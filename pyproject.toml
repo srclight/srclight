@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "srclight"
+version = "0.8.0"
+description = "Deep code indexing for AI agents. SQLite FTS5 + tree-sitter + embeddings + MCP."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Gig8 LLC" }]
+keywords = ["mcp", "code-indexing", "sqlite", "fts5", "tree-sitter", "embeddings", "ai", "claude"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Text Processing :: Indexing",
+]
+
+dependencies = [
+    "mcp>=1.26.0",
+    "click>=8.1.0",
+    "tree-sitter>=0.25.0",
+    "tree-sitter-c>=0.24.0",
+    "tree-sitter-cpp>=0.23.0",
+    "tree-sitter-python>=0.25.0",
+    "tree-sitter-javascript>=0.25.0",
+    "tree-sitter-typescript>=0.23.0",
+    "tree-sitter-rust>=0.24.0",
+    "tree-sitter-c-sharp>=0.23.0",
+    "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda12x>=13.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.9.0",
+]
+
+[project.scripts]
+srclight = "srclight.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/srclight/srclight"
+Repository = "https://github.com/srclight/srclight"
+Issues = "https://github.com/srclight/srclight/issues"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/srclight"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/srclight", "README.md", "LICENSE"]
