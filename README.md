@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.srclight/srclight -->
+
 # Srclight
 
 [![PyPI](https://img.shields.io/pypi/v/srclight)](https://pypi.org/project/srclight/)

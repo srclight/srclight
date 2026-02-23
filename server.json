@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.srclight/srclight",
+  "title": "Srclight",
+  "description": "Deep code indexing for AI agents. SQLite FTS5 + tree-sitter + embeddings + MCP. 25 tools for symbol search, call graphs, git intelligence, and hybrid semantic search.",
+  "version": "0.8.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "srclight",
+      "version": "0.8.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
