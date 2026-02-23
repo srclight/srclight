@@ -26,7 +26,7 @@ Each repo has its own `.srclight/` directory with:
 ### 1. Install Srclight
 
 ```bash
-# From PyPI (when published)
+# From PyPI
 pip install srclight
 
 # From source

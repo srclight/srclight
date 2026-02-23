@@ -1,5 +1,9 @@
 # Srclight
 
+[![PyPI](https://img.shields.io/pypi/v/srclight)](https://pypi.org/project/srclight/)
+[![License](https://img.shields.io/github/license/srclight/srclight)](https://github.com/srclight/srclight/blob/master/LICENSE)
+[![Python](https://img.shields.io/pypi/pyversions/srclight)](https://pypi.org/project/srclight/)
+
 **Deep code indexing for AI agents.** SQLite FTS5 + tree-sitter + embeddings + MCP.
 
 Srclight builds a rich, searchable index of your codebase that AI coding agents can query instantly — replacing dozens of grep/glob calls with precise, structured lookups.
@@ -38,7 +42,7 @@ AI coding agents (Claude Code, Cursor, etc.) spend **40-60% of their tokens on o
 ## Quick Start
 
 ```bash
-# Install from PyPI (when published)
+# Install from PyPI
 pip install srclight
 
 # Install from source
