@@ -95,6 +95,10 @@ def index(path: str, db_path: str | None, embed_model: str | None):
     # Ensure .srclight/ directory exists
     db_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Ensure .srclight/ is in .gitignore
+    if (root / ".git").is_dir():
+        _ensure_gitignore(root)
+
     click.echo(f"Indexing {root}")
     click.echo(f"Database: {db_file}")
     if embed_model:
@@ -592,6 +596,23 @@ def _remove_hook_snippet(hook_file: Path) -> bool:
     return True
 
 
+def _ensure_gitignore(repo_path: Path) -> None:
+    """Ensure .srclight/ is listed in the repo's .gitignore."""
+    gitignore = repo_path / ".gitignore"
+    pattern = ".srclight/"
+    if gitignore.exists():
+        content = gitignore.read_text()
+        if pattern in content:
+            return
+        # Append with a newline guard
+        if content and not content.endswith("\n"):
+            content += "\n"
+        content += f"{pattern}\n"
+        gitignore.write_text(content)
+    else:
+        gitignore.write_text(f"{pattern}\n")
+
+
 def _install_hooks_in_repo(repo_path: Path, srclight_path: str) -> str:
     """Install post-commit + post-checkout hooks. Returns status message."""
     git_dir = repo_path / ".git"
@@ -616,6 +637,9 @@ def _install_hooks_in_repo(repo_path: Path, srclight_path: str) -> str:
 
     # Ensure .srclight dir exists for log file
     (repo_path / ".srclight").mkdir(exist_ok=True)
+
+    # Ensure .srclight/ is in .gitignore (indexes + embeddings should never be committed)
+    _ensure_gitignore(repo_path)
 
     if not installed:
         return f"  SKIP {repo_path.name}: hooks already installed"

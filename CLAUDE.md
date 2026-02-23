@@ -147,6 +147,33 @@ Semantic versioning:
 - Do NOT run builds without the venv — `tree-sitter` bindings are in `.venv/`
 - Do NOT add torch/transformers as hard dependencies — numpy is optional (for vector cache), cupy is optional (for GPU acceleration)
 
+## Documentation Strategy
+
+This is a public repo. Keep a clear split between public docs and private strategic notes.
+
+### Public — `docs/` in this repo
+- **Usage guides** (setup, deployment, troubleshooting) — `docs/usage-guide.md`
+- **Architecture** for contributors (how the code works, how to extend)
+- **API reference** (MCP tool docs, CLI reference)
+- **Changelog** and release notes
+
+### Private — Obsidian Vault (Dropbox)
+Strategic, competitive, and personal notes live in Tim's Vault:
+
+| Location | Contents |
+|----------|----------|
+| `Areas/Code Indexing/` | Competitive landscape, architecture research, embedding model analysis, ideal agent index design, FTS5 lessons |
+| `Projects/srclight-personal-claude.md` | Personal dev environment: machine paths, hardware, workspace config, systemd, MCP setup |
+
+### CLAUDE.md Backup
+A copy of this file is kept in the private Vault (`Projects/srclight-CLAUDE-md-backup.md`). When making significant changes to this CLAUDE.md, update the backup copy too (see `srclight-personal-claude.md` for the exact path/command).
+
+### Rule of thumb
+- Mentions competitors, pricing, market strategy, or "why to build this" → **Vault**
+- Personal paths, hardware specs, workspace names → **Vault** (`srclight-personal-claude.md`)
+- Helps an external user or contributor use/understand srclight → **`docs/`**
+- Do NOT put strategic analysis or personal infra details in the public repo
+
 ## Testing
 
 102 tests: db (8), indexer (5), features (14), workspace (7), hooks (9), git (9), build (6), embeddings (20), workspace batch (1), vector_math (9), vector_cache (11).

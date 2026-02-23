@@ -65,6 +65,8 @@ srclight symbols src/main.py
 srclight serve
 ```
 
+> **Note:** `srclight index` automatically adds `.srclight/` to your `.gitignore`. Index databases and embedding files can be large and should never be committed.
+
 ## Semantic Search (Embeddings)
 
 Srclight supports embedding-based semantic search for natural language queries like "find code that handles authentication" or "where is the database connection pool".

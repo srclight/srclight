@@ -152,6 +152,8 @@ srclight workspace status -w myworkspace
 
 The new repo is immediately searchable. The MCP server picks up new projects on the next tool call (no restart needed — workspace config is re-read).
 
+**Note:** Both `srclight index` and `srclight hook install` automatically add `.srclight/` to the repo's `.gitignore`. The index databases and embedding files can be large (hundreds of MB) and should never be committed.
+
 ## Removing a Repo
 
 ```bash
