@@ -3,12 +3,12 @@
   "name": "io.github.srclight/srclight",
   "title": "Srclight",
   "description": "Deep code indexing for AI agents. SQLite FTS5 + tree-sitter + embeddings + MCP.",
-  "version": "0.8.1",
+  "version": "0.10.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "srclight",
-      "version": "0.8.1",
+      "version": "0.10.0",
       "transport": {
         "type": "stdio"
       }
