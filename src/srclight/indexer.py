@@ -17,6 +17,7 @@ from typing import Callable
 
 from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
+from . import __version__
 from .db import Database, EdgeRecord, FileRecord, SymbolRecord, content_hash
 from .languages import (
     LANGUAGES,
@@ -573,6 +574,7 @@ class Indexer:
             last_commit=git_head,
             files_indexed=stats.files_scanned,
             symbols_indexed=stats.symbols_extracted,
+            indexer_version=__version__,
         )
 
         self.db.commit()
