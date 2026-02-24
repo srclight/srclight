@@ -176,7 +176,7 @@ A copy of this file is kept in the private Vault (`Projects/srclight-CLAUDE-md-b
 
 ## Testing
 
-102 tests: db (8), indexer (5), features (14), workspace (7), hooks (9), git (9), build (6), embeddings (20), workspace batch (1), vector_math (9), vector_cache (11).
+105 tests: db (8), indexer (8), features (14), workspace (7), hooks (9), git (9), build (6), embeddings (20), workspace batch (1), vector_math (9), vector_cache (11).
 
 ```sh
 python -m pytest tests/ -v

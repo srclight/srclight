@@ -26,7 +26,7 @@ AI coding agents (Claude Code, Cursor, etc.) spend **40-60% of their tokens on o
 - **Minimal dependencies** — single SQLite file per repo, no Docker/Redis/vector DB
 - **Fully offline** — no API calls, works air-gapped (Ollama local embeddings)
 - **Incremental** — only re-indexes changed files (content hash detection)
-- **7 languages** — Python, C, C++, C#, JavaScript, TypeScript, Rust
+- **8 languages** — Python, C, C++, C#, JavaScript, TypeScript, Rust, Markdown
 - **4 search modes** — symbol names, source code (trigram), documentation (stemmed), semantic (embeddings)
 - **Hybrid search** — RRF fusion of keyword + semantic results for best accuracy
 - **Multi-repo workspaces** — search across all your repos simultaneously via SQLite ATTACH+UNION
@@ -156,17 +156,65 @@ srclight serve --workspace myworkspace
 
 ## MCP Integration
 
-### Claude Code (single repo)
+Srclight supports two transport modes: **stdio** (one server per session) and **SSE** (persistent server, multiple sessions). SSE is recommended for workspaces.
 
+### Claude Code
+
+**Stdio (simplest — one server per session):**
 ```bash
+# Single repo
 claude mcp add srclight -- srclight serve
+
+# Workspace mode
+claude mcp add srclight -- srclight serve --workspace myworkspace
+
+# Make it available in all projects (user scope)
+claude mcp add --scope user srclight -- srclight serve --workspace myworkspace
 ```
 
-### Claude Code (workspace mode)
+**SSE (persistent server — recommended for workspaces):**
+
+Run srclight as a long-lived server, then point Claude Code at it:
 
 ```bash
-claude mcp add srclight -- srclight serve --workspace myworkspace
+# Start the server (default: http://127.0.0.1:8742/sse)
+srclight serve --workspace myworkspace &
+
+# Or install as a systemd user service (Linux/WSL)
+# See docs/usage-guide.md for the service file
+
+# Connect Claude Code to the running server
+claude mcp add --transport sse srclight http://127.0.0.1:8742/sse
 ```
+
+SSE mode supports multiple concurrent sessions and survives Claude Code restarts.
+
+### OpenClaw
+
+OpenClaw connects to srclight via [mcporter](https://mcporter.dev), its built-in MCP tool server CLI.
+
+```bash
+# 1. Add srclight to mcporter's home config
+mcporter config add srclight http://127.0.0.1:8742/sse \
+  --transport sse --scope home \
+  --description "Srclight deep code indexing"
+
+# 2. Verify the connection
+mcporter call srclight.list_projects
+
+# 3. Restart the OpenClaw gateway to pick up the new server
+systemctl --user restart openclaw-gateway  # if using systemd
+# or: openclaw daemon restart
+```
+
+The OpenClaw agent can then use srclight tools via the `mcporter` skill:
+```
+mcporter call srclight.search_symbols query="my_function"
+mcporter call srclight.get_callers symbol_name="MyClass" project="my-repo"
+mcporter call srclight.hybrid_search query="authentication logic"
+```
+
+> **Prerequisite:** Srclight must be running as an SSE server (see above). OpenClaw's mcporter connects over HTTP — stdio mode is not supported.
 
 ### Claude Desktop (`claude_desktop_config.json`)
 
@@ -179,6 +227,13 @@ claude mcp add srclight -- srclight serve --workspace myworkspace
     }
   }
 }
+```
+
+### Any MCP Client (SSE)
+
+Any MCP-compatible client can connect to the SSE endpoint:
+```
+http://127.0.0.1:8742/sse
 ```
 
 ## MCP Tools (25)

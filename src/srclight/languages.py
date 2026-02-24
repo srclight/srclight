@@ -211,6 +211,74 @@ _CSHARP_QUERY = """
     name: (identifier) @prop.name) @prop.def
 """
 
+# Markdown uses custom extraction in indexer.py (not tree-sitter queries).
+# Placeholder query — never actually compiled.
+_MARKDOWN_QUERY = ""
+
+_DART_QUERY = """
+(function_signature name: (identifier) @fn.name) @fn.def
+
+(method_signature (function_signature name: (identifier) @method.name) @method.def)
+
+(getter_signature name: (identifier) @getter.name) @getter.def
+
+(class_definition name: (identifier) @cls.name) @cls.def
+
+(enum_declaration name: (identifier) @enum.name) @enum.def
+
+(mixin_declaration (identifier) @mixin.name) @mixin.def
+
+(extension_declaration (identifier) @ext.name) @ext.def
+
+(type_alias (type_identifier) @type.name) @type.def
+
+(constructor_signature name: (identifier) @ctor.name) @ctor.def
+"""
+
+_SWIFT_QUERY = """
+(function_declaration (simple_identifier) @fn.name) @fn.def
+
+(function_declaration (simple_identifier) @method.name) @method.def
+
+(class_declaration (type_identifier) @cls.name) @cls.def
+
+(class_declaration (type_identifier) @struct.name) @struct.def
+
+(class_declaration (type_identifier) @enum.name) @enum.def
+
+(protocol_declaration (type_identifier) @iface.name) @iface.def
+
+(typealias_declaration (type_identifier) @type.name) @type.def
+"""
+
+_KOTLIN_QUERY = """
+(function_declaration (identifier) @fn.name) @fn.def
+
+(function_declaration (identifier) @method.name) @method.def
+
+(class_declaration (identifier) @cls.name) @cls.def
+"""
+
+_JAVA_QUERY = """
+(method_declaration (identifier) @fn.name) @fn.def
+
+(method_declaration (identifier) @method.name) @method.def
+
+(class_declaration (identifier) @cls.name) @cls.def
+
+(interface_declaration (identifier) @iface.name) @iface.def
+
+(enum_declaration (identifier) @enum.name) @enum.def
+"""
+
+_GO_QUERY = """
+(function_declaration (identifier) @fn.name) @fn.def
+
+(method_declaration (field_identifier) @method.name) @method.def
+
+(type_declaration (type_spec (type_identifier) @type.name) @type.def)
+"""
+
 
 LANGUAGES: dict[str, LanguageConfig] = {
     "python": LanguageConfig(
@@ -254,6 +322,42 @@ LANGUAGES: dict[str, LanguageConfig] = {
         extensions=(".cs",),
         loader="tree_sitter_c_sharp",
         symbol_query=_CSHARP_QUERY,
+    ),
+    "markdown": LanguageConfig(
+        name="markdown",
+        extensions=(".md",),
+        loader="tree_sitter_markdown",
+        symbol_query=_MARKDOWN_QUERY,
+    ),
+    "dart": LanguageConfig(
+        name="dart",
+        extensions=(".dart",),
+        loader="tree_sitter_dart",
+        symbol_query=_DART_QUERY,
+    ),
+    "swift": LanguageConfig(
+        name="swift",
+        extensions=(".swift",),
+        loader="tree_sitter_swift",
+        symbol_query=_SWIFT_QUERY,
+    ),
+    "kotlin": LanguageConfig(
+        name="kotlin",
+        extensions=(".kt", ".kts"),
+        loader="tree_sitter_kotlin",
+        symbol_query=_KOTLIN_QUERY,
+    ),
+    "java": LanguageConfig(
+        name="java",
+        extensions=(".java",),
+        loader="tree_sitter_java",
+        symbol_query=_JAVA_QUERY,
+    ),
+    "go": LanguageConfig(
+        name="go",
+        extensions=(".go",),
+        loader="tree_sitter_go",
+        symbol_query=_GO_QUERY,
     ),
 }
 
@@ -305,7 +409,7 @@ def get_language(name: str) -> Language | None:
             return None
         _LANGUAGES[name] = lang
         return lang
-    except (ImportError, AttributeError):
+    except (ImportError, AttributeError) as e:
         return None
 
 

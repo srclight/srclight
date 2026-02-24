@@ -37,17 +37,68 @@ pip install -e .
 
 ### 2. Add as MCP Server
 
-**Claude Code (stdio — simplest):**
-```bash
-claude mcp add srclight -- srclight serve --workspace myworkspace
-```
+Srclight supports two transport modes:
 
-**Claude Code (global, user-scoped):**
+- **stdio** — one server process per client session (simple, no setup)
+- **SSE** — one persistent server, many clients (recommended for workspaces)
+
+#### Option A: Stdio (simplest)
+
+Each Claude Code session spawns its own srclight process:
+
 ```bash
+# Add for current project
+claude mcp add srclight -- srclight serve --workspace myworkspace
+
+# Add globally (available in all projects)
 claude mcp add --scope user srclight -- srclight serve --workspace myworkspace
 ```
 
-**Claude Desktop (`claude_desktop_config.json`):**
+#### Option B: SSE with systemd (recommended)
+
+Run srclight as a persistent background service. This is faster (no cold start per session), supports multiple concurrent clients, and survives restarts.
+
+**Create the service file** (`~/.config/systemd/user/srclight.service`):
+```ini
+[Unit]
+Description=Srclight MCP Server (workspace: myworkspace)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/path/to/srclight-venv/bin/srclight serve --workspace myworkspace
+Restart=on-failure
+RestartSec=3
+Environment=PATH=/path/to/srclight-venv/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+```
+
+**Enable and start:**
+```bash
+systemctl --user daemon-reload
+systemctl --user enable srclight
+systemctl --user start srclight
+
+# Verify it's running
+systemctl --user status srclight
+curl -s http://127.0.0.1:8742/sse  # should stream SSE events
+```
+
+**Connect Claude Code to the SSE server:**
+```bash
+claude mcp add --transport sse srclight http://127.0.0.1:8742/sse
+```
+
+**WSL + Windows Claude Code:** If Claude Code runs on Windows but srclight runs in WSL, the same `localhost:8742` URL works — WSL2 forwards localhost ports to Windows automatically:
+```bash
+# Run this in Windows Claude Code (cmd/PowerShell terminal)
+claude mcp add --transport sse srclight http://127.0.0.1:8742/sse
+```
+
+#### Option C: Claude Desktop (`claude_desktop_config.json`)
+
 ```json
 {
   "mcpServers": {
@@ -59,19 +110,36 @@ claude mcp add --scope user srclight -- srclight serve --workspace myworkspace
 }
 ```
 
-**WSL note:** If your MCP client runs on Windows but srclight is installed in WSL, use `wsl` as the command:
-```json
-"srclight": {
-  "type": "stdio",
-  "command": "wsl",
-  "args": [
-    "/path/to/srclight-mcp/.venv/bin/srclight",
-    "serve", "--workspace", "myworkspace"
-  ]
-}
+### 3. Add to OpenClaw
+
+[OpenClaw](https://openclaw.ai) connects to srclight via its built-in [mcporter](https://mcporter.dev) MCP tool server.
+
+**Prerequisite:** Srclight must be running as an SSE server (Option B above).
+
+```bash
+# 1. Add srclight to mcporter config
+mcporter config add srclight http://127.0.0.1:8742/sse \
+  --transport sse --scope home \
+  --description "Srclight deep code indexing"
+
+# 2. Verify the connection
+mcporter call srclight.list_projects
+
+# 3. Restart the OpenClaw gateway to pick up the new server
+systemctl --user restart openclaw-gateway
 ```
 
-### 3. Verify
+The OpenClaw agent uses srclight tools via the `mcporter` skill and `exec`:
+```
+mcporter call srclight.list_projects
+mcporter call srclight.search_symbols query="MyClass"
+mcporter call srclight.get_callers symbol_name="lookup" project="my-repo"
+mcporter call srclight.hybrid_search query="authentication logic"
+```
+
+All 25 srclight tools are available as `srclight.<tool_name>` through mcporter.
+
+### 4. Verify
 
 Start a new session and ask:
 ```

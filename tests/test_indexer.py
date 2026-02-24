@@ -185,6 +185,111 @@ def test_search_after_index(db, sample_project):
     assert len(results) > 0
 
 
+@pytest.fixture
+def markdown_project(tmp_path):
+    """Create a minimal Markdown project."""
+    src = tmp_path / "mdproject"
+    src.mkdir()
+
+    (src / "notes.md").write_text('''\
+---
+title: Architecture Notes
+tags: [design, architecture]
+---
+
+# Architecture
+
+Overall system design.
+
+## Components
+
+The main components are listed here.
+
+### Database Layer
+
+SQLite with FTS5 indexes.
+
+## Deployment
+
+Run on any Linux server.
+''')
+
+    (src / "plain.md").write_text('''\
+Just a file with no headings.
+
+Some plain text content.
+''')
+
+    (src / "single-heading.md").write_text('''\
+# Quick Note
+
+A brief note with only one heading.
+''')
+
+    return src
+
+
+def test_index_markdown(db, markdown_project):
+    """Indexes Markdown files and extracts heading sections as symbols."""
+    config = IndexConfig(root=markdown_project)
+    indexer = Indexer(db, config)
+    stats = indexer.index(markdown_project)
+
+    assert stats.files_scanned == 3
+    assert stats.files_indexed == 3
+    assert stats.symbols_extracted > 0
+    assert stats.errors == 0
+
+    # Check notes.md — should have 4 section symbols
+    syms = db.symbols_in_file("notes.md")
+    names = [s.name for s in syms]
+    assert "Architecture" in names
+    assert "Components" in names
+    assert "Database Layer" in names
+    assert "Deployment" in names
+
+    # Check kinds are all "section"
+    assert all(s.kind == "section" for s in syms)
+
+    # Check qualified names use ">" ancestry
+    arch = [s for s in syms if s.name == "Architecture"][0]
+    assert arch.qualified_name == "notes > Architecture"
+    db_layer = [s for s in syms if s.name == "Database Layer"][0]
+    assert db_layer.qualified_name == "notes > Architecture > Components > Database Layer"
+
+    # Check own-content: "Components" section shouldn't include "Database Layer" content
+    components = [s for s in syms if s.name == "Components"][0]
+    assert "The main components" in components.content
+    assert "SQLite" not in components.content
+
+
+def test_index_markdown_no_headings(db, markdown_project):
+    """Markdown file without headings produces a single document symbol."""
+    config = IndexConfig(root=markdown_project)
+    indexer = Indexer(db, config)
+    indexer.index(markdown_project)
+
+    syms = db.symbols_in_file("plain.md")
+    assert len(syms) == 1
+    assert syms[0].kind == "document"
+    assert syms[0].name == "plain"
+    assert "no headings" in syms[0].content
+
+
+def test_index_markdown_frontmatter(db, markdown_project):
+    """YAML frontmatter is extracted as doc_comment on the first symbol."""
+    config = IndexConfig(root=markdown_project)
+    indexer = Indexer(db, config)
+    indexer.index(markdown_project)
+
+    syms = db.symbols_in_file("notes.md")
+    # First symbol should have frontmatter in doc_comment
+    first = sorted(syms, key=lambda s: s.start_line)[0]
+    assert first.doc_comment is not None
+    assert "title: Architecture Notes" in first.doc_comment
+    assert "tags:" in first.doc_comment
+
+
 def test_file_removal_detection(db, sample_project):
     """Detects and removes deleted files from index."""
     config = IndexConfig(root=sample_project)
@@ -201,3 +306,125 @@ def test_file_removal_detection(db, sample_project):
     stats = indexer.index(sample_project)
     assert stats.files_removed == 1
     assert db.stats()["files"] == 1
+
+
+@pytest.fixture
+def dart_project(tmp_path):
+    """Create a minimal Dart project."""
+    src = tmp_path / "dartproject"
+    src.mkdir()
+
+    # Main Dart file with various constructs
+    (src / "main.dart").write_text('''\
+// A sample Dart file for testing.
+
+int add(int a, int b) {
+  return a + b;
+}
+
+class UserService {
+  final String _name;
+
+  UserService(this._name);
+
+  String get name => _name;
+
+  /// Fetches a user by ID.
+  Future<User?> fetchUser(int id) async {
+    return null;
+  }
+}
+
+class User {
+  final int id;
+  final String email;
+
+  const User({
+    required this.id,
+    required this.email,
+  });
+
+  factory User.fromJson(Map<String, dynamic> json) {
+    return User(
+      id: json['id'] as int,
+      email: json['email'] as String,
+    );
+  }
+}
+
+enum UserStatus {
+  active,
+  inactive,
+}
+
+mixin Logger {
+  void log(String message) {
+    print('[LOG] $message');
+  }
+}
+
+class DataManager with Logger {
+  Future<void> load() async {
+    log('Loading data...');
+  }
+}
+
+extension StringExtensions on String {
+  String get capitalized {
+    if (isEmpty) return this;
+    return '${this[0].toUpperCase()}${substring(1)}';
+  }
+}
+''')
+
+    return src
+
+
+def test_index_dart(db, dart_project):
+    """Indexes Dart files and extracts symbols."""
+    config = IndexConfig(root=dart_project)
+    indexer = Indexer(db, config)
+    stats = indexer.index(dart_project)
+
+    assert stats.files_scanned == 1
+    assert stats.files_indexed == 1
+    assert stats.symbols_extracted > 0
+    assert stats.errors == 0
+
+    # Check symbols were created
+    db_stats = db.stats()
+    assert db_stats["files"] == 1
+    assert db_stats["symbols"] > 0
+    assert "dart" in db_stats["languages"]
+
+    # Check specific symbols
+    syms = db.symbols_in_file("main.dart")
+    names = [s.name for s in syms]
+
+    # Top-level function
+    assert "add" in names
+
+    # Classes
+    assert "UserService" in names
+    assert "User" in names
+
+    # Method in class - there may be duplicates due to how Dart AST works
+    # Check that we have at least one fetchUser with kind=method
+    fetch_methods = [s for s in syms if s.name == "fetchUser" and s.kind == "method"]
+    assert len(fetch_methods) >= 1
+
+    # Enum
+    assert "UserStatus" in names
+
+    # Mixin
+    assert "Logger" in names
+    # Verify mixin kind
+    logger_syms = [s for s in syms if s.name == "Logger"]
+    assert len(logger_syms) >= 1
+    assert logger_syms[0].kind == "mixin"
+
+    # Extension
+    assert "StringExtensions" in names
+    ext_syms = [s for s in syms if s.name == "StringExtensions"]
+    assert len(ext_syms) >= 1
+    assert ext_syms[0].kind == "extension"

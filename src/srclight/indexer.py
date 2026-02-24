@@ -104,6 +104,9 @@ DEFAULT_IGNORE = [
     # Srclight index
     ".srclight",
     ".codelight",
+    # Obsidian
+    ".obsidian",
+    ".trash",
 ]
 
 # Max file size to index (1 MB)
@@ -294,6 +297,10 @@ def _kind_from_capture(capture_name: str) -> str:
         "var2": "function",
         "ctor": "function",    # C# constructors
         "prop": "property",    # C# properties
+        # Dart-specific
+        "ext": "extension",
+        "mixin": "mixin",
+        "getter": "method",    # Dart getters
     }
     return mapping.get(prefix, "unknown")
 
@@ -583,6 +590,9 @@ class Indexer:
         self, file_id: int, rel_path: str, source: bytes, lang: str,
     ) -> int:
         """Parse a file and extract symbols. Returns count of symbols extracted."""
+        if lang == "markdown":
+            return self._extract_markdown_symbols(file_id, rel_path, source)
+
         parser = self._get_parser(lang)
         query = self._get_query(lang)
         if parser is None or query is None:
@@ -668,6 +678,148 @@ class Indexer:
 
         return count
 
+    def _extract_markdown_symbols(
+        self, file_id: int, rel_path: str, source: bytes,
+    ) -> int:
+        """Extract symbols from a Markdown file using heading-based sections.
+
+        Each heading section becomes a symbol (kind='section'). A file with
+        no headings becomes a single 'document' symbol. YAML frontmatter is
+        stored as doc_comment on the first symbol.
+        """
+        parser = self._get_parser("markdown")
+        if parser is None:
+            return 0
+
+        tree = parser.parse(source)
+        root = tree.root_node
+        file_stem = Path(rel_path).stem
+
+        # Extract frontmatter if present
+        frontmatter: str | None = None
+        for child in root.children:
+            if child.type == "minus_metadata":
+                frontmatter = child.text.decode("utf-8", errors="replace").strip()
+                break
+
+        count = 0
+        # Track inserted symbols for parent lookup: (start, end, sym_id)
+        inserted: list[tuple[int, int, int]] = []
+
+        def _get_own_content(section_node: Node) -> str:
+            """Get text of all children except nested sections."""
+            parts = []
+            for child in section_node.children:
+                if child.type != "section":
+                    parts.append(source[child.start_byte:child.end_byte])
+            return b"".join(parts).decode("utf-8", errors="replace").strip()
+
+        def _get_heading_info(section_node: Node) -> tuple[str | None, str | None, int]:
+            """Extract heading name, markdown signature, and level from a section.
+
+            Returns (name, signature, level). Level is 0 if no heading found.
+            """
+            for child in section_node.children:
+                if child.type == "atx_heading":
+                    # Get inline text as name
+                    inlines = [c for c in child.children if c.type == "inline"]
+                    name = inlines[0].text.decode("utf-8", errors="replace").strip() if inlines else None
+                    sig = child.text.decode("utf-8", errors="replace").strip()
+                    # Determine level from marker (atx_h1_marker, atx_h2_marker, etc.)
+                    markers = [c for c in child.children if c.type.startswith("atx_h")]
+                    level = int(markers[0].type[5]) if markers else 0  # "atx_h2_marker" -> 2
+                    return name, sig, level
+            return None, None, 0
+
+        def _walk_sections(
+            node: Node, ancestry: list[str],
+        ) -> None:
+            nonlocal count
+
+            for child in node.children:
+                if child.type != "section":
+                    continue
+
+                name, sig, level = _get_heading_info(child)
+                if name is None:
+                    # Section without heading (rare) — skip
+                    _walk_sections(child, ancestry)
+                    continue
+
+                own_content = _get_own_content(child)
+                current_ancestry = ancestry + [name]
+                qualified = file_stem + " > " + " > ".join(current_ancestry)
+
+                # First paragraph (after heading) as doc_comment
+                doc = None
+                for sc in child.children:
+                    if sc.type == "paragraph":
+                        doc = sc.text.decode("utf-8", errors="replace").strip()
+                        break
+
+                # Attach frontmatter to the first symbol in the file
+                is_first = count == 0
+                if is_first and frontmatter:
+                    doc = frontmatter + ("\n\n" + doc if doc else "")
+
+                body_h = hashlib.sha256(own_content.encode("utf-8")).hexdigest()[:16]
+
+                # Find parent: tightest enclosing section we've inserted
+                parent_id = None
+                best_span = float("inf")
+                for c_start, c_end, c_id in inserted:
+                    if c_start < child.start_byte and child.end_byte <= c_end:
+                        span = c_end - c_start
+                        if span < best_span:
+                            best_span = span
+                            parent_id = c_id
+
+                sym = SymbolRecord(
+                    file_id=file_id,
+                    kind="section",
+                    name=name,
+                    qualified_name=qualified,
+                    signature=sig,
+                    start_line=child.start_point[0] + 1,
+                    end_line=child.end_point[0] + 1,
+                    content=own_content,
+                    doc_comment=doc,
+                    body_hash=body_h,
+                    line_count=child.end_point[0] - child.start_point[0] + 1,
+                    parent_symbol_id=parent_id,
+                )
+                sym_id = self.db.insert_symbol(sym, rel_path)
+                inserted.append((child.start_byte, child.end_byte, sym_id))
+                count += 1
+
+                # Recurse into child sections
+                _walk_sections(child, current_ancestry)
+
+        _walk_sections(root, [])
+
+        # If no sections found, create a single document symbol for the whole file
+        if count == 0:
+            content_text = source.decode("utf-8", errors="replace").strip()
+            body_h = hashlib.sha256(source).hexdigest()[:16]
+            sym = SymbolRecord(
+                file_id=file_id,
+                kind="document",
+                name=file_stem,
+                qualified_name=file_stem,
+                signature=None,
+                start_line=1,
+                end_line=root.end_point[0] + 1,
+                content=content_text,
+                doc_comment=frontmatter,
+                body_hash=body_h,
+                line_count=root.end_point[0] + 1,
+                parent_symbol_id=None,
+            )
+            self.db.insert_symbol(sym, rel_path)
+            count = 1
+
+        return count
+
     def _build_edges(self) -> int:
         """Build call graph edges by scanning symbol content for references.
 
@@ -682,10 +834,12 @@ class Indexer:
         self.db.conn.execute("DELETE FROM symbol_edges")
 
         # Build name -> [(symbol_id, file_path, kind)] lookup
+        # Exclude markdown — sections don't "call" anything and scanning their
+        # prose for symbol-name matches would create noise with zero useful edges.
         rows = self.db.conn.execute(
             """SELECT s.id, s.name, s.kind, f.path as file_path
                FROM symbols s JOIN files f ON s.file_id = f.id
-               WHERE s.name IS NOT NULL"""
+               WHERE s.name IS NOT NULL AND f.language != 'markdown'"""
         ).fetchall()
 
         name_to_symbols: dict[str, list[dict]] = {}
@@ -783,7 +937,9 @@ class Indexer:
         MAX_REFS_PER_SYMBOL = 30
 
         content_rows = self.db.conn.execute(
-            "SELECT id, name, content FROM symbols WHERE name IS NOT NULL"
+            """SELECT s.id, s.name, s.content FROM symbols s
+               JOIN files f ON s.file_id = f.id
+               WHERE s.name IS NOT NULL AND f.language != 'markdown'"""
         ).fetchall()
 
         for row in content_rows:
