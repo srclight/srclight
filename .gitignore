@@ -22,3 +22,5 @@ htmlcov/
 *.log
 .DS_Store
 Thumbs.db
+.mcpregistry_*
+.playwright-mcp/
