@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "Gig8 LLC" }]
-keywords = ["mcp", "code-indexing", "sqlite", "fts5", "tree-sitter", "embeddings", "ai", "claude"]
+keywords = ["mcp", "mcp-server", "code-indexing", "code-search", "code-intelligence", "sqlite", "fts5", "tree-sitter", "embeddings", "semantic-search", "ai", "claude", "ollama", "developer-tools"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

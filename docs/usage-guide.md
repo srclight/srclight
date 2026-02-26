@@ -305,6 +305,68 @@ srclight workspace add /new/path/to/repo -w myworkspace
 srclight workspace index -w myworkspace -p new-name --embed qwen3-embedding
 ```
 
+## Claude Code Custom Agents (Subagents)
+
+Claude Code supports [custom agents](https://docs.anthropic.com/en/docs/claude-code/agents) defined in `.claude/agents/*.md`. These agents run as subprocesses with their own tool access, controlled by the `tools:` frontmatter field.
+
+### The Problem: MCP Tools in Subagents
+
+Custom agents defined in `.claude/agents/` **cannot access MCP tools**. This is a [known bug](https://github.com/anthropics/claude-code/issues/13605) ([#25200](https://github.com/anthropics/claude-code/issues/25200)) as of Claude Code v2.1.52 (Feb 2026).
+
+The tool injection code has two paths: built-in agents receive MCP tools, custom agents do not. None of these workarounds help:
+- Adding MCP tool names to `tools:` frontmatter
+- Adding `ToolSearch` to `tools:` frontmatter
+- Adding `mcpServers:` to frontmatter
+- Omitting `tools:` entirely (should inherit all — doesn't)
+
+| Agent Type | Tools | MCP Access |
+|---|---|---|
+| `general-purpose` | `*` (all) | **Yes** |
+| `Explore` | All except Task/Edit/Write | **Yes** |
+| `Plan` | All except Task/Edit/Write | **Yes** |
+| Custom agents (`.claude/agents/`) | Core tools only | **No** — bug [#13605](https://github.com/anthropics/claude-code/issues/13605) |
+
+### Solution: Use `general-purpose` Agent Type
+
+Until the bug is fixed, the only way to give a subagent access to srclight is to use `general-purpose` as the `subagent_type`. It has `(Tools: *)` which includes ToolSearch and all MCP tools:
+
+```
+Task(
+  subagent_type="general-purpose",
+  prompt="You are a UI design reviewer. Use srclight MCP tools for code analysis..."
+)
+```
+
+The agent must call `ToolSearch("srclight")` before using any `mcp__srclight__*` tool. Include this instruction in the prompt.
+
+**Tradeoff:** `general-purpose` agents also have write access (Edit, Write), which is more permissive than a read-only reviewer needs. The agent's system prompt can instruct it not to modify files.
+
+### Example: UI Design Reviewer with Srclight
+
+Since custom agents can't access MCP ([#13605](https://github.com/anthropics/claude-code/issues/13605)), invoke via `general-purpose` and include your review instructions in the prompt:
+
+```
+Task(
+  subagent_type="general-purpose",
+  prompt="You are a senior UI/UX designer reviewing a Flutter app.
+
+  ## srclight Code Index (MCP)
+
+  Use ToolSearch to load srclight tools before calling them. Key tools:
+
+  | Tool | Use |
+  |------|-----|
+  | mcp__srclight__symbols_in_file(path, project) | Widget/class outline |
+  | mcp__srclight__get_callers(symbol, project)    | Consistency checks |
+  | mcp__srclight__search_symbols(query, project)  | Find exact names |
+
+  Workflow: Use symbols_in_file to get outlines, then Read sections.
+  Use get_callers to verify token usage consistency. Use Grep for pattern
+  violations (raw Color literals, bare EdgeInsets) that srclight can't catch.
+
+  DO NOT modify any files. This is a read-only review."
+)
+
 ## Architecture Notes
 
 - **One server, one workspace**: The MCP server runs in workspace mode serving all repos. Each project's `.srclight/index.db` is ATTACHed to a `:memory:` database at query time via SQLite's ATTACH mechanism.
