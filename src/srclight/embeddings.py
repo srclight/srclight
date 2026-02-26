@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import struct
 import urllib.error
 import urllib.request
@@ -24,6 +25,14 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 logger = logging.getLogger("srclight.embeddings")
+
+# Timeout for embedding API requests (MCP tool path). Kept short so Cursor/IDE
+# tool calls don't hang; indexing can set SRCLIGHT_EMBED_REQUEST_TIMEOUT=120.
+def _embed_request_timeout() -> int:
+    try:
+        return int(os.environ.get("SRCLIGHT_EMBED_REQUEST_TIMEOUT", "20"))
+    except ValueError:
+        return 20
 
 
 # --- Embedding text preparation ---
@@ -130,7 +139,7 @@ class OllamaProvider(EmbeddingProvider):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=_embed_request_timeout()) as resp:
                 data = json.loads(resp.read())
         except urllib.error.URLError as e:
             raise ConnectionError(
@@ -248,7 +257,7 @@ class OpenAIProvider(EmbeddingProvider):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=_embed_request_timeout()) as resp:
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             body = e.read().decode() if hasattr(e, 'read') else str(e)
@@ -325,7 +334,7 @@ class CohereProvider(EmbeddingProvider):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=_embed_request_timeout()) as resp:
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             body = e.read().decode() if hasattr(e, 'read') else str(e)
@@ -395,7 +404,7 @@ class VoyageProvider(EmbeddingProvider):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=_embed_request_timeout()) as resp:
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             body = e.read().decode() if hasattr(e, 'read') else str(e)

@@ -1346,6 +1346,7 @@ def hybrid_search(
     # Try to get embedding results
     embedding_results = []
     model_used = None
+    embedding_error: str | None = None
 
     if _is_workspace_mode():
         emb_stats = wdb.embedding_stats(project=project)
@@ -1371,6 +1372,11 @@ def hybrid_search(
                 )
             model_used = model_name
         except Exception as e:
+            # Fail fast and report clearly when the embedding provider
+            # (e.g. Ollama) is unreachable or misconfigured. We still
+            # return FTS-only results, but include the error so clients
+            # can surface it instead of silently degrading.
+            embedding_error = str(e)
             logger.warning("Embedding search failed, using FTS only: %s", e)
 
     if embedding_results:
@@ -1383,12 +1389,15 @@ def hybrid_search(
             "results": merged[:limit],
         }, indent=2)
     else:
-        return json.dumps({
+        payload: dict[str, object] = {
             "query": query,
             "mode": "keyword only (no embeddings available)",
             "result_count": min(len(fts_results), limit),
             "results": fts_results[:limit],
-        }, indent=2)
+        }
+        if embedding_error is not None:
+            payload["embedding_error"] = embedding_error
+        return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -1412,6 +1421,64 @@ def embedding_status(project: str | None = None) -> str:
         stats["hint"] = "Run 'srclight index --embed <model>' to generate embeddings"
 
     return json.dumps(stats, indent=2)
+
+
+@mcp.tool()
+def embedding_health(project: str | None = None) -> str:
+    """Check if the configured embedding provider is reachable.
+
+    Uses embedding_stats() to find the active model, then performs a
+    lightweight provider-specific health check (e.g. Ollama /api/tags).
+    Returns a JSON blob with status, model, and any error message so
+    clients can surface problems instead of silently degrading.
+    """
+    if _is_workspace_mode():
+        wdb = _get_workspace_db()
+        stats = wdb.embedding_stats(project=project)
+    else:
+        db = _get_db()
+        stats = db.embedding_stats()
+
+    if not stats.get("model"):
+        return json.dumps({
+            "status": "no_embeddings",
+            "detail": "No embeddings found in the index. Run 'srclight index --embed <model>' first.",
+            "stats": stats,
+        }, indent=2)
+
+    model_name = stats["model"]
+    from .embeddings import get_provider
+
+    result: dict[str, object] = {
+        "status": "unknown",
+        "model": model_name,
+        "dimensions": stats.get("dimensions"),
+    }
+
+    try:
+        provider = get_provider(model_name)
+
+        # OllamaProvider exposes is_available(), which hits /api/tags with a short timeout.
+        is_available = getattr(provider, "is_available", None)
+        if callable(is_available):
+            ok = bool(is_available())
+            result["provider"] = provider.name
+            result["reachable"] = ok
+            if ok:
+                result["status"] = "ok"
+            else:
+                result["status"] = "error"
+                result["error"] = "Embedding provider reported is_available() == False"
+        else:
+            # Fallback: we don't know how to health-check this provider without
+            # running a full embed call. Leave status as unknown but include name.
+            result["provider"] = getattr(provider, "name", model_name)
+            result["status"] = "unknown"
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+
+    return json.dumps(result, indent=2)
 
 
 def configure(db_path: Path | None = None, repo_root: Path | None = None) -> None:

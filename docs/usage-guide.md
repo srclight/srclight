@@ -97,7 +97,20 @@ claude mcp add --transport sse srclight http://127.0.0.1:8742/sse
 claude mcp add --transport sse srclight http://127.0.0.1:8742/sse
 ```
 
-#### Option C: Claude Desktop (`claude_desktop_config.json`)
+#### Option C: Cursor
+
+**Recommended: SSE (streamable HTTP).** Run srclight as a long-lived server (Option B above or `srclight serve -p 8742` in a terminal), then point Cursor at it. Config lives in project `.cursor/mcp.json` or user `~/.cursor/mcp.json`. Example: [cursor-mcp-example.json](cursor-mcp-example.json).
+
+- **UI:** Settings → Tools & MCP → Add new MCP server → Type **streamableHttp**, URL: `http://127.0.0.1:8742/sse`. Name it e.g. `srclight`.
+- Ensure srclight is running first (e.g. `srclight serve --workspace myworkspace` or your systemd service).
+- Restart Cursor completely after adding the server.
+
+Alternatively you can use **stdio** (Type **command**, Command: `srclight`, Args: `serve --workspace myworkspace`); SSE is preferred so the server is already warm and tools don’t pay cold-start.
+- **If tools feel stuck:** Cursor applies a short timeout to MCP tool calls (~60–120s). Srclight uses a 20s timeout for embedding API calls so search returns quickly or falls back to keyword-only. Prefer SSE so the first request doesn’t pay cold-start cost.
+
+**WSL + Windows Cursor:** If Cursor runs on Windows and srclight runs in WSL, `http://127.0.0.1:8742/sse` works the same way — WSL2 forwards localhost to Windows.
+
+#### Option D: Claude Desktop (`claude_desktop_config.json`)
 
 ```json
 {
@@ -274,6 +287,20 @@ claude mcp remove srclight
 claude mcp add --scope user srclight -- srclight serve --workspace myworkspace
 ```
 
+### Tools get stuck or timeout in Cursor
+Cursor applies a short timeout to MCP tool calls. Srclight avoids long blocks by:
+
+- Using a **20s timeout** for embedding API requests (Ollama, OpenAI, etc.). If the embed service is slow or unreachable, the tool returns within 20s: `hybrid_search` falls back to keyword-only; `semantic_search` returns an error with a hint.
+- Prefer **SSE** (streamable HTTP) with a long-running server so the first request doesn’t pay cold-start (workspace load, vector cache load). In Cursor MCP config, use Type **streamableHttp** and URL `http://127.0.0.1:8742/sse` with srclight started separately (e.g. systemd or a terminal).
+
+If you need a longer embed timeout (e.g. for slow Ollama on first load), set:
+
+```bash
+export SRCLIGHT_EMBED_REQUEST_TIMEOUT=45
+```
+
+Then start Cursor (or start srclight with that env in its process).
+
 ### Semantic search returning stale results
 ```bash
 # Check embedding status via CLI
@@ -282,6 +309,9 @@ srclight index --embed qwen3-embedding
 
 # Or ask the agent: "What's the embedding status?"
 # → calls embedding_status() tool
+
+# Check whether the embedding provider (e.g. Ollama) is reachable
+# → calls embedding_health() tool
 ```
 
 ### Hook not firing

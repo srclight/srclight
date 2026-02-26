@@ -189,6 +189,37 @@ claude mcp add --transport sse srclight http://127.0.0.1:8742/sse
 
 SSE mode supports multiple concurrent sessions and survives Claude Code restarts.
 
+### Cursor
+
+**SSE (recommended):** Run srclight once, then connect Cursor to it. Best for responsiveness and no cold-start per session.
+
+Start the server: `srclight serve --workspace myworkspace` (default SSE on port 8742).
+
+- **UI:** Settings → Tools & MCP → Add new MCP server → Type: `streamableHttp`, URL: `http://127.0.0.1:8742/sse`.
+- **JSON** (project `.cursor/mcp.json` or global `~/.cursor/mcp.json`):
+
+```json
+"srclight": {
+  "url": "http://127.0.0.1:8742/sse"
+}
+```
+
+**Stdio (alternative):** One server process per Cursor session.
+
+- **UI:** Type: `command`, Command: `srclight`, Args: `serve --workspace myworkspace` (or `serve` for single-repo).
+- **JSON:**
+
+```json
+"srclight": {
+  "command": "srclight",
+  "args": ["serve", "--workspace", "myworkspace"]
+}
+```
+
+For single-repo: `"args": ["serve"]`. Restart Cursor completely after adding the server.
+
+**Verify:** In Cursor chat, ask "What projects are in the srclight workspace?" or "List srclight tools" — the agent should call `list_projects()` or show srclight tools.
+
 ### OpenClaw
 
 OpenClaw connects to srclight via [mcporter](https://mcporter.dev), its built-in MCP tool server CLI.
