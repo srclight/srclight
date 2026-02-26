@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.srclight/srclight",
   "title": "Srclight",
-  "description": "Deep code indexing for AI agents. 25 MCP tools: hybrid FTS5 + embedding search, call graphs, git blame/hotspots, build system analysis. Multi-repo workspaces, GPU-accelerated semantic search, 10 languages via tree-sitter. Fully local, zero cloud dependencies, single SQLite file per repo.",
+  "description": "Deep code indexing for AI agents. FTS5 + embeddings + call graphs + git intelligence. Fully local.",
   "version": "0.11.0",
   "packages": [
     {
