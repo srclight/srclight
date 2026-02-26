@@ -20,6 +20,22 @@ from srclight.embeddings import (
     vector_to_bytes,
     vectors_to_bytes,
 )
+from srclight.embeddings import _embed_request_timeout
+
+
+# --- Embed request timeout (Cursor/IDE tool timeout) ---
+
+
+def test_embed_request_timeout_default():
+    import os
+    with patch.dict("os.environ", {}, clear=False):
+        os.environ.pop("SRCLIGHT_EMBED_REQUEST_TIMEOUT", None)
+        assert _embed_request_timeout() == 20
+
+
+def test_embed_request_timeout_from_env():
+    with patch.dict("os.environ", {"SRCLIGHT_EMBED_REQUEST_TIMEOUT": "45"}, clear=False):
+        assert _embed_request_timeout() == 45
 
 
 # --- Fixtures ---

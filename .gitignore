@@ -24,3 +24,5 @@ htmlcov/
 Thumbs.db
 .mcpregistry_*
 .playwright-mcp/
+*.png
+mcp-publisher
