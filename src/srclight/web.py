@@ -34,7 +34,9 @@ def _dashboard_html() -> str:
     button { background: var(--accent); color: #fff; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
     button.secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
     .loading { color: var(--muted); }
+    .muted { color: var(--muted); }
     .error { color: #f85149; font-size: 0.9rem; }
+    .workspace-alert { background: rgba(248,81,73,0.15); border: 1px solid #f85149; border-radius: 6px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; }
     .flex { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
     pre { white-space: pre-wrap; font-size: 0.85rem; max-height: 300px; overflow: auto; margin: 0.5rem 0 0; }
     p.note { font-size: 0.9rem; color: var(--success); margin: 0 0 1rem; }
@@ -43,6 +45,20 @@ def _dashboard_html() -> str:
 <body>
   <h1>Srclight</h1>
   <p class="note"><strong>Local only.</strong> Server listens on 127.0.0.1. Same server as MCP (SSE at <code>/sse</code>, Streamable HTTP at <code>/mcp</code>).</p>
+
+  <div id="workspaceAlert" class="workspace-alert" style="display: none;"></div>
+
+  <section>
+    <h2>Workspace</h2>
+    <div class="flex" style="align-items: center; gap: 0.5rem;">
+      <label for="workspaceSelect" style="margin: 0; color: var(--muted);">Current workspace:</label>
+      <select id="workspaceSelect" style="max-width: 200px; padding: 0.4rem 0.5rem;">
+        <option value="">Loading…</option>
+      </select>
+      <span id="workspaceSwitchResult" class="muted" style="font-size: 0.85rem;"></span>
+    </div>
+    <p style="margin: 0.5rem 0 0; font-size: 0.85rem; color: var(--muted);">Switch workspace to change which projects List projects / Codebase map use. Create workspaces with <code>srclight workspace init NAME</code>.</p>
+  </section>
 
   <section>
     <h2>Status</h2>
@@ -56,7 +72,7 @@ def _dashboard_html() -> str:
   </section>
 
   <section>
-    <h2>Workspace</h2>
+    <h2>Projects &amp; map</h2>
     <div class="flex">
       <button type="button" id="btnListProjects">List projects</button>
       <button type="button" id="btnCodebaseMap">Codebase map</button>
@@ -138,6 +154,75 @@ def _dashboard_html() -> str:
         set('restartOutput', JSON.stringify(data, null, 2));
       } catch (e) { set('restartOutput', e.message, true); }
     };
+
+    const workspaceSelect = document.getElementById('workspaceSelect');
+    const workspaceSwitchResult = document.getElementById('workspaceSwitchResult');
+    const workspaceAlert = document.getElementById('workspaceAlert');
+    async function loadWorkspaceSelector() {
+      try {
+        const [workspaces, current] = await Promise.all([api('/api/workspaces'), api('/api/current_workspace')]);
+        const cur = current.current_workspace;
+        const available = workspaces.workspaces || [];
+        workspaceSelect.innerHTML = '';
+        if (!cur) {
+          const opt = document.createElement('option');
+          opt.value = '';
+          opt.textContent = '— single-repo mode (no workspace) —';
+          workspaceSelect.appendChild(opt);
+        }
+        if (available.length === 0 && cur) {
+          const opt = document.createElement('option');
+          opt.value = cur;
+          opt.textContent = cur + ' (config not found — create workspace or restart)';
+          opt.selected = true;
+          workspaceSelect.appendChild(opt);
+          workspaceAlert.textContent = "Workspace '" + cur + "' not found. Create it with srclight workspace init " + cur + " (and add projects), or restart the server with an existing workspace: srclight serve --workspace NAME --web.";
+          workspaceAlert.style.display = 'block';
+        } else {
+          available.forEach(name => {
+            const opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            workspaceSelect.appendChild(opt);
+          });
+          if (cur && available.includes(cur)) {
+            workspaceSelect.value = cur;
+            workspaceAlert.style.display = 'none';
+          } else if (cur) {
+            const opt = document.createElement('option');
+            opt.value = cur;
+            opt.textContent = cur + ' (not found — create or restart server)';
+            opt.selected = true;
+            workspaceSelect.insertBefore(opt, workspaceSelect.firstChild);
+            workspaceAlert.textContent = "Workspace '" + cur + "' not found. Select an existing workspace above, or create it with srclight workspace init " + cur + ", or restart with: srclight serve --workspace NAME --web.";
+            workspaceAlert.style.display = 'block';
+          }
+        }
+      } catch (e) {
+        workspaceSelect.innerHTML = '<option value="">Error loading workspaces</option>';
+        workspaceSwitchResult.textContent = e.message;
+        workspaceSwitchResult.className = 'error';
+        workspaceAlert.style.display = 'none';
+      }
+    }
+    workspaceSelect.addEventListener('change', async () => {
+      const name = workspaceSelect.value;
+      if (!name) return;
+      const sel = workspaceSelect.selectedOptions[0];
+      if (sel && sel.textContent.includes('(not found')) return;
+      workspaceSwitchResult.textContent = 'Switching…';
+      workspaceSwitchResult.className = '';
+      try {
+        await api('/api/switch_workspace', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workspace: name }) });
+        workspaceSwitchResult.textContent = 'Switched to ' + name;
+        workspaceSwitchResult.className = '';
+      } catch (e) {
+        workspaceSwitchResult.textContent = e.message;
+        workspaceSwitchResult.className = 'error';
+      }
+    });
+    loadWorkspaceSelector();
+
     document.getElementById('btnServerStats').click();
   </script>
 </body>
@@ -224,6 +309,45 @@ async def _api_restart_server(_request: Request) -> Response:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+async def _api_workspaces(_request: Request) -> Response:
+    try:
+        from .workspace import WorkspaceConfig
+        names = WorkspaceConfig.list_all()
+        return JSONResponse({"workspaces": names})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def _api_current_workspace(_request: Request) -> Response:
+    try:
+        from . import server as server_mod
+        current = getattr(server_mod, "_workspace_name", None)
+        return JSONResponse({"current_workspace": current})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def _api_switch_workspace(request: Request) -> Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    name = data.get("workspace") if isinstance(data, dict) else None
+    if not name or not isinstance(name, str):
+        return JSONResponse({"error": "workspace name required"}, status_code=400)
+    try:
+        from .workspace import WorkspaceConfig
+        WorkspaceConfig.load(name)
+    except FileNotFoundError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    try:
+        from . import server as server_mod
+        server_mod.configure_workspace(name)
+        return JSONResponse({"ok": True, "workspace": name})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 async def _dashboard(_request: Request) -> Response:
     return HTMLResponse(_dashboard_html())
 
@@ -233,6 +357,9 @@ def add_web_routes(app: "Starlette") -> None:
     from starlette.routing import Route
     routes = [
         Route("/", _dashboard, methods=["GET"]),
+        Route("/api/workspaces", _api_workspaces, methods=["GET"]),
+        Route("/api/current_workspace", _api_current_workspace, methods=["GET"]),
+        Route("/api/switch_workspace", _api_switch_workspace, methods=["POST"]),
         Route("/api/list_projects", _api_list_projects, methods=["GET"]),
         Route("/api/codebase_map", _api_codebase_map, methods=["GET"]),
         Route("/api/index_status", _api_index_status, methods=["GET"]),
