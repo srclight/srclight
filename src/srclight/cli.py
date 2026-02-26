@@ -258,7 +258,8 @@ def status(db_path: str | None):
 @click.option("--workspace", "-w", "workspace_name", help="Workspace name (multi-repo mode)")
 @click.option("--transport", "-t", type=click.Choice(["stdio", "sse"]), default="sse", help="Transport (stdio or sse, default: sse)")
 @click.option("--port", "-p", default=8742, help="Port for SSE transport (default: 8742)")
-def serve(db_path: str | None, workspace_name: str | None, transport: str, port: int):
+@click.option("--web", is_flag=True, help="Serve dashboard and REST API at / and /api/* (SSE only)")
+def serve(db_path: str | None, workspace_name: str | None, transport: str, port: int, web: bool):
     """Start the MCP server."""
     from .server import configure, configure_workspace, run_server
 
@@ -272,6 +273,39 @@ def serve(db_path: str | None, workspace_name: str | None, transport: str, port:
         root = _find_repo_root(Path.cwd())
         db_file = _get_db_path(root)
         configure(db_path=db_file, repo_root=root)
+
+    if transport == "sse" and web:
+        import anyio
+        import time
+        from . import server as server_mod
+        if server_mod._server_start_time is None:
+            server_mod._server_start_time = time.time()
+        from .server import make_sse_and_streamable_http_app
+        from .web import add_web_routes
+        app = make_sse_and_streamable_http_app(mount_path="/")
+        add_web_routes(app)
+        server_mod.mcp.settings.host = "127.0.0.1"
+        server_mod.mcp.settings.port = port
+        import uvicorn
+        log_level = getattr(server_mod.mcp.settings, "log_level", "info")
+        if isinstance(log_level, str):
+            log_level = log_level.lower()
+        config = uvicorn.Config(
+            app,
+            host=server_mod.mcp.settings.host,
+            port=server_mod.mcp.settings.port,
+            log_level=log_level,
+        )
+
+        async def _run():
+            srv = uvicorn.Server(config)
+            await srv.serve()
+
+        anyio.run(_run)
+        return
+
+    if web and transport != "sse":
+        click.echo("--web requires --transport sse; ignoring --web.", err=True)
 
     run_server(transport=transport, port=port)
 

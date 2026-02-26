@@ -26,3 +26,6 @@ Thumbs.db
 .playwright-mcp/
 *.png
 mcp-publisher
+
+# CLAUDE.md is private — golden copy in Vault only
+CLAUDE.md

@@ -6,8 +6,12 @@ Supports both single-repo mode and workspace mode (multi-repo via ATTACH+UNION).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -64,6 +68,11 @@ srclight workspace index -w WORKSPACE_NAME -p PROJECT_NAME --embed qwen3-embeddi
 srclight hook install --workspace WORKSPACE_NAME
 ```
 The server picks up new projects automatically (no restart needed).
+
+## Setup and server control
+- `setup_guide()` — Structured instructions for agents: how to add a workspace, connect Cursor, where config lives, how to index with embeddings, hook install. Call when the user or agent needs setup steps.
+- `server_stats()` — When the server started and uptime (for \"how long has srclight been up\").
+- `restart_server()` — (SSE only, opt-in) Exit the process so a process manager can restart. Requires SRCLIGHT_ALLOW_RESTART=1.
 """,
 )
 
@@ -1481,6 +1490,106 @@ def embedding_health(project: str | None = None) -> str:
     return json.dumps(result, indent=2)
 
 
+# Set when run_server() or first tool runs — for server_stats
+_server_start_time: float | None = None
+
+
+@mcp.tool()
+async def server_stats() -> str:
+    """Return when this server process started and how long it has been running."""
+    global _server_start_time
+    if _server_start_time is None:
+        _server_start_time = time.time()
+    now = time.time()
+    uptime = now - _server_start_time
+    started_at = datetime.fromtimestamp(_server_start_time, tz=timezone.utc)
+    return json.dumps({
+        "started_at": started_at.isoformat(),
+        "started_at_epoch": _server_start_time,
+        "uptime_seconds": round(uptime, 2),
+        "uptime_human": f"{int(uptime)}s",
+    }, indent=2)
+
+
+@mcp.tool()
+async def restart_server() -> str:
+    """Request the server to exit so a process manager can restart it (SSE only, opt-in).
+    Requires SRC LIGHT_ALLOW_RESTART=1."""
+    if os.environ.get("SRCLIGHT_ALLOW_RESTART") != "1":
+        return json.dumps({
+            "ok": False,
+            "message": "Restart is disabled. Set SRCLIGHT_ALLOW_RESTART=1 and run under a process manager that restarts on exit.",
+            "hint": "Example: SRCLIGHT_ALLOW_RESTART=1 srclight serve --workspace NAME --transport sse --port 8742",
+        }, indent=2)
+
+    def _exit():
+        os._exit(0)
+
+    asyncio.get_running_loop().call_later(0, _exit)
+    return json.dumps({
+        "ok": True,
+        "message": "Server will exit now. Reconnect after your process manager restarts it.",
+    }, indent=2)
+
+
+@mcp.tool()
+async def setup_guide() -> str:
+    """Structured setup instructions for AI agents and users.
+    Returns: how to add a workspace, connect Cursor, where config lives, how to index with embeddings, hook install."""
+    from .workspace import WORKSPACES_DIR
+
+    return json.dumps({
+        "title": "Srclight setup guide for agents",
+        "config_location": {
+            "workspaces_dir": str(WORKSPACES_DIR),
+            "description": "Workspace configs are JSON files: ~/.srclight/workspaces/{name}.json",
+        },
+        "steps": [
+            {
+                "step": 1,
+                "title": "Create or use a workspace",
+                "commands": [
+                    "srclight workspace init WORKSPACE_NAME",
+                    "srclight workspace add /path/to/repo -w WORKSPACE_NAME",
+                ],
+            },
+            {
+                "step": 2,
+                "title": "Index the workspace (optionally with embeddings)",
+                "commands": [
+                    "srclight workspace index -w WORKSPACE_NAME",
+                    "srclight workspace index -w WORKSPACE_NAME --embed qwen3-embedding",
+                ],
+                "notes": "Ollama on localhost:11434 for qwen3-embedding. Server hot-reloads; no restart needed after indexing.",
+            },
+            {
+                "step": 3,
+                "title": "Install git hooks (optional, for auto-reindex)",
+                "commands": ["srclight hook install --workspace WORKSPACE_NAME"],
+            },
+            {
+                "step": 4,
+                "title": "Start the MCP server and connect Cursor",
+                "commands": [
+                    "srclight serve --workspace WORKSPACE_NAME",
+                    "# Or with web dashboard: srclight serve --workspace WORKSPACE_NAME --web",
+                ],
+                "notes": "Server binds to 127.0.0.1:8742. In Cursor MCP config use URL http://127.0.0.1:8742 (Streamable HTTP /mcp or SSE /sse). Start server before opening Cursor.",
+            },
+        ],
+        "for_agents": "Call codebase_map() at session start. Use list_projects() to see repos. Use setup_guide() to get these steps for the user.",
+    }, indent=2)
+
+
+def make_sse_and_streamable_http_app(mount_path: str | None = "/"):
+    """Return a Starlette app serving both SSE and Streamable HTTP on one port (Cursor compatibility)."""
+    streamable_app = mcp.streamable_http_app()
+    sse_app = mcp.sse_app(mount_path=mount_path)
+    sse_routes = [r for r in sse_app.routes if getattr(r, "path", None) in ("/sse", "/messages")]
+    streamable_app.router.routes.extend(sse_routes)
+    return streamable_app
+
+
 def configure(db_path: Path | None = None, repo_root: Path | None = None) -> None:
     """Configure the server for single-repo mode."""
     global _db_path, _repo_root, _db, _vector_cache
@@ -1503,6 +1612,9 @@ def configure_workspace(workspace_name: str) -> None:
 
 def run_server(transport: str = "sse", port: int = 8742):
     """Start the MCP server."""
+    global _server_start_time
+    if _server_start_time is None:
+        _server_start_time = time.time()
     if transport == "sse":
         mcp.settings.host = "127.0.0.1"
         mcp.settings.port = port
