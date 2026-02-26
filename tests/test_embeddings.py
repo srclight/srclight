@@ -6,8 +6,10 @@ from unittest.mock import patch
 import pytest
 
 from srclight.embeddings import (
+    CohereProvider,
     EmbeddingProvider,
     OllamaProvider,
+    OpenAIProvider,
     VoyageProvider,
     bytes_to_vector,
     cosine_similarity,
@@ -190,6 +192,60 @@ def test_get_provider_voyage():
 def test_get_provider_voyage_explicit():
     provider = get_provider("voyage:voyage-code-3", api_key="test-key")
     assert isinstance(provider, VoyageProvider)
+
+
+def test_get_provider_openai():
+    with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
+        provider = get_provider("openai:text-embedding-3-small")
+        assert isinstance(provider, OpenAIProvider)
+        assert "openai" in provider.name
+        assert "text-embedding-3-small" in provider.name
+
+
+def test_get_provider_openai_inferred():
+    with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
+        provider = get_provider("text-embedding-3-small")
+        assert isinstance(provider, OpenAIProvider)
+
+
+def test_get_provider_openai_custom_base_url():
+    provider = get_provider(
+        "openai:my-model",
+        api_key="test-key",
+        base_url="https://api.together.xyz",
+    )
+    assert isinstance(provider, OpenAIProvider)
+    assert provider._base_url == "https://api.together.xyz"
+
+
+def test_get_provider_openai_no_key():
+    with patch.dict("os.environ", {}, clear=True):
+        # Remove OPENAI_API_KEY if set
+        import os
+        os.environ.pop("OPENAI_API_KEY", None)
+        with pytest.raises(ValueError, match="API key required"):
+            get_provider("openai:text-embedding-3-small")
+
+
+def test_get_provider_cohere():
+    with patch.dict("os.environ", {"COHERE_API_KEY": "test-key"}):
+        provider = get_provider("cohere:embed-v4.0")
+        assert isinstance(provider, CohereProvider)
+        assert "cohere" in provider.name
+
+
+def test_get_provider_cohere_inferred():
+    with patch.dict("os.environ", {"COHERE_API_KEY": "test-key"}):
+        provider = get_provider("embed-v4.0")
+        assert isinstance(provider, CohereProvider)
+
+
+def test_get_provider_cohere_no_key():
+    with patch.dict("os.environ", {}, clear=True):
+        import os
+        os.environ.pop("COHERE_API_KEY", None)
+        with pytest.raises(ValueError, match="Cohere API key required"):
+            get_provider("cohere:embed-v4.0")
 
 
 def test_get_provider_unknown():

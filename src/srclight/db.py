@@ -169,7 +169,8 @@ CREATE TABLE IF NOT EXISTS index_state (
     config_hash TEXT,
     files_indexed INTEGER DEFAULT 0,
     symbols_indexed INTEGER DEFAULT 0,
-    indexed_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    indexed_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    indexer_version TEXT
 );
 
 -- Embeddings (optional, populated when embed model is configured)
@@ -279,6 +280,11 @@ class Database:
             "INSERT OR IGNORE INTO schema_info (key, value) VALUES (?, ?)",
             ("embedding_cache_version", "0"),
         )
+        # Migrate: add indexer_version column if missing (pre-0.10.1 DBs)
+        try:
+            self.conn.execute("ALTER TABLE index_state ADD COLUMN indexer_version TEXT")
+        except Exception:
+            pass  # column already exists
         self.conn.commit()
 
     # --- Files ---
@@ -1095,17 +1101,19 @@ class Database:
     def update_index_state(
         self, repo_root: str, last_commit: str | None = None,
         files_indexed: int = 0, symbols_indexed: int = 0,
+        indexer_version: str | None = None,
     ) -> None:
         assert self.conn is not None
         self.conn.execute(
-            """INSERT INTO index_state (repo_root, last_commit, files_indexed, symbols_indexed)
-               VALUES (?, ?, ?, ?)
+            """INSERT INTO index_state (repo_root, last_commit, files_indexed, symbols_indexed, indexer_version)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(repo_root) DO UPDATE SET
                    last_commit=excluded.last_commit,
                    files_indexed=excluded.files_indexed,
                    symbols_indexed=excluded.symbols_indexed,
+                   indexer_version=excluded.indexer_version,
                    indexed_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')""",
-            (repo_root, last_commit, files_indexed, symbols_indexed),
+            (repo_root, last_commit, files_indexed, symbols_indexed, indexer_version),
         )
         self.conn.commit()
 

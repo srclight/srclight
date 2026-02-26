@@ -8,7 +8,7 @@
 
 **Deep code indexing for AI agents.** SQLite FTS5 + tree-sitter + embeddings + MCP.
 
-Srclight builds a rich, searchable index of your codebase that AI coding agents can query instantly — replacing dozens of grep/glob calls with precise, structured lookups.
+Srclight builds a rich, searchable index of your codebase that AI coding agents can query instantly — replacing dozens of grep/glob calls with precise, structured lookups. It is the most comprehensive code intelligence MCP server available: 25 tools covering symbol search, relationship graphs, git change intelligence, semantic search, and build system awareness — capabilities no other single MCP server combines. Fully local and private: your code never leaves your machine.
 
 ## Why?
 
@@ -26,7 +26,7 @@ AI coding agents (Claude Code, Cursor, etc.) spend **40-60% of their tokens on o
 - **Minimal dependencies** — single SQLite file per repo, no Docker/Redis/vector DB
 - **Fully offline** — no API calls, works air-gapped (Ollama local embeddings)
 - **Incremental** — only re-indexes changed files (content hash detection)
-- **8 languages** — Python, C, C++, C#, JavaScript, TypeScript, Rust, Markdown
+- **10 languages** — Python, C, C++, C#, JavaScript, TypeScript, Dart, Swift, Kotlin, Java, Go
 - **4 search modes** — symbol names, source code (trigram), documentation (stemmed), semantic (embeddings)
 - **Hybrid search** — RRF fusion of keyword + semantic results for best accuracy
 - **Multi-repo workspaces** — search across all your repos simultaneously via SQLite ATTACH+UNION
@@ -339,6 +339,26 @@ repo3/.srclight/index.db  ──┘
 ```
 
 Each repo is indexed independently. At query time, SQLite's ATTACH mechanism joins them into a single searchable namespace. Handles >10 repos via automatic batching (SQLite's ATTACH limit).
+
+## How Srclight Compares
+
+A survey of 50+ MCP code intelligence servers across all major registries (Official MCP Registry, Smithery, Glama, mcp.so, awesome-mcp-servers) found that no other single server combines srclight's full capabilities:
+
+| Capability | srclight | grep/glob (default) | CodeMCP (SCIP) | Claude Context (Zilliz) |
+|-----------|----------|---------------------|----------------|------------------------|
+| Symbol search (FTS5) | 3 indexes (name, content, docs) | None | SCIP-based | BM25 |
+| Semantic search (embeddings) | GPU-accelerated, ~3ms | None | None | OpenAI API + Milvus |
+| Hybrid search (keyword + semantic) | RRF fusion | None | None | BM25 + vector |
+| Relationship graph (callers, callees) | tree-sitter edges | None | SCIP edges | None |
+| Git change intelligence | blame, hotspots, WIP | None | None | None |
+| Build system awareness | CMake, .csproj, #ifdef | None | None | None |
+| Multi-repo workspace | ATTACH+UNION | None | None | None |
+| Infrastructure required | `pip install`, SQLite | None | SCIP indexer | Docker, Milvus, OpenAI API |
+| Fully local / private | Yes, zero API calls | Yes | Yes | No (needs OpenAI) |
+| Languages | 10 | Any (regex) | 5 (SCIP) | Any (chunking) |
+| MCP tools | 25 | 2 (grep, glob) | 80+ | ~10 |
+
+Unlike grep-based tools, srclight builds a persistent index with structured lookups. Unlike cloud-based solutions, everything runs locally — your code never leaves your machine. Unlike IDE plugins, srclight works with any MCP client.
 
 ## Roadmap
 

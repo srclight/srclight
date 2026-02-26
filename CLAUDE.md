@@ -120,7 +120,19 @@ Currently extracted: `calls`, `inherits`. Graph queries: callers, callees, depen
 |-------|----------|------|---------|-------|
 | `qwen3-embedding` | Ollama | varies | Best local | Default. Needs ~6GB VRAM |
 | `nomic-embed-text` | Ollama | 768 | Good local | Lighter, 137M params |
+| `text-embedding-3-small` | OpenAI | 1536 | Good | Requires OPENAI_API_KEY |
+| `text-embedding-3-large` | OpenAI | 3072 | Better | Requires OPENAI_API_KEY |
+| `embed-v4.0` | Cohere | 1024 | Good | Requires COHERE_API_KEY |
 | `voyage-code-3` | Voyage API | 1024 | Best overall | Requires VOYAGE_API_KEY |
+
+### OpenAI-compatible providers
+Any service speaking the `/v1/embeddings` format works with the `openai:` prefix.
+Set `OPENAI_BASE_URL` to point at the provider:
+```sh
+export OPENAI_API_KEY=your-key
+export OPENAI_BASE_URL=https://api.together.xyz  # Together, Fireworks, etc.
+srclight index --embed openai:your-model /path/to/repo
+```
 
 ## Server Robustness
 - **Workspace config hot-reload**: `_get_workspace_db()` checks config file mtime — adding repos via `srclight workspace add` takes effect immediately, no server restart needed
@@ -147,6 +159,33 @@ Semantic versioning:
 - Do NOT run builds without the venv — `tree-sitter` bindings are in `.venv/`
 - Do NOT add torch/transformers as hard dependencies — numpy is optional (for vector cache), cupy is optional (for GPU acceleration)
 
+## Release Process
+
+### Git Flow
+```sh
+# Feature development
+git checkout develop && git checkout -b feature/xxx
+# ... work ...
+git checkout develop && git merge feature/xxx
+git checkout master && git merge develop
+git tag -a vX.Y.Z -m "vX.Y.Z description"
+git push origin master develop --tags
+gh release create vX.Y.Z --title "vX.Y.Z — Description" --notes "Notes"
+```
+
+### Automated Publishing (GitHub Actions)
+On `release: [published]`, `.github/workflows/publish.yml` runs:
+1. **PyPI** — trusted publisher via OIDC, no secrets needed
+2. **MCP Registry** — `mcp-publisher` with OIDC auth, patches version from git tag
+
+### Post-Release Checklist
+1. Reinstall dev package: `pip install -e .`
+2. Reindex workspace: `srclight workspace index -w <workspace> --embed qwen3-embedding`
+3. Verify `index_status()` shows new `indexer_version`
+
+### server.json
+Updated automatically during CI from git tag. Description should be keyword-rich for AI discovery. Current keywords: "code indexing", "MCP tools", "FTS5", "embedding search", "call graphs", "git blame", "multi-repo", "fully local".
+
 ## Documentation Strategy
 
 This is a public repo. Keep a clear split between public docs and private strategic notes.
@@ -162,7 +201,9 @@ Strategic, competitive, and personal notes live in Tim's Vault:
 
 | Location | Contents |
 |----------|----------|
-| `Areas/Code Indexing/` | Competitive landscape, architecture research, embedding model analysis, ideal agent index design, FTS5 lessons |
+| `Areas/Srclight/Marketing/` | AI discovery strategy, draft posts, launch playbook, competitive analysis |
+| `Areas/Srclight/performance-analysis.md` | Embedding bottleneck analysis, GPU/platform support |
+| `Areas/Code Indexing/` | Architecture research, embedding model analysis, FTS5 lessons |
 | `Projects/srclight-personal-claude.md` | Personal dev environment: machine paths, hardware, workspace config, systemd, MCP setup |
 
 ### CLAUDE.md Backup
@@ -170,13 +211,15 @@ A copy of this file is kept in the private Vault (`Projects/srclight-CLAUDE-md-b
 
 ### Rule of thumb
 - Mentions competitors, pricing, market strategy, or "why to build this" → **Vault**
+- Marketing plans, registry strategy, posting schedules, AI-persuasion techniques → **Vault** (`Areas/Srclight/Marketing/`)
 - Personal paths, hardware specs, workspace names → **Vault** (`srclight-personal-claude.md`)
 - Helps an external user or contributor use/understand srclight → **`docs/`**
-- Do NOT put strategic analysis or personal infra details in the public repo
+- Release process (git flow, CI) is fine in public CLAUDE.md
+- Do NOT put strategic analysis, marketing plans, or personal infra details in the public repo
 
 ## Testing
 
-105 tests: db (8), indexer (8), features (14), workspace (7), hooks (9), git (9), build (6), embeddings (20), workspace batch (1), vector_math (9), vector_cache (11).
+113 tests: db (8), indexer (9), features (14), workspace (7), hooks (11), git (9), build (6), embeddings (27), vector_math (7), vector_cache (11), workspace batch (1).
 
 ```sh
 python -m pytest tests/ -v
