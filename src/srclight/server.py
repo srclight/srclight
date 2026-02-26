@@ -72,7 +72,7 @@ The server picks up new projects automatically (no restart needed).
 ## Setup and server control
 - `setup_guide()` — Structured instructions for agents: how to add a workspace, connect Cursor, where config lives, how to index with embeddings, hook install. Call when the user or agent needs setup steps.
 - `server_stats()` — When the server started and uptime (for \"how long has srclight been up\").
-- `restart_server()` — (SSE only, opt-in) Exit the process so a process manager can restart. Requires SRCLIGHT_ALLOW_RESTART=1.
+- `restart_server()` — (SSE only) Exit so a process manager can restart. Allowed by default; set SRCLIGHT_ALLOW_RESTART=0 to disable.
 """,
 )
 
@@ -1513,13 +1513,18 @@ async def server_stats() -> str:
 
 @mcp.tool()
 async def restart_server() -> str:
-    """Request the server to exit so a process manager can restart it (SSE only, opt-in).
-    Requires SRC LIGHT_ALLOW_RESTART=1."""
-    if os.environ.get("SRCLIGHT_ALLOW_RESTART") != "1":
+    """Request the server to exit so a process manager can restart it (SSE only).
+
+    Exits with code 0 so a wrapper can start a fresh process (e.g. loads updated
+    code). Client must reconnect after restart. Restart is allowed by default;
+    set SRCLIGHT_ALLOW_RESTART=0 to disable.
+    """
+    allow = os.environ.get("SRCLIGHT_ALLOW_RESTART", "1").strip().lower()
+    if allow in ("0", "false", "no"):
         return json.dumps({
             "ok": False,
-            "message": "Restart is disabled. Set SRCLIGHT_ALLOW_RESTART=1 and run under a process manager that restarts on exit.",
-            "hint": "Example: SRCLIGHT_ALLOW_RESTART=1 srclight serve --workspace NAME --transport sse --port 8742",
+            "message": "Restart is disabled (SRCLIGHT_ALLOW_RESTART=0). Remove it or set to 1 to allow.",
+            "hint": "Example: srclight serve --workspace NAME --transport sse --port 8742",
         }, indent=2)
 
     def _exit():

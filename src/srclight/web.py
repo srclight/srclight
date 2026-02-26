@@ -91,7 +91,7 @@ def _dashboard_html() -> str:
   <section>
     <h2>Server control</h2>
     <div class="flex">
-      <button type="button" id="btnRestart" class="secondary">Request restart (SRCLIGHT_ALLOW_RESTART=1)</button>
+      <button type="button" id="btnRestart" class="secondary">Request restart (SSE only; set SRCLIGHT_ALLOW_RESTART=0 to disable)</button>
     </div>
     <div id="restartOutput" class="loading"></div>
   </section>
