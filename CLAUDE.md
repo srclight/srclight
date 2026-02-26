@@ -163,20 +163,35 @@ Semantic versioning:
 
 ### Git Flow
 ```sh
-# Feature development
+# 1. Feature development on develop
 git checkout develop && git checkout -b feature/xxx
-# ... work ...
+# ... work, commit ...
 git checkout develop && git merge feature/xxx
-git checkout master && git merge develop
+
+# 2. Release branch — bump version here
+git checkout -b release/X.Y.Z
+# Bump version in pyproject.toml + src/srclight/__init__.py
+git commit -am "chore: Bump version to X.Y.Z"
+
+# 3. Merge release to master, tag, merge back to develop
+git checkout master && git merge release/X.Y.Z --no-ff
 git tag -a vX.Y.Z -m "vX.Y.Z description"
+git checkout develop && git merge release/X.Y.Z --no-ff
+git branch -d release/X.Y.Z
+
+# 4. Push everything
 git push origin master develop --tags
+
+# 5. Create GitHub release — triggers PyPI + MCP registry publish automatically
 gh release create vX.Y.Z --title "vX.Y.Z — Description" --notes "Notes"
 ```
 
 ### Automated Publishing (GitHub Actions)
 On `release: [published]`, `.github/workflows/publish.yml` runs:
 1. **PyPI** — trusted publisher via OIDC, no secrets needed
-2. **MCP Registry** — `mcp-publisher` with OIDC auth, patches version from git tag
+2. **MCP Registry** — `mcp-publisher` with OIDC auth, patches `server.json` version from git tag
+
+No manual `mcp-publisher publish` needed — CI handles both PyPI and MCP registry.
 
 ### Post-Release Checklist
 1. Reinstall dev package: `pip install -e .`
@@ -184,7 +199,7 @@ On `release: [published]`, `.github/workflows/publish.yml` runs:
 3. Verify `index_status()` shows new `indexer_version`
 
 ### server.json
-Updated automatically during CI from git tag. Description should be keyword-rich for AI discovery. Current keywords: "code indexing", "MCP tools", "FTS5", "embedding search", "call graphs", "git blame", "multi-repo", "fully local".
+Version patched automatically during CI from git tag — do NOT bump `server.json` version manually. Description should be keyword-rich for AI discovery. Current keywords: "code indexing", "MCP tools", "FTS5", "embedding search", "call graphs", "git blame", "multi-repo", "fully local".
 
 ## Documentation Strategy
 
