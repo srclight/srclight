@@ -3,12 +3,12 @@
   "name": "io.github.srclight/srclight",
   "title": "Srclight",
   "description": "Deep code indexing for AI agents. FTS5 + embeddings + call graphs + git intelligence. Fully local.",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "srclight",
-      "version": "0.11.0",
+      "version": "0.12.0",
       "transport": {
         "type": "stdio"
       }
