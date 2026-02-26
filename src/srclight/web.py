@@ -81,7 +81,7 @@ def _dashboard_html() -> str:
   </section>
 
   <script>
-    const api = (path) => fetch(path, { headers: { Accept: 'application/json' } }).then(r => r.json());
+    const api = (path, opts = {}) => fetch(path, { headers: { Accept: 'application/json', ...opts.headers }, ...opts }).then(async r => { const data = await r.json(); if (!r.ok && data && data.error) throw new Error(data.error); if (!r.ok) throw new Error(r.statusText || 'Request failed'); return data; });
     const set = (id, text, isError) => { const el = document.getElementById(id); el.textContent = text; el.className = isError ? 'error' : ''; };
     const setPre = (id, text) => { document.getElementById(id).textContent = text; };
 
@@ -134,7 +134,7 @@ def _dashboard_html() -> str:
     document.getElementById('btnRestart').onclick = async () => {
       set('restartOutput', 'Calling restart…');
       try {
-        const data = await api('/api/restart_server');
+        const data = await api('/api/restart_server', { method: 'POST' });
         set('restartOutput', JSON.stringify(data, null, 2));
       } catch (e) { set('restartOutput', e.message, true); }
     };
@@ -150,54 +150,78 @@ async def _run_sync(fn, *args, **kwargs):
 
 
 async def _api_list_projects(_request: Request) -> Response:
-    from .server import list_projects
-    body = await _run_sync(list_projects)
-    return JSONResponse(json.loads(body))
+    try:
+        from .server import list_projects
+        body = await _run_sync(list_projects)
+        return JSONResponse(json.loads(body))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def _api_codebase_map(request: Request) -> Response:
-    from .server import codebase_map
-    project = request.query_params.get("project") or None
-    body = await _run_sync(codebase_map, project)
-    return JSONResponse(json.loads(body))
+    try:
+        from .server import codebase_map
+        project = request.query_params.get("project") or None
+        body = await _run_sync(codebase_map, project)
+        return JSONResponse(json.loads(body))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def _api_index_status(_request: Request) -> Response:
-    from .server import index_status
-    body = await _run_sync(index_status)
-    return JSONResponse(json.loads(body))
+    try:
+        from .server import index_status
+        body = await _run_sync(index_status)
+        return JSONResponse(json.loads(body))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def _api_embedding_status(request: Request) -> Response:
-    from .server import embedding_status
-    project = request.query_params.get("project") or None
-    body = await _run_sync(embedding_status, project)
-    return JSONResponse(json.loads(body))
+    try:
+        from .server import embedding_status
+        project = request.query_params.get("project") or None
+        body = await _run_sync(embedding_status, project)
+        return JSONResponse(json.loads(body))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def _api_embedding_health(request: Request) -> Response:
-    from .server import embedding_health
-    project = request.query_params.get("project") or None
-    body = await _run_sync(embedding_health, project)
-    return JSONResponse(json.loads(body))
+    try:
+        from .server import embedding_health
+        project = request.query_params.get("project") or None
+        body = await _run_sync(embedding_health, project)
+        return JSONResponse(json.loads(body))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def _api_setup_guide(_request: Request) -> Response:
-    from .server import setup_guide
-    body = await setup_guide()
-    return JSONResponse(json.loads(body))
+    try:
+        from .server import setup_guide
+        body = await setup_guide()
+        return JSONResponse(json.loads(body))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def _api_server_stats(_request: Request) -> Response:
-    from .server import server_stats
-    body = await server_stats()
-    return JSONResponse(json.loads(body))
+    try:
+        from .server import server_stats
+        body = await server_stats()
+        return JSONResponse(json.loads(body))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def _api_restart_server(_request: Request) -> Response:
-    from .server import restart_server
-    body = await restart_server()
-    return JSONResponse(json.loads(body))
+    try:
+        from .server import restart_server
+        body = await restart_server()
+        return JSONResponse(json.loads(body))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def _dashboard(_request: Request) -> Response:
