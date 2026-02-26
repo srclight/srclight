@@ -2,6 +2,8 @@
 
 Supports:
 - Ollama (local, default) — zero Python ML deps, just HTTP
+- OpenAI-compatible (any provider speaking /v1/embeddings) — OpenAI, Together,
+  Fireworks, Mistral, Jina, vLLM, HuggingFace TEI, LiteLLM, DeepInfra, etc.
 - Voyage Code 3 (API, optional) — best code retrieval quality
 
 Architecture:
@@ -185,6 +187,165 @@ class OllamaProvider(EmbeddingProvider):
             resp.read()
 
 
+# --- OpenAI-compatible provider ---
+
+
+class OpenAIProvider(EmbeddingProvider):
+    """Embed via any OpenAI-compatible /v1/embeddings endpoint.
+
+    Covers: OpenAI, Together, Fireworks, Mistral, Jina, vLLM,
+    HuggingFace TEI, LiteLLM, DeepInfra, Anyscale, and more.
+
+    Config via environment variables:
+        OPENAI_API_KEY  — API key (required)
+        OPENAI_BASE_URL — Base URL (default: https://api.openai.com)
+    """
+
+    def __init__(
+        self,
+        model: str = "text-embedding-3-small",
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ):
+        import os
+        self._model = model
+        self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self._base_url = (base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")).rstrip("/")
+        self._dimensions: int | None = None
+        if not self._api_key:
+            raise ValueError(
+                "API key required. Set OPENAI_API_KEY environment variable "
+                "or pass api_key parameter."
+            )
+
+    @property
+    def name(self) -> str:
+        return f"openai:{self._model}"
+
+    @property
+    def dimensions(self) -> int:
+        if self._dimensions is None:
+            # Probe by embedding a test string
+            vec = self.embed_one("test")
+            self._dimensions = len(vec)
+        return self._dimensions
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed texts via OpenAI-compatible /v1/embeddings endpoint."""
+        url = f"{self._base_url}/v1/embeddings"
+        payload = json.dumps({
+            "model": self._model,
+            "input": texts,
+        }).encode()
+
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._api_key}",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if hasattr(e, 'read') else str(e)
+            raise ConnectionError(f"OpenAI API error ({e.code}): {body}") from e
+        except urllib.error.URLError as e:
+            raise ConnectionError(
+                f"Cannot reach {self._base_url}. Error: {e}"
+            ) from e
+
+        results = data.get("data", [])
+        embeddings = [r["embedding"] for r in sorted(results, key=lambda x: x["index"])]
+
+        if len(embeddings) != len(texts):
+            raise ValueError(
+                f"API returned {len(embeddings)} embeddings for {len(texts)} inputs"
+            )
+
+        # Cache dimensions from first result
+        if self._dimensions is None and embeddings:
+            self._dimensions = len(embeddings[0])
+
+        return embeddings
+
+
+# --- Cohere provider ---
+
+
+class CohereProvider(EmbeddingProvider):
+    """Embed via Cohere's v2 embed API.
+
+    Models: embed-v4.0 (1024 dims), embed-english-v3.0, embed-multilingual-v3.0.
+
+    Config via environment variable:
+        COHERE_API_KEY — API key (required)
+    """
+
+    API_URL = "https://api.cohere.com/v2/embed"
+
+    def __init__(self, api_key: str | None = None, model: str = "embed-v4.0"):
+        import os
+        self._api_key = api_key or os.environ.get("COHERE_API_KEY", "")
+        self._model = model
+        if not self._api_key:
+            raise ValueError(
+                "Cohere API key required. Set COHERE_API_KEY environment variable "
+                "or pass api_key parameter."
+            )
+
+    @property
+    def name(self) -> str:
+        return f"cohere:{self._model}"
+
+    @property
+    def dimensions(self) -> int:
+        # embed-v4.0 and embed-*-v3.0 all output 1024 dimensions
+        return 1024
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed texts via Cohere v2 embed API."""
+        payload = json.dumps({
+            "model": self._model,
+            "texts": texts,
+            "input_type": "search_document",
+            "embedding_types": ["float"],
+        }).encode()
+
+        req = urllib.request.Request(
+            self.API_URL, data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._api_key}",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if hasattr(e, 'read') else str(e)
+            raise ConnectionError(f"Cohere API error ({e.code}): {body}") from e
+
+        # v2 response: {"embeddings": {"float": [[...], [...]]}}
+        embeddings_data = data.get("embeddings", {})
+        if isinstance(embeddings_data, dict):
+            embeddings = embeddings_data.get("float", [])
+        else:
+            embeddings = embeddings_data
+
+        if len(embeddings) != len(texts):
+            raise ValueError(
+                f"Cohere returned {len(embeddings)} embeddings for {len(texts)} inputs"
+            )
+
+        return embeddings
+
+
 # --- Voyage Code 3 provider ---
 
 
@@ -351,15 +512,25 @@ def get_provider(model: str, **kwargs) -> EmbeddingProvider:
 
     Formats:
         "ollama:qwen3-embedding" or "qwen3-embedding" -> OllamaProvider
+        "openai:text-embedding-3-small" -> OpenAIProvider
+        "cohere:embed-v4.0" or "embed-v4.0" -> CohereProvider
         "voyage:voyage-code-3" or "voyage-code-3" -> VoyageProvider
-        "ollama:nomic-embed-text" -> OllamaProvider with nomic model
+
+    OpenAI-compatible providers (Together, Fireworks, Mistral, vLLM, etc.)
+    use the "openai:" prefix with OPENAI_BASE_URL env var to set the endpoint.
     """
     if ":" in model:
         provider_type, model_name = model.split(":", 1)
     else:
-        # Default: if it starts with "voyage", use Voyage; otherwise Ollama
+        # Default: infer provider from model name prefix
         if model.startswith("voyage"):
             provider_type = "voyage"
+            model_name = model
+        elif model.startswith("embed-") and ("v3" in model or "v4" in model):
+            provider_type = "cohere"
+            model_name = model
+        elif model.startswith("text-embedding"):
+            provider_type = "openai"
             model_name = model
         else:
             provider_type = "ollama"
@@ -368,6 +539,13 @@ def get_provider(model: str, **kwargs) -> EmbeddingProvider:
     if provider_type == "ollama":
         base_url = kwargs.get("base_url", "http://localhost:11434")
         return OllamaProvider(model=model_name, base_url=base_url)
+    elif provider_type == "openai":
+        api_key = kwargs.get("api_key")
+        base_url = kwargs.get("base_url")
+        return OpenAIProvider(model=model_name, api_key=api_key, base_url=base_url)
+    elif provider_type == "cohere":
+        api_key = kwargs.get("api_key")
+        return CohereProvider(api_key=api_key, model=model_name)
     elif provider_type == "voyage":
         api_key = kwargs.get("api_key")
         return VoyageProvider(api_key=api_key, model=model_name)
