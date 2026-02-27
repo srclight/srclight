@@ -235,6 +235,26 @@ The new repo is immediately searchable. The MCP server picks up new projects on 
 
 **Note:** Both `srclight index` and `srclight hook install` automatically add `.srclight/` to the repo's `.gitignore`. The index databases and embedding files can be large (hundreds of MB) and should never be committed.
 
+## Git Submodules
+
+Srclight discovers files using `git ls-files`, which does **not** recurse into submodules. Git treats submodules as opaque "gitlink" entries, so their contents are invisible to the indexer. This also applies to vendored code that lives in a separate git repo nested inside the parent.
+
+**Recommendation:** If you want a submodule indexed, clone it separately and add it as its own project.
+
+```bash
+# Clone the submodule repo standalone
+git clone git@github.com:your-org/some-lib.git /path/to/some-lib
+
+# Add and index it
+srclight workspace add /path/to/some-lib -w myworkspace
+srclight workspace index -w myworkspace -p some-lib --embed qwen3-embedding
+srclight hook install --workspace myworkspace
+```
+
+This gives you full symbol search, relationship graphs, and semantic search across the submodule — and keeps it independently searchable alongside the parent project.
+
+**What about vendored copies?** If a dependency is committed directly into your repo (e.g. `third_party/some-lib/` without a `.gitmodules` entry), then `git ls-files` does return those files and srclight indexes them as part of the parent project. No extra steps needed. If you later convert a vendored directory to a proper git submodule, its files will disappear from the parent's index on the next reindex — at which point you'd add it as a standalone project.
+
 ## Removing a Repo
 
 ```bash

@@ -154,6 +154,8 @@ srclight workspace list
 srclight serve --workspace myworkspace
 ```
 
+**Git submodules** are not indexed automatically — `git ls-files` does not recurse into them. To index a submodule, clone it separately and add it as its own workspace project. See [docs/usage-guide.md](docs/usage-guide.md#git-submodules) for details.
+
 ## MCP Integration
 
 Srclight supports two transport modes: **stdio** (one server per session) and **SSE** (persistent server, multiple sessions). SSE is recommended for workspaces.
