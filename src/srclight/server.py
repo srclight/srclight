@@ -70,6 +70,9 @@ srclight hook install --workspace WORKSPACE_NAME
 ```
 The server picks up new projects automatically (no restart needed).
 
+## Troubleshooting
+- If ALL tools fail with `-32602: Invalid request parameters`, the MCP session is stale (e.g. the srclight service was restarted while this client was connected). Tell the user to **restart their editor/CLI** so the MCP client reconnects. Retrying the same calls will not help.
+
 ## Setup and server control
 - `setup_guide()` — Structured instructions for agents: how to add a workspace, connect Cursor, where config lives, how to index with embeddings, hook install. Call when the user or agent needs setup steps.
 - `server_stats()` — When the server started and uptime (for \"how long has srclight been up\").
