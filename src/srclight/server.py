@@ -7,6 +7,7 @@ Supports both single-repo mode and workspace mode (multi-repo via ATTACH+UNION).
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import logging
 import os
@@ -239,6 +240,34 @@ def _project_required_error(tool_name: str) -> str:
     })
 
 
+def _symbol_not_found_error(name: str, project: str | None = None) -> str:
+    """Return a JSON error with recovery hints when a symbol lookup fails."""
+    ctx = f" in {project}" if project else ""
+    return json.dumps({
+        "error": f"Symbol '{name}' not found{ctx}",
+        "suggestions": [
+            f"Try search_symbols(\"{name}\") for fuzzy keyword matching",
+            f"Try hybrid_search(\"{name}\") for keyword + semantic matching",
+        ],
+    })
+
+
+def _project_not_found_error(project: str) -> str:
+    """Return a JSON error with fuzzy 'did you mean' suggestions for project names."""
+    if _is_workspace_mode():
+        wdb = _get_workspace_db()
+        project_names = sorted(e.name for e in wdb._all_indexable)
+    else:
+        project_names = []
+    result: dict[str, object] = {"error": f"Project '{project}' not found"}
+    if project_names:
+        close = difflib.get_close_matches(project, project_names, n=3, cutoff=0.4)
+        if close:
+            result["did_you_mean"] = close
+        result["available_projects"] = project_names
+    return json.dumps(result)
+
+
 # --- Tier 1: Instant tools ---
 
 
@@ -303,10 +332,18 @@ def search_symbols(
     if _is_workspace_mode():
         wdb = _get_workspace_db()
         results = wdb.search_symbols(query, kind=kind, project=project, limit=limit)
-        return json.dumps(results, indent=2)
+    else:
+        db = _get_db()
+        results = db.search_symbols(query, kind=kind, limit=limit)
 
-    db = _get_db()
-    results = db.search_symbols(query, kind=kind, limit=limit)
+    if not results:
+        return json.dumps({
+            "query": query,
+            "result_count": 0,
+            "results": [],
+            "hint": f"No keyword matches. Try hybrid_search(\"{query}\") for semantic matching.",
+        }, indent=2)
+
     return json.dumps(results, indent=2)
 
 
@@ -328,7 +365,7 @@ def get_symbol(name: str, project: str | None = None) -> str:
         wdb = _get_workspace_db()
         results = wdb.get_symbol(name, project=project)
         if not results:
-            return json.dumps({"error": f"Symbol '{name}' not found"})
+            return _symbol_not_found_error(name)
         if len(results) == 1:
             return json.dumps(results[0], indent=2)
         return json.dumps({"match_count": len(results), "symbols": results}, indent=2)
@@ -336,7 +373,7 @@ def get_symbol(name: str, project: str | None = None) -> str:
     db = _get_db()
     symbols = db.get_symbols_by_name(name)
     if not symbols:
-        return json.dumps({"error": f"Symbol '{name}' not found"})
+        return _symbol_not_found_error(name)
 
     if len(symbols) == 1:
         sym = symbols[0]
@@ -376,7 +413,7 @@ def get_signature(name: str) -> str:
         wdb = _get_workspace_db()
         results = wdb.get_symbol(name)
         if not results:
-            return json.dumps({"error": f"Symbol '{name}' not found"})
+            return _symbol_not_found_error(name)
         sigs = [
             {
                 "project": r["project"],
@@ -396,7 +433,7 @@ def get_signature(name: str) -> str:
     db = _get_db()
     symbols = db.get_symbols_by_name(name, limit=10)
     if not symbols:
-        return json.dumps({"error": f"Symbol '{name}' not found"})
+        return _symbol_not_found_error(name)
 
     results = []
     for sym in symbols:
@@ -544,7 +581,7 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
         config = WorkspaceConfig.load(_workspace_name)
         path = config.projects.get(project)
         if not path:
-            return json.dumps({"error": f"Project '{project}' not in workspace"})
+            return _project_not_found_error(project)
         db_path = Path(path) / ".srclight" / "index.db"
         if not db_path.exists():
             return json.dumps({"error": f"Project '{project}' not indexed"})
@@ -553,7 +590,7 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
         sym = db.get_symbol_by_name(symbol_name)
         if sym is None:
             db.close()
-            return json.dumps({"error": f"Symbol '{symbol_name}' not found in {project}"})
+            return _symbol_not_found_error(symbol_name, project)
         callers = db.get_callers(sym.id)
         result = _dedup_edges(callers)
         db.close()
@@ -567,7 +604,7 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
     db = _get_db()
     sym = db.get_symbol_by_name(symbol_name)
     if sym is None:
-        return json.dumps({"error": f"Symbol '{symbol_name}' not found"})
+        return _symbol_not_found_error(symbol_name)
 
     callers = db.get_callers(sym.id)
     result = _dedup_edges(callers)
@@ -597,7 +634,7 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
         config = WorkspaceConfig.load(_workspace_name)
         path = config.projects.get(project)
         if not path:
-            return json.dumps({"error": f"Project '{project}' not in workspace"})
+            return _project_not_found_error(project)
         db_path = Path(path) / ".srclight" / "index.db"
         if not db_path.exists():
             return json.dumps({"error": f"Project '{project}' not indexed"})
@@ -606,7 +643,7 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
         sym = db.get_symbol_by_name(symbol_name)
         if sym is None:
             db.close()
-            return json.dumps({"error": f"Symbol '{symbol_name}' not found in {project}"})
+            return _symbol_not_found_error(symbol_name, project)
         callees = db.get_callees(sym.id)
         result = _dedup_edges(callees)
         db.close()
@@ -620,7 +657,7 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
     db = _get_db()
     sym = db.get_symbol_by_name(symbol_name)
     if sym is None:
-        return json.dumps({"error": f"Symbol '{symbol_name}' not found"})
+        return _symbol_not_found_error(symbol_name)
 
     callees = db.get_callees(sym.id)
     result = _dedup_edges(callees)
@@ -650,7 +687,7 @@ def get_type_hierarchy(name: str, project: str | None = None) -> str:
         config = WorkspaceConfig.load(_workspace_name)
         path = config.projects.get(project)
         if not path:
-            return json.dumps({"error": f"Project '{project}' not in workspace"})
+            return _project_not_found_error(project)
         db_path = Path(path) / ".srclight" / "index.db"
         if not db_path.exists():
             return json.dumps({"error": f"Project '{project}' not indexed"})
@@ -659,7 +696,7 @@ def get_type_hierarchy(name: str, project: str | None = None) -> str:
         sym = db.get_symbol_by_name(name)
         if sym is None:
             db.close()
-            return json.dumps({"error": f"Symbol '{name}' not found in {project}"})
+            return _symbol_not_found_error(name, project)
         base_classes = db.get_base_classes(sym.id)
         subclasses = db.get_subclasses(sym.id)
         db.close()
@@ -673,7 +710,7 @@ def get_type_hierarchy(name: str, project: str | None = None) -> str:
     db = _get_db()
     sym = db.get_symbol_by_name(name)
     if sym is None:
-        return json.dumps({"error": f"Symbol '{name}' not found"})
+        return _symbol_not_found_error(name)
 
     base_classes = db.get_base_classes(sym.id)
     subclasses = db.get_subclasses(sym.id)
@@ -726,7 +763,7 @@ def get_tests_for(symbol_name: str, project: str | None = None) -> str:
         config = WorkspaceConfig.load(_workspace_name)
         path = config.projects.get(project)
         if not path:
-            return json.dumps({"error": f"Project '{project}' not in workspace"})
+            return _project_not_found_error(project)
         db_path = Path(path) / ".srclight" / "index.db"
         if not db_path.exists():
             return json.dumps({"error": f"Project '{project}' not indexed"})
@@ -777,7 +814,7 @@ def get_dependents(symbol_name: str, transitive: bool = False, project: str | No
         config = WorkspaceConfig.load(_workspace_name)
         path = config.projects.get(project)
         if not path:
-            return json.dumps({"error": f"Project '{project}' not in workspace"})
+            return _project_not_found_error(project)
         db_path = Path(path) / ".srclight" / "index.db"
         if not db_path.exists():
             return json.dumps({"error": f"Project '{project}' not indexed"})
@@ -786,14 +823,14 @@ def get_dependents(symbol_name: str, transitive: bool = False, project: str | No
         sym = db.get_symbol_by_name(symbol_name)
         if sym is None:
             db.close()
-            return json.dumps({"error": f"Symbol '{symbol_name}' not found in {project}"})
+            return _symbol_not_found_error(symbol_name, project)
         deps = db.get_dependents(sym.id, transitive=transitive)
         db.close()
     else:
         db = _get_db()
         sym = db.get_symbol_by_name(symbol_name)
         if sym is None:
-            return json.dumps({"error": f"Symbol '{symbol_name}' not found"})
+            return _symbol_not_found_error(symbol_name)
         deps = db.get_dependents(sym.id, transitive=transitive)
 
     result = _dedup_edges(deps)
@@ -822,7 +859,7 @@ def get_implementors(interface_name: str, project: str | None = None) -> str:
         config = WorkspaceConfig.load(_workspace_name)
         path = config.projects.get(project)
         if not path:
-            return json.dumps({"error": f"Project '{project}' not in workspace"})
+            return _project_not_found_error(project)
         db_path = Path(path) / ".srclight" / "index.db"
         if not db_path.exists():
             return json.dumps({"error": f"Project '{project}' not indexed"})
@@ -831,14 +868,14 @@ def get_implementors(interface_name: str, project: str | None = None) -> str:
         sym = db.get_symbol_by_name(interface_name)
         if sym is None:
             db.close()
-            return json.dumps({"error": f"Symbol '{interface_name}' not found in {project}"})
+            return _symbol_not_found_error(interface_name, project)
         impls = db.get_implementors(sym.id)
         db.close()
     else:
         db = _get_db()
         sym = db.get_symbol_by_name(interface_name)
         if sym is None:
-            return json.dumps({"error": f"Symbol '{interface_name}' not found"})
+            return _symbol_not_found_error(interface_name)
         impls = db.get_implementors(sym.id)
 
     results = [
@@ -979,7 +1016,7 @@ def blame_symbol(symbol_name: str, project: str | None = None) -> str:
 
     repo_root = _resolve_repo_root(project)
     if not repo_root:
-        return json.dumps({"error": f"Project '{project}' not found"})
+        return _project_not_found_error(project)
 
     # Find the symbol in the index
     if _is_workspace_mode():
@@ -995,7 +1032,7 @@ def blame_symbol(symbol_name: str, project: str | None = None) -> str:
         sym = db.get_symbol_by_name(symbol_name)
 
     if sym is None:
-        return json.dumps({"error": f"Symbol '{symbol_name}' not found"})
+        return _symbol_not_found_error(symbol_name)
 
     result = git_mod.blame_symbol(
         repo_root, sym.file_path, sym.start_line, sym.end_line
@@ -1044,7 +1081,7 @@ def recent_changes(
 
     repo_root = _resolve_repo_root(project)
     if not repo_root:
-        return json.dumps({"error": f"Project '{project}' not found"})
+        return _project_not_found_error(project)
 
     commits = git_mod.recent_changes(
         repo_root, n=n, author=author, path_filter=path_filter
@@ -1073,7 +1110,7 @@ def git_hotspots(
 
     repo_root = _resolve_repo_root(project)
     if not repo_root:
-        return json.dumps({"error": f"Project '{project}' not found"})
+        return _project_not_found_error(project)
 
     spots = git_mod.hotspots(repo_root, n=n, since=since)
     return json.dumps({
@@ -1114,7 +1151,7 @@ def whats_changed(project: str | None = None) -> str:
 
     repo_root = _resolve_repo_root(project)
     if not repo_root:
-        return json.dumps({"error": f"Project '{project}' not found"})
+        return _project_not_found_error(project)
 
     result = git_mod.whats_changed(repo_root)
     return json.dumps(result, indent=2)
@@ -1139,7 +1176,7 @@ def changes_to(symbol_name: str, n: int = 20, project: str | None = None) -> str
 
     repo_root = _resolve_repo_root(project)
     if not repo_root:
-        return json.dumps({"error": f"Project '{project}' not found"})
+        return _project_not_found_error(project)
 
     # Find the symbol to get its file
     if _is_workspace_mode():
@@ -1155,7 +1192,7 @@ def changes_to(symbol_name: str, n: int = 20, project: str | None = None) -> str
         sym = db.get_symbol_by_name(symbol_name)
 
     if sym is None:
-        return json.dumps({"error": f"Symbol '{symbol_name}' not found"})
+        return _symbol_not_found_error(symbol_name)
 
     commits = git_mod.changes_to_file(repo_root, sym.file_path, n=n)
     return json.dumps({
@@ -1186,7 +1223,7 @@ def get_build_targets(project: str | None = None) -> str:
 
     repo_root = _resolve_repo_root(project)
     if not repo_root:
-        return json.dumps({"error": f"Project '{project}' not found"})
+        return _project_not_found_error(project)
 
     info = build_mod.get_build_info(repo_root)
     return json.dumps(info, indent=2)
@@ -1211,7 +1248,7 @@ def get_platform_variants(symbol_name: str, project: str | None = None) -> str:
 
     repo_root = _resolve_repo_root(project)
     if not repo_root:
-        return json.dumps({"error": f"Project '{project}' not found"})
+        return _project_not_found_error(project)
 
     variants = build_mod.get_platform_variants(repo_root, symbol_name)
     return json.dumps({
@@ -1239,7 +1276,7 @@ def platform_conditionals(project: str | None = None, platform: str | None = Non
 
     repo_root = _resolve_repo_root(project)
     if not repo_root:
-        return json.dumps({"error": f"Project '{project}' not found"})
+        return _project_not_found_error(project)
 
     conditionals = build_mod.scan_platform_conditionals(repo_root)
 
@@ -1390,20 +1427,26 @@ def hybrid_search(
 
     if embedding_results:
         merged = rrf_merge(fts_results, embedding_results)
-        return json.dumps({
+        final = merged[:limit]
+        payload: dict[str, object] = {
             "query": query,
             "mode": "hybrid (FTS5 + embeddings)",
             "model": model_used,
-            "result_count": min(len(merged), limit),
-            "results": merged[:limit],
-        }, indent=2)
+            "result_count": len(final),
+            "results": final,
+        }
+        if not final:
+            payload["hint"] = "No results. Try broadening your query or check that the index is up to date with reindex()."
+        return json.dumps(payload, indent=2)
     else:
-        payload: dict[str, object] = {
+        payload = {
             "query": query,
             "mode": "keyword only (no embeddings available)",
             "result_count": min(len(fts_results), limit),
             "results": fts_results[:limit],
         }
+        if not fts_results:
+            payload["hint"] = "No results. Try broadening your query or check that the index is up to date with reindex()."
         if embedding_error is not None:
             payload["embedding_error"] = embedding_error
         return json.dumps(payload, indent=2)
