@@ -2,13 +2,14 @@
 
 ## Version Locations
 
-Version must be updated in **three files** — all must match:
+Version must be updated in **two files** — both must match:
 
 | File | Field |
 |------|-------|
 | `pyproject.toml` | `version = "X.Y.Z"` |
 | `src/srclight/__init__.py` | `__version__ = "X.Y.Z"` |
-| `server.json` | `"version": "X.Y.Z"` (top-level and inside `packages[0]`) |
+
+`server.json` is **not** bumped manually — CI patches it from the git tag automatically.
 
 ## Semantic Versioning
 
@@ -19,55 +20,48 @@ Version must be updated in **three files** — all must match:
 ## Release Checklist
 
 ```bash
-# 1. Bump version in all three files
-#    pyproject.toml, src/srclight/__init__.py, server.json
+# 1. Commit feature work on develop
+git checkout develop
+# ... work, commit ...
 
-# 2. Commit on develop
-git add pyproject.toml src/srclight/__init__.py server.json
-git commit -m "Bump version to X.Y.Z"
+# 2. Create release branch and bump version
+git checkout -b release/X.Y.Z
+# Edit pyproject.toml and src/srclight/__init__.py
+git commit -am "chore: Bump version to X.Y.Z"
 
-# 3. Merge to master and push
+# 3. Merge release to master
 git checkout master
-git merge develop --no-edit
-git push origin master
-git push origin develop
+git merge release/X.Y.Z --no-ff
 
-# 4. Create GitHub release (triggers PyPI publish via GitHub Actions)
-gh release create vX.Y.Z --title "vX.Y.Z" --notes "Release notes here." --target master
+# 4. Tag the release
+git tag -a vX.Y.Z -m "vX.Y.Z description"
 
-# 5. Wait for PyPI publish to complete
+# 5. Merge release back to develop
+git checkout develop
+git merge release/X.Y.Z --no-ff
+git branch -d release/X.Y.Z
+
+# 6. Push everything
+git push origin master develop --tags
+
+# 7. Create GitHub release (triggers PyPI + MCP registry publish automatically)
+gh release create vX.Y.Z --title "vX.Y.Z — Description" --notes "Release notes here."
+
+# 8. (Optional) Watch the CI run
 gh run watch $(gh run list --limit 1 --json databaseId --jq '.[0].databaseId')
 
-# 6. Verify on PyPI
+# 9. Verify on PyPI
 pip index versions srclight
-
-# 7. Publish to MCP registry
-mcp-publisher publish
-
-# 8. Switch back to develop
-git checkout develop
 ```
 
 ## What's Automated
 
-- **PyPI publish**: GitHub Actions workflow (`.github/workflows/publish.yml`) triggers on every GitHub release. Uses Trusted Publisher (OIDC) — no API tokens needed.
-- **MCP registry**: Manual for now (`mcp-publisher publish`). Requires a valid token from `mcp-publisher login github`.
+On `release: [published]`, `.github/workflows/publish.yml` runs two jobs:
 
-## MCP Registry Auth
+1. **PyPI** — builds and publishes via Trusted Publisher (OIDC). No API tokens needed.
+2. **MCP Registry** — patches `server.json` version from the git tag, authenticates via GitHub OIDC, publishes. No manual `mcp-publisher` step needed.
 
-The `mcp-publisher` CLI authenticates via GitHub OAuth. Token is stored at `~/.mcp_publisher_token`.
-
-```bash
-# Login (GitHub device flow)
-mcp-publisher login github
-
-# Publish (reads server.json from current directory)
-mcp-publisher publish
-
-# Token expires periodically — re-login if you get a 401
-```
-
-The server name `io.github.srclight/srclight` requires that the authenticated GitHub user is a **public member** of the `srclight` GitHub org.
+Both PyPI and MCP registry publishing are **fully automated**. No manual `mcp-publisher login` or `mcp-publisher publish` required.
 
 ## Troubleshooting
 
@@ -76,11 +70,14 @@ The server name `io.github.srclight/srclight` requires that the authenticated Gi
 - Verify the `pypi` environment exists in repo settings
 - Verify Trusted Publisher is configured on PyPI for `srclight/srclight`
 
-### MCP registry 403
-- Re-login: `mcp-publisher login github`
-- Verify org membership is **public** at https://github.com/orgs/srclight/people
+### MCP registry publish fails
+- Check the `mcp-registry` job in the GitHub Actions run
+- The server name `io.github.srclight/srclight` requires the `srclight` GitHub org to exist
+- OIDC auth requires `id-token: write` permission in the workflow
+
+### MCP registry 400 (duplicate version)
+- The version was already published. This usually means CI already ran — no manual publish needed.
 
 ### MCP registry 400 (README validation)
 - The PyPI package README must contain `<!-- mcp-name: io.github.srclight/srclight -->` (line 1 of README.md)
-- This means any version bump that doesn't touch README still needs the tag present
 - PyPI must have the **current version** published — the registry checks the latest version

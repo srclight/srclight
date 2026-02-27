@@ -26,3 +26,12 @@ Thumbs.db
 .playwright-mcp/
 *.png
 mcp-publisher
+
+# CLAUDE.md is private — golden copy in Vault only
+CLAUDE.md
+
+# Cursor rules are private — golden copy in Vault, symlink in repo
+.cursor/rules
+
+# Plans and roadmaps stay in Vault; do not commit
+PLAN.md
