@@ -19,6 +19,7 @@ from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
 from . import __version__
 from .db import Database, EdgeRecord, FileRecord, SymbolRecord, content_hash
+from .extractors import DOCUMENT_EXTENSIONS, detect_document_language, get_registry
 from .languages import (
     LANGUAGES,
     LanguageConfig,
@@ -132,6 +133,7 @@ class IndexConfig:
     root: Path = field(default_factory=Path)
     ignore_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
     max_file_size: int = MAX_FILE_SIZE
+    max_doc_file_size: int = 50_000_000  # 50 MB for documents (PDF, DOCX, etc.)
     languages: list[str] | None = None  # None = all supported
     embed_model: str | None = None  # e.g. "qwen3-embedding", "voyage-code-3"
 
@@ -401,6 +403,16 @@ def _extract_template_name(node: Node) -> str | None:
     return None
 
 
+def _active_doc_extensions() -> set[str]:
+    """Return file extensions (e.g. '*.pdf') that have active extractors."""
+    return {f"*{ext}" for ext in DOCUMENT_EXTENSIONS}
+
+
+def _doc_languages() -> set[str]:
+    """Return the set of document language names with active extractors."""
+    return set(get_registry().keys()) | {"markdown"}
+
+
 class Indexer:
     """Indexes a codebase into a Srclight database."""
 
@@ -409,6 +421,12 @@ class Indexer:
         self.config = config or IndexConfig()
         self._parsers: dict[str, Parser] = {}
         self._queries: dict[str, Query] = {}
+
+        # Remove ignore patterns for extensions that have active extractors
+        active_exts = _active_doc_extensions()
+        self.config.ignore_patterns = [
+            p for p in self.config.ignore_patterns if p not in active_exts
+        ]
 
     def _get_parser(self, lang_name: str) -> Parser | None:
         if lang_name in self._parsers:
@@ -465,16 +483,23 @@ class Indexer:
                 path = root / rel
                 if not path.is_file():
                     continue
+
+                lang = detect_language(path)
+                is_doc = False
+                if lang is None:
+                    lang = detect_document_language(path.suffix)
+                    is_doc = True
+                if lang is None:
+                    continue
+
+                size_limit = self.config.max_doc_file_size if is_doc else self.config.max_file_size
                 try:
-                    if path.stat().st_size > self.config.max_file_size:
+                    if path.stat().st_size > size_limit:
                         stats.files_skipped += 1
                         continue
                 except OSError:
                     continue
 
-                lang = detect_language(path)
-                if lang is None:
-                    continue
                 if self.config.languages and lang not in self.config.languages:
                     continue
 
@@ -486,13 +511,20 @@ class Indexer:
                     continue
                 if _should_ignore(path, root, self.config.ignore_patterns):
                     continue
-                if path.stat().st_size > self.config.max_file_size:
+
+                lang = detect_language(path)
+                is_doc = False
+                if lang is None:
+                    lang = detect_document_language(path.suffix)
+                    is_doc = True
+                if lang is None:
+                    continue
+
+                size_limit = self.config.max_doc_file_size if is_doc else self.config.max_file_size
+                if path.stat().st_size > size_limit:
                     stats.files_skipped += 1
                     continue
 
-                lang = detect_language(path)
-                if lang is None:
-                    continue
                 if self.config.languages and lang not in self.config.languages:
                     continue
 
@@ -521,6 +553,8 @@ class Indexer:
                     continue
 
                 lang = detect_language(path)
+                if lang is None:
+                    lang = detect_document_language(path.suffix)
                 if lang is None:
                     continue
 
@@ -594,6 +628,11 @@ class Indexer:
         """Parse a file and extract symbols. Returns count of symbols extracted."""
         if lang == "markdown":
             return self._extract_markdown_symbols(file_id, rel_path, source)
+
+        # Document extractors
+        doc_registry = get_registry()
+        if lang in doc_registry:
+            return doc_registry[lang].extract(file_id, rel_path, source, self.db)
 
         parser = self._get_parser(lang)
         query = self._get_query(lang)
@@ -836,12 +875,15 @@ class Indexer:
         self.db.conn.execute("DELETE FROM symbol_edges")
 
         # Build name -> [(symbol_id, file_path, kind)] lookup
-        # Exclude markdown — sections don't "call" anything and scanning their
-        # prose for symbol-name matches would create noise with zero useful edges.
+        # Exclude markdown and document types — sections don't "call" anything
+        # and scanning their prose would create noise with zero useful edges.
+        excluded = _doc_languages()
+        placeholders = ",".join("?" * len(excluded))
         rows = self.db.conn.execute(
-            """SELECT s.id, s.name, s.kind, f.path as file_path
+            f"""SELECT s.id, s.name, s.kind, f.path as file_path
                FROM symbols s JOIN files f ON s.file_id = f.id
-               WHERE s.name IS NOT NULL AND f.language != 'markdown'"""
+               WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
+            list(excluded),
         ).fetchall()
 
         name_to_symbols: dict[str, list[dict]] = {}
@@ -939,9 +981,10 @@ class Indexer:
         MAX_REFS_PER_SYMBOL = 30
 
         content_rows = self.db.conn.execute(
-            """SELECT s.id, s.name, s.content FROM symbols s
+            f"""SELECT s.id, s.name, s.content FROM symbols s
                JOIN files f ON s.file_id = f.id
-               WHERE s.name IS NOT NULL AND f.language != 'markdown'"""
+               WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
+            list(excluded),
         ).fetchall()
 
         for row in content_rows:

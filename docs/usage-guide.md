@@ -150,7 +150,7 @@ mcporter call srclight.get_callers symbol_name="lookup" project="my-repo"
 mcporter call srclight.hybrid_search query="authentication logic"
 ```
 
-All 25 srclight tools are available as `srclight.<tool_name>` through mcporter.
+All 29 srclight tools are available as `srclight.<tool_name>` through mcporter.
 
 ### 4. Verify
 
@@ -211,6 +211,122 @@ srclight workspace index -w myworkspace -p project-name --embed qwen3-embedding
 
 Embedding is incremental — only symbols whose `body_hash` changed get re-embedded. The `.npy` sidecar is rebuilt automatically after embedding.
 
+## Document Extraction
+
+Srclight indexes non-code files alongside source code. Documents are extracted into searchable symbols (sections, pages, tables) with the same FTS5 indexes and embedding support as code symbols.
+
+### Supported Formats
+
+| Format | Extension(s) | Install extra | What's extracted |
+|--------|-------------|---------------|-----------------|
+| PDF | `.pdf` | `srclight[pdf]` | Pages, tables, heading-based sections |
+| Word | `.docx` | `srclight[docs]` | Heading-based sections |
+| Excel | `.xlsx` | `srclight[docs]` | Sheets with column metadata |
+| HTML | `.html`, `.htm` | `srclight[docs]` | Heading-based sections |
+| Images | `.png`, `.jpg`, `.svg`, etc. | `srclight[docs]` | Dimensions, EXIF, optional OCR text |
+| CSV/TSV | `.csv`, `.tsv` | *(built-in)* | Column names, row counts |
+| Email | `.eml` | *(built-in)* | Subject, from/to, body |
+| Text/RST | `.txt`, `.rst`, `.log` | *(built-in)* | Sections (RST headings) or chunks |
+| Markdown | `.md` | *(built-in)* | Heading-based sections |
+
+Install all document extras at once:
+
+```bash
+pip install 'srclight[docs,pdf]'
+```
+
+### OCR for Scanned PDFs (PaddleOCR)
+
+Scanned or image-only PDF pages (where `extract_text()` returns nothing) can be OCR'd automatically using PaddleOCR. This is per-page: native-text pages are never touched, and mixed PDFs (some pages scanned, some native) work correctly.
+
+#### System Prerequisites
+
+PaddleOCR renders PDF pages to images via `pdf2image`, which requires the **Poppler** PDF rendering library:
+
+```bash
+# Ubuntu / Debian / WSL
+sudo apt install poppler-utils
+
+# macOS
+brew install poppler
+
+# Windows (native)
+# Download from https://github.com/oschwartz10612/poppler-windows/releases
+# Add the bin/ directory to your PATH
+```
+
+#### Python Dependencies
+
+```bash
+pip install 'srclight[pdf,paddleocr]'
+```
+
+This installs `paddleocr>=2.8` and `pdf2image>=1.16`. On first use, PaddleOCR downloads its models (~1 GB).
+
+#### How It Works
+
+1. During indexing, for each PDF page where `extract_text()` returns empty and the page has embedded images:
+2. PaddleOCR is lazily initialized (once per indexer run, only if a scanned page is encountered)
+3. The page is rasterized at 200 DPI via `pdf2image` + Poppler
+4. PaddleOCR extracts text from the rendered image
+5. The OCR'd text becomes a searchable "page" symbol, same as native text
+
+If `paddleocr` or `pdf2image` are not installed, scanned pages are silently skipped (no error). Native-text PDFs work fine without these dependencies.
+
+#### For AI Agents: Setting Up PaddleOCR
+
+If an agent needs to enable scanned-PDF indexing, run these commands:
+
+```bash
+# 1. Check if poppler is installed
+which pdftoppm  # Linux/macOS — should return a path
+# If missing: sudo apt install poppler-utils (or brew install poppler)
+
+# 2. Install Python deps into srclight's environment
+pip install 'srclight[pdf,paddleocr]'
+
+# 3. Verify the install
+python -c "import paddleocr; print('paddleocr OK')"
+python -c "import pdf2image; print('pdf2image OK')"
+
+# 4. Re-index the project to pick up scanned PDFs
+srclight index
+# Or with embeddings:
+srclight index --embed qwen3-embedding
+```
+
+#### GPU Acceleration for PaddleOCR
+
+PaddleOCR defaults to CPU. For GPU acceleration:
+
+```bash
+# Check if NVIDIA GPU is available
+nvidia-smi  # Shows GPU model, driver, CUDA version
+
+# Install PaddlePaddle with GPU support (CUDA 11.8 or 12.x)
+pip install paddlepaddle-gpu  # Replaces the CPU-only paddlepaddle
+
+# Verify GPU is available to PaddlePaddle
+python -c "import paddle; print('GPU available:', paddle.device.is_compiled_with_cuda())"
+```
+
+Note: Srclight's PaddleOCR wrapper currently initializes with `device="cpu"`. To use GPU, you would need to modify the `_init_paddle()` call in `pdf_extractor.py` to pass `device="gpu"`. This is a future enhancement.
+
+### OCR for Images (pytesseract)
+
+For standalone image files (PNG, JPG, TIFF, etc.), srclight can extract text using Tesseract OCR:
+
+```bash
+# System prerequisite
+sudo apt install tesseract-ocr  # Ubuntu/Debian/WSL
+brew install tesseract           # macOS
+
+# Python dependency
+pip install 'srclight[docs,ocr]'
+```
+
+This is independent of PaddleOCR — `pytesseract` handles image files, while PaddleOCR handles scanned PDF pages.
+
 ## Adding a New Repo
 
 ```bash
@@ -234,6 +350,26 @@ srclight workspace status -w myworkspace
 The new repo is immediately searchable. The MCP server picks up new projects on the next tool call (no restart needed — workspace config is re-read).
 
 **Note:** Both `srclight index` and `srclight hook install` automatically add `.srclight/` to the repo's `.gitignore`. The index databases and embedding files can be large (hundreds of MB) and should never be committed.
+
+## Git Submodules
+
+Srclight discovers files using `git ls-files`, which does **not** recurse into submodules. Git treats submodules as opaque "gitlink" entries, so their contents are invisible to the indexer. This also applies to vendored code that lives in a separate git repo nested inside the parent.
+
+**Recommendation:** If you want a submodule indexed, clone it separately and add it as its own project.
+
+```bash
+# Clone the submodule repo standalone
+git clone git@github.com:your-org/some-lib.git /path/to/some-lib
+
+# Add and index it
+srclight workspace add /path/to/some-lib -w myworkspace
+srclight workspace index -w myworkspace -p some-lib --embed qwen3-embedding
+srclight hook install --workspace myworkspace
+```
+
+This gives you full symbol search, relationship graphs, and semantic search across the submodule — and keeps it independently searchable alongside the parent project.
+
+**What about vendored copies?** If a dependency is committed directly into your repo (e.g. `third_party/some-lib/` without a `.gitmodules` entry), then `git ls-files` does return those files and srclight indexes them as part of the parent project. No extra steps needed. If you later convert a vendored directory to a proper git submodule, its files will disappear from the parent's index on the next reindex — at which point you'd add it as a standalone project.
 
 ## Removing a Repo
 

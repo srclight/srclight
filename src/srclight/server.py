@@ -61,6 +61,14 @@ In workspace mode (multi-repo), many tools accept an optional `project` paramete
 | Bug-prone files (churn) | `git_hotspots(project=project)` |
 | Uncommitted WIP | `whats_changed(project=project)` |
 
+## Document Indexing
+Srclight indexes non-code files (PDF, DOCX, XLSX, HTML, CSV, email, images, text/RST) alongside source code. Documents become searchable symbols (sections, pages, tables) in the same FTS5 indexes.
+
+- **Install**: `pip install 'srclight[docs,pdf]'` for document formats.
+- **Scanned PDFs**: Install `pip install 'srclight[pdf,paddleocr]'` + system `poppler-utils` to OCR scanned/image-only PDF pages automatically. Native-text pages are unaffected. If paddleocr is not installed, scanned pages are silently skipped.
+- **Image OCR**: Install `pip install 'srclight[docs,ocr]'` + system `tesseract-ocr` for OCR on standalone image files.
+- After installing new extras, re-run `srclight index` (or `srclight workspace index`) to pick up documents.
+
 ## Adding a New Repo to the Workspace
 To index a new repo and add it to the workspace, run these shell commands:
 ```
@@ -69,6 +77,9 @@ srclight workspace index -w WORKSPACE_NAME -p PROJECT_NAME --embed qwen3-embeddi
 srclight hook install --workspace WORKSPACE_NAME
 ```
 The server picks up new projects automatically (no restart needed).
+
+## Troubleshooting
+- If ALL tools fail with `-32602: Invalid request parameters`, the MCP session is stale (e.g. the srclight service was restarted while this client was connected). Tell the user to **restart their editor/CLI** so the MCP client reconnects. Retrying the same calls will not help.
 
 ## Setup and server control
 - `setup_guide()` — Structured instructions for agents: how to add a workspace, connect Cursor, where config lives, how to index with embeddings, hook install. Call when the user or agent needs setup steps.
