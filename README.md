@@ -8,7 +8,7 @@
 
 **Deep code indexing for AI agents.** SQLite FTS5 + tree-sitter + embeddings + MCP.
 
-Srclight builds a rich, searchable index of your codebase that AI coding agents can query instantly — replacing dozens of grep/glob calls with precise, structured lookups. It is the most comprehensive code intelligence MCP server available: 25 tools covering symbol search, relationship graphs, git change intelligence, semantic search, and build system awareness — capabilities no other single MCP server combines. Fully local and private: your code never leaves your machine.
+Srclight builds a rich, searchable index of your codebase that AI coding agents can query instantly — replacing dozens of grep/glob calls with precise, structured lookups. It is the most comprehensive code intelligence MCP server available: 29 tools covering symbol search, relationship graphs, git change intelligence, semantic search, build system awareness, and document extraction — capabilities no other single MCP server combines. Fully local and private: your code never leaves your machine.
 
 ## Why?
 
@@ -27,6 +27,8 @@ AI coding agents (Claude Code, Cursor, etc.) spend **40-60% of their tokens on o
 - **Fully offline** — no API calls, works air-gapped (Ollama local embeddings)
 - **Incremental** — only re-indexes changed files (content hash detection)
 - **10 languages** — Python, C, C++, C#, JavaScript, TypeScript, Dart, Swift, Kotlin, Java, Go
+- **10 document formats** — PDF, DOCX, XLSX, HTML, CSV/TSV, email (.eml), images (PNG/JPG/SVG/etc.), plain text, RST, Markdown
+- **Optional OCR** — PaddleOCR for scanned/image-only PDF pages; pytesseract for images
 - **4 search modes** — symbol names, source code (trigram), documentation (stemmed), semantic (embeddings)
 - **Hybrid search** — RRF fusion of keyword + semantic results for best accuracy
 - **Multi-repo workspaces** — search across all your repos simultaneously via SQLite ATTACH+UNION
@@ -40,6 +42,7 @@ AI coding agents (Claude Code, Cursor, etc.) spend **40-60% of their tokens on o
 - **Git** (for change intelligence and auto-reindex hooks)
 - **Ollama** (optional, for semantic search / embeddings) — [ollama.com](https://ollama.com)
 - **NVIDIA GPU + cupy** (optional, for GPU-accelerated vector search)
+- **Poppler** (optional, for PaddleOCR scanned-PDF support) — `apt install poppler-utils` / `brew install poppler`
 
 ## Quick Start
 
@@ -52,8 +55,20 @@ git clone https://github.com/srclight/srclight.git
 cd srclight
 pip install -e .
 
+# Optional: document format support (PDF, DOCX, XLSX, HTML, images)
+pip install 'srclight[docs,pdf]'
+
+# Optional: OCR for scanned PDFs (also needs poppler-utils on your system)
+pip install 'srclight[pdf,paddleocr]'
+
+# Optional: OCR for images (needs tesseract on your system)
+pip install 'srclight[docs,ocr]'
+
 # Optional: GPU-accelerated vector search (requires CUDA 12.x)
 pip install 'srclight[gpu]'
+
+# Everything (docs + pdf + ocr + paddleocr + gpu)
+pip install 'srclight[all]'
 
 # Index your project
 cd /path/to/your/project
@@ -269,9 +284,9 @@ Any MCP-compatible client can connect to the SSE endpoint:
 http://127.0.0.1:8742/sse
 ```
 
-## MCP Tools (25)
+## MCP Tools (29)
 
-Srclight exposes 25 MCP tools organized in five tiers. The MCP server includes built-in instructions that guide AI agents on which tool to use and when — agents receive a session protocol, tool selection guide, and `project` parameter documentation automatically on connection.
+Srclight exposes 29 MCP tools organized in six tiers. The MCP server includes built-in instructions that guide AI agents on which tool to use and when — agents receive a session protocol, tool selection guide, and `project` parameter documentation automatically on connection.
 
 ### Tier 1: Instant Orientation
 | Tool | What it does |
@@ -316,11 +331,15 @@ Srclight exposes 25 MCP tools organized in five tiers. The MCP server includes b
 | `hybrid_search(query)` | Best of both: keyword + semantic with RRF fusion |
 | `embedding_status()` | Embedding coverage and model info |
 
-### Meta
+### Tier 6: Meta & Server
 | Tool | What it does |
 |------|-------------|
 | `index_status()` | Index freshness and stats |
 | `reindex()` | Trigger incremental re-index |
+| `embedding_health()` | Check if the embedding provider (Ollama, etc.) is reachable |
+| `setup_guide()` | Structured setup instructions for agents and users |
+| `server_stats()` | Server uptime and process info |
+| `restart_server()` | Request server restart (SSE only) |
 
 In workspace mode, `search_symbols`, `get_symbol`, `codebase_map`, and `hybrid_search` accept an optional `project` filter. Graph/git/build tools require `project` in workspace mode.
 
@@ -353,15 +372,16 @@ The hooks run `srclight index` in the background after each commit and branch sw
 ## How It Works
 
 1. **tree-sitter** parses every source file into an AST
-2. Symbols (functions, classes, methods, structs, etc.) are extracted with full metadata
-3. Three **SQLite FTS5** indexes are built with different tokenization strategies:
+2. **Document extractors** handle non-code files (PDF, DOCX, XLSX, HTML, CSV, images, email, text) — extracting headings, tables, pages, and metadata as searchable symbols. Scanned PDF pages are optionally OCR'd via PaddleOCR.
+3. Symbols (functions, classes, methods, structs, etc.) are extracted with full metadata
+4. Three **SQLite FTS5** indexes are built with different tokenization strategies:
    - **Names**: code-aware tokenization (splits `camelCase`, handles `::`, `->`)
    - **Content**: trigram index for substring matching
    - **Docs**: Porter stemming for natural language in docstrings
-4. Optional: **embedding vectors** are generated via Ollama or Voyage API and stored as BLOBs
-5. A `.npy` **sidecar snapshot** is built and loaded to **GPU VRAM** (cupy) or CPU RAM (numpy) for fast search
-6. The **MCP server** exposes structured query tools that AI agents call instead of grep
-7. **Hybrid search** merges keyword (FTS5) and semantic (embedding) results via RRF
+5. Optional: **embedding vectors** are generated via Ollama or Voyage API and stored as BLOBs
+6. A `.npy` **sidecar snapshot** is built and loaded to **GPU VRAM** (cupy) or CPU RAM (numpy) for fast search
+7. The **MCP server** exposes structured query tools that AI agents call instead of grep
+8. **Hybrid search** merges keyword (FTS5) and semantic (embedding) results via RRF
 
 ### Architecture (Workspace Mode)
 
@@ -389,7 +409,7 @@ A survey of 50+ MCP code intelligence servers across all major registries (Offic
 | Infrastructure required | `pip install`, SQLite | None | SCIP indexer | Docker, Milvus, OpenAI API |
 | Fully local / private | Yes, zero API calls | Yes | Yes | No (needs OpenAI) |
 | Languages | 10 | Any (regex) | 5 (SCIP) | Any (chunking) |
-| MCP tools | 25 | 2 (grep, glob) | 80+ | ~10 |
+| MCP tools | 29 | 2 (grep, glob) | 80+ | ~10 |
 
 Unlike grep-based tools, srclight builds a persistent index with structured lookups. Unlike cloud-based solutions, everything runs locally — your code never leaves your machine. Unlike IDE plugins, srclight works with any MCP client.
 
@@ -405,6 +425,8 @@ Unlike grep-based tools, srclight builds a persistent index with structured look
 - [x] GPU-accelerated vector search: `.npy` sidecar, cupy/numpy vectorized math
 - [x] Multi-repo workspaces (ATTACH+UNION)
 - [x] Auto-reindex git hooks (post-commit + post-checkout)
+- [x] Document extraction: PDF, DOCX, XLSX, HTML, CSV, email, images, text (heading detection, tables, metadata)
+- [x] Optional OCR: PaddleOCR for scanned PDFs, pytesseract for images
 - [x] MCP agent guidance: comprehensive instructions, tool selection guide, session protocol
 - [x] Workspace config hot-reload (no server restart needed to add repos)
 - [x] VectorCache sidecar re-discovery (no restart needed after embedding)
