@@ -428,3 +428,81 @@ def test_index_dart(db, dart_project):
     ext_syms = [s for s in syms if s.name == "StringExtensions"]
     assert len(ext_syms) >= 1
     assert ext_syms[0].kind == "extension"
+
+
+@pytest.fixture
+def php_project(tmp_path):
+    """Create a minimal PHP project."""
+    src = tmp_path / "phpproject"
+    src.mkdir()
+
+    (src / "app.php").write_text('''\
+<?php
+function greet($name) {
+    echo "Hello, $name!";
+}
+
+class UserController {
+    public function index(): void {
+        echo "list users";
+    }
+
+    private function validate($input): bool {
+        return true;
+    }
+}
+
+interface Cacheable {
+    public function cache(): void;
+}
+
+trait Loggable {
+    public function log($msg): void {}
+}
+
+enum Status {
+    case Active;
+    case Inactive;
+}
+?>
+''')
+    return src
+
+
+def test_index_php(db, php_project):
+    """Indexes PHP files and extracts symbols."""
+    config = IndexConfig(root=php_project)
+    indexer = Indexer(db, config)
+    stats = indexer.index(php_project)
+
+    assert stats.files_scanned == 1
+    assert stats.files_indexed == 1
+    assert stats.symbols_extracted > 0
+    assert stats.errors == 0
+
+    db_stats = db.stats()
+    assert db_stats["files"] == 1
+    assert db_stats["symbols"] > 0
+    assert "php" in db_stats["languages"]
+
+    syms = db.symbols_in_file("app.php")
+    names = [s.name for s in syms]
+
+    # Top-level function
+    assert "greet" in names
+
+    # Class
+    assert "UserController" in names
+
+    # Methods
+    assert "index" in names
+    assert "validate" in names
+
+    # Interface
+    assert "Cacheable" in names
+
+    # Trait
+    assert "Loggable" in names
+
+    # Enum
+    assert "Status" in names
