@@ -279,6 +279,26 @@ _GO_QUERY = """
 (type_declaration (type_spec (type_identifier) @type.name) @type.def)
 """
 
+_PHP_QUERY = """
+(function_definition
+    name: (name) @fn.name) @fn.def
+
+(class_declaration
+    name: (name) @cls.name) @cls.def
+
+(method_declaration
+    name: (name) @method.name) @method.def
+
+(interface_declaration
+    name: (name) @iface.name) @iface.def
+
+(trait_declaration
+    name: (name) @trait.name) @trait.def
+
+(enum_declaration
+    name: (name) @enum.name) @enum.def
+"""
+
 
 LANGUAGES: dict[str, LanguageConfig] = {
     "python": LanguageConfig(
@@ -359,6 +379,12 @@ LANGUAGES: dict[str, LanguageConfig] = {
         loader="tree_sitter_go",
         symbol_query=_GO_QUERY,
     ),
+    "php": LanguageConfig(
+        name="php",
+        extensions=(".php",),
+        loader="tree_sitter_php",
+        symbol_query=_PHP_QUERY,
+    ),
 }
 
 # Extension to language mapping (handle .h ambiguity: default to C, override if cpp detected)
@@ -403,6 +429,8 @@ def get_language(name: str) -> Language | None:
         mod = importlib.import_module(config.loader)
         if name == "typescript":
             lang = Language(mod.language_typescript())
+        elif name == "php":
+            lang = Language(mod.language_php())
         elif hasattr(mod, "language"):
             lang = Language(mod.language())
         else:
