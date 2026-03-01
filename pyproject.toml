@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "srclight"
-version = "0.15.0"
+version = "0.15.1"
 description = "Deep code indexing for AI agents. SQLite FTS5 + tree-sitter + embeddings + MCP."
 readme = "README.md"
 license = "MIT"
