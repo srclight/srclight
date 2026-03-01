@@ -26,7 +26,7 @@ AI coding agents (Claude Code, Cursor, etc.) spend **40-60% of their tokens on o
 - **Minimal dependencies** — single SQLite file per repo, no Docker/Redis/vector DB
 - **Fully offline** — no API calls, works air-gapped (Ollama local embeddings)
 - **Incremental** — only re-indexes changed files (content hash detection)
-- **10 languages** — Python, C, C++, C#, JavaScript, TypeScript, Dart, Swift, Kotlin, Java, Go
+- **11 languages** — Python, C, C++, C#, JavaScript, TypeScript, PHP, Dart, Swift, Kotlin, Java, Go
 - **10 document formats** — PDF, DOCX, XLSX, HTML, CSV/TSV, email (.eml), images (PNG/JPG/SVG/etc.), plain text, RST, Markdown
 - **Optional OCR** — PaddleOCR for scanned/image-only PDF pages; pytesseract for images
 - **4 search modes** — symbol names, source code (trigram), documentation (stemmed), semantic (embeddings)
@@ -408,7 +408,7 @@ A survey of 50+ MCP code intelligence servers across all major registries (Offic
 | Multi-repo workspace | ATTACH+UNION | None | None | None |
 | Infrastructure required | `pip install`, SQLite | None | SCIP indexer | Docker, Milvus, OpenAI API |
 | Fully local / private | Yes, zero API calls | Yes | Yes | No (needs OpenAI) |
-| Languages | 10 | Any (regex) | 5 (SCIP) | Any (chunking) |
+| Languages | 11 | Any (regex) | 5 (SCIP) | Any (chunking) |
 | MCP tools | 29 | 2 (grep, glob) | 80+ | ~10 |
 
 Unlike grep-based tools, srclight builds a persistent index with structured lookups. Unlike cloud-based solutions, everything runs locally — your code never leaves your machine. Unlike IDE plugins, srclight works with any MCP client.
