@@ -160,6 +160,7 @@ mcp = FastMCP(
     instructions=_INSTRUCTIONS_TEMPLATE.format(
         dynamic_section="You have access to a code index with searchable symbols, call graphs, and git history.\n\n"
     ),
+    stateless_http=True,
 )
 
 # Global state — initialized on first tool call or via configure()
