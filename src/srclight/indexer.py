@@ -306,6 +306,11 @@ def _kind_from_capture(capture_name: str) -> str:
         "ext": "extension",
         "mixin": "mixin",
         "getter": "method",    # Dart getters
+        # Bash-specific
+        "export_var": "variable",
+        # SQL-specific
+        "table": "table",
+        "view": "view",
     }
     return mapping.get(prefix, "unknown")
 

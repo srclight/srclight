@@ -2086,6 +2086,9 @@ _last_query_time: float | None = None
 _last_query_client: str | None = None
 _query_count: int = 0
 
+# UI event queue — polled by Flutter app via /api/ui_events.
+_ui_events: list[dict] = []
+
 
 def _record_query(client: str | None = None) -> None:
     """Record that a tool was called (timestamp + optional client identifier)."""
@@ -2137,6 +2140,39 @@ async def restart_server() -> str:
         "ok": True,
         "message": "Server will exit now. Reconnect after your process manager restarts it.",
     }, indent=2)
+
+
+@mcp.tool()
+async def show_status(message: str = "") -> str:
+    """Show the srclight dashboard window and return current status.
+
+    Pops up the desktop app window (if running) and returns indexing stats.
+    Use this when a user asks about their indexing status, project health,
+    or wants to see what srclight is doing.
+
+    Args:
+        message: Optional message to display in the dashboard.
+    """
+    global _ui_events
+    _ui_events.append({
+        "type": "show_status",
+        "message": message,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    # Return current stats so the AI has the data in context too.
+    stats: dict = {
+        "query_count": _query_count,
+    }
+    if _last_query_time is not None:
+        stats["last_query_ago_seconds"] = round(time.time() - _last_query_time, 1)
+    if _last_query_client is not None:
+        stats["last_query_client"] = _last_query_client
+    try:
+        map_result = await codebase_map()
+        stats["codebase"] = json.loads(map_result)
+    except Exception:
+        pass
+    return json.dumps(stats, indent=2)
 
 
 @mcp.tool()

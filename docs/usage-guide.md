@@ -123,6 +123,17 @@ Alternatively you can use **stdio** (Type **command**, Command: `srclight`, Args
 }
 ```
 
+#### Option E: Claude Code Plugin (easiest)
+
+Install the plugin — it auto-configures the MCP server via `uvx` (zero-install):
+
+```
+/plugin marketplace add srclight/claude-code-plugin
+/plugin install srclight
+```
+
+This gives you all MCP tools plus skills that teach Claude when and how to use them, a codebase explorer agent, and a SessionStart hook that detects index status. See [playbook-claude-code-plugin.md](playbook-claude-code-plugin.md) for details.
+
 ### 3. Add to OpenClaw
 
 [OpenClaw](https://openclaw.ai) connects to srclight via its built-in [mcporter](https://mcporter.dev) MCP tool server.

@@ -299,6 +299,48 @@ _PHP_QUERY = """
     name: (name) @enum.name) @enum.def
 """
 
+_BASH_QUERY = """
+(function_definition
+    name: (word) @fn.name) @fn.def
+
+(declaration_command
+    (variable_assignment
+        name: (variable_name) @export_var.name)) @export_var.def
+"""
+
+_CMAKE_QUERY = """
+(function_def
+    (function_command
+        (argument_list
+            . (argument) @fn.name))) @fn.def
+
+(macro_def
+    (macro_command
+        (argument_list
+            . (argument) @macro.name))) @macro.def
+"""
+
+_SQL_QUERY = """
+(create_table
+    (object_reference
+        (identifier) @table.name)) @table.def
+
+(create_view
+    (object_reference
+        (identifier) @view.name)) @view.def
+"""
+
+_GROOVY_QUERY = """
+(class_declaration
+    (identifier) @cls.name) @cls.def
+
+(method_declaration
+    (identifier) @method.name) @method.def
+
+(function_definition
+    (identifier) @fn.name) @fn.def
+"""
+
 
 LANGUAGES: dict[str, LanguageConfig] = {
     "python": LanguageConfig(
@@ -385,6 +427,30 @@ LANGUAGES: dict[str, LanguageConfig] = {
         loader="tree_sitter_php",
         symbol_query=_PHP_QUERY,
     ),
+    "bash": LanguageConfig(
+        name="bash",
+        extensions=(".sh", ".bash"),
+        loader="tree_sitter_bash",
+        symbol_query=_BASH_QUERY,
+    ),
+    "cmake": LanguageConfig(
+        name="cmake",
+        extensions=(".cmake",),
+        loader="tree_sitter_cmake",
+        symbol_query=_CMAKE_QUERY,
+    ),
+    "sql": LanguageConfig(
+        name="sql",
+        extensions=(".sql",),
+        loader="tree_sitter_sql",
+        symbol_query=_SQL_QUERY,
+    ),
+    "groovy": LanguageConfig(
+        name="groovy",
+        extensions=(".groovy", ".gradle"),
+        loader="tree_sitter_groovy",
+        symbol_query=_GROOVY_QUERY,
+    ),
 }
 
 # Extension to language mapping (handle .h ambiguity: default to C, override if cpp detected)
@@ -397,8 +463,18 @@ for lang_name, config in LANGUAGES.items():
         _EXT_TO_LANG.setdefault(ext, lang_name)
 
 
+_FILENAME_TO_LANG: dict[str, str] = {
+    "CMakeLists.txt": "cmake",
+}
+
+
 def detect_language(path: Path) -> str | None:
-    """Detect language from file extension."""
+    """Detect language from file extension or filename."""
+    # Check exact filename first (e.g. CMakeLists.txt)
+    lang = _FILENAME_TO_LANG.get(path.name)
+    if lang:
+        return lang
+
     suffix = path.suffix.lower()
     lang = _EXT_TO_LANG.get(suffix)
 
