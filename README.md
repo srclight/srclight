@@ -21,6 +21,10 @@ AI coding agents (Claude Code, Cursor, etc.) spend **40-60% of their tokens on o
 | "Find code that does X" → 20 greps | `semantic_search("dictionary lookup")` — one call |
 | 15-25 tool calls per bug fix | 5-8 tool calls per bug fix |
 
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/srclight-srclight).
+
 ## Features
 
 - **Minimal dependencies** — single SQLite file per repo, no Docker/Redis/vector DB
