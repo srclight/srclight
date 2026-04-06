@@ -8,6 +8,7 @@ import pytest
 from srclight.git import (
     blame_lines,
     changes_to_file,
+    detect_changes,
     hotspots,
     recent_changes,
     whats_changed,
@@ -116,3 +117,54 @@ def test_blame_lines(git_repo):
     assert len(blames) >= 1
     # At least one blame entry should have author info
     assert any(b.author for b in blames)
+
+
+def test_detect_changes_uncommitted(git_repo):
+    """detect_changes finds modified files with hunk line ranges."""
+    (git_repo / "main.py").write_text(
+        "def hello():\n    print('CHANGED')\n\ndef goodbye():\n    print('bye')\n"
+    )
+    changes = detect_changes(git_repo)
+    assert len(changes) == 1
+    assert changes[0]["file"] == "main.py"
+    assert len(changes[0]["hunks"]) >= 1
+    # The hunk should cover around line 2 (the changed print line)
+    hunk = changes[0]["hunks"][0]
+    assert hunk["new_start"] >= 1
+    assert hunk["new_count"] >= 1
+
+
+def test_detect_changes_with_ref(git_repo):
+    """detect_changes with ref compares against a specific commit."""
+    changes = detect_changes(git_repo, ref="HEAD~1")
+    assert len(changes) >= 1
+    files = [c["file"] for c in changes]
+    assert "utils.py" in files
+
+
+def test_detect_changes_no_changes(git_repo):
+    """detect_changes returns empty list when nothing changed."""
+    changes = detect_changes(git_repo)
+    assert changes == []
+
+
+def test_detect_changes_deleted_file(git_repo):
+    """detect_changes skips deleted files (no +++ b/ line)."""
+    import os
+    os.remove(git_repo / "utils.py")
+    subprocess.run(["git", "add", "utils.py"], cwd=str(git_repo), capture_output=True)
+    changes = detect_changes(git_repo)
+    # Deleted files should not appear (we only track +++ b/ lines)
+    files = [c["file"] for c in changes]
+    assert "utils.py" not in files
+
+
+def test_detect_changes_multiple_hunks(git_repo):
+    """Multiple non-adjacent changes in one file produce multiple hunks."""
+    (git_repo / "main.py").write_text(
+        "def hello():\n    print('CHANGED1')\n\ndef goodbye():\n    print('CHANGED2')\n"
+    )
+    changes = detect_changes(git_repo)
+    assert len(changes) == 1
+    # Two separate changes should produce two hunks
+    assert len(changes[0]["hunks"]) >= 2

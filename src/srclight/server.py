@@ -55,6 +55,11 @@ In workspace mode (multi-repo), many tools accept an optional `project` paramete
 | What implements this interface? | `get_implementors(interface, project)` |
 | Test coverage for a symbol | `get_tests_for(symbol, project)` |
 | Class inheritance tree | `get_type_hierarchy(name, project)` |
+| Functional module clusters | `get_communities(project)` |
+| Which module does this belong to? | `get_community(symbol, project)` |
+| Execution paths through code | `get_execution_flows(project)` |
+| Risk of changing a symbol | `get_impact(symbol, project)` |
+| What did my edits just break? | `detect_changes(project=project)` |
 | Who last changed this & why | `blame_symbol(symbol, project)` |
 | Recent commit activity | `recent_changes(project=project)` |
 | Bug-prone files (churn) | `git_hotspots(project=project)` |
@@ -62,6 +67,17 @@ In workspace mode (multi-repo), many tools accept an optional `project` paramete
 | What does this file import? | `find_imports(path, project)` |
 | Find unused/dead code | `find_dead_code(project)` |
 | Search for code patterns (regex) | `find_pattern(pattern, project)` |
+| Past decisions/learnings relevant to current work | `relevant_learnings(query)` |
+| Record a decision, correction, or discovery | `record_learning(kind, content, reasoning)` |
+| Log what this session accomplished | `conversation_summary(session_id, task_summary)` |
+| Learning counts and trends | `learning_stats()` |
+
+## Learnings (Conversation Intelligence)
+Srclight maintains a workspace-level learnings database — decisions, corrections, discoveries, patterns, and conventions captured across sessions. Use these to build institutional memory:
+
+- **At session start**: Call `relevant_learnings(query)` with the task description to check if prior decisions apply.
+- **During work**: Call `record_learning(kind, content, reasoning)` when making important decisions or receiving corrections. Valid kinds: `decision`, `correction`, `discovery`, `pattern`, `blocker`, `convention`.
+- **At session end**: Call `conversation_summary(session_id, task_summary)` to log what was accomplished.
 
 ## Document Indexing
 Srclight indexes non-code files (PDF, DOCX, XLSX, HTML, CSV, email, images, text/RST) alongside source code. Documents become searchable symbols (sections, pages, tables) in the same search indexes.
@@ -175,6 +191,9 @@ _workspace_config_mtime: float = 0.0  # mtime of workspace config at last load
 # Vector cache (GPU-resident embedding matrix)
 _vector_cache = None  # VectorCache instance (single-repo mode)
 
+# Learnings DB (workspace-level, lazy)
+_learnings_db = None  # LearningsDB instance
+
 
 def _is_workspace_mode() -> bool:
     return _workspace_name is not None
@@ -229,6 +248,26 @@ def _get_workspace_db():
     _workspace_db.open()
     _workspace_config_mtime = current_mtime
     return _workspace_db
+
+
+def _get_learnings_db():
+    """Get or create the workspace-level LearningsDB."""
+    global _learnings_db
+
+    if _learnings_db is not None:
+        return _learnings_db
+
+    from .workspace import WorkspaceConfig
+    from .learnings import LearningsDB
+
+    if _workspace_name is None:
+        raise RuntimeError("Learnings require workspace mode")
+
+    config = WorkspaceConfig.load(_workspace_name)
+    _learnings_db = LearningsDB(config.learnings_db_path)
+    _learnings_db.open()
+    _learnings_db.initialize()
+    return _learnings_db
 
 
 def _get_db() -> Database:
@@ -2225,6 +2264,526 @@ async def setup_guide() -> str:
     }, indent=2)
 
 
+# --- Tier 7: Learnings (workspace-level conversation intelligence) ---
+
+
+@mcp.tool()
+def record_learning(
+    kind: str,
+    content: str,
+    reasoning: str | None = None,
+    project: str | None = None,
+    scope: str = "workspace",
+    confidence: float = 1.0,
+    ttl_days: int | None = None,
+    symbols: list[str] | None = None,
+    source_type: str | None = None,
+    source_ref: str | None = None,
+) -> str:
+    """Record a learning — a decision, correction, discovery, pattern, blocker, or convention.
+
+    Learnings persist across sessions and are searchable via relevant_learnings().
+    Use this to capture important decisions, corrections from the user, discovered
+    patterns, blockers, or coding conventions.
+
+    Args:
+        kind: One of 'decision', 'correction', 'discovery', 'pattern', 'blocker', 'convention'
+        content: The learning itself (what was decided/discovered/corrected)
+        reasoning: Why this learning matters or the context behind it
+        project: Project this applies to (omit for cross-project learnings)
+        scope: 'workspace', 'project', 'file', or 'symbol'
+        confidence: 0.0-1.0 confidence level (default 1.0)
+        ttl_days: Auto-expire after N days (omit for permanent)
+        symbols: Symbol names this learning relates to
+        source_type: 'conversation', 'labbook', 'decisions_md', 'claude_md', 'agent_log'
+        source_ref: Reference identifier (session ID, file path, etc.)
+    """
+    from .learnings import LearningRecord
+
+    ldb = _get_learnings_db()
+    rec = LearningRecord(
+        kind=kind,
+        content=content,
+        reasoning=reasoning,
+        scope=scope,
+        project=project,
+        confidence=confidence,
+        ttl_days=ttl_days,
+    )
+
+    sources = None
+    if source_type:
+        sources = [{"type": source_type, "ref": source_ref or ""}]
+
+    learning_id = ldb.record_learning(rec, symbols=symbols, sources=sources)
+    return json.dumps({"learning_id": learning_id, "status": "recorded"})
+
+
+@mcp.tool()
+def conversation_summary(
+    session_id: str,
+    task_summary: str,
+    project: str | None = None,
+    model: str | None = None,
+    tokens_in: int | None = None,
+    tokens_out: int | None = None,
+    cost_usd: float | None = None,
+) -> str:
+    """Record a conversation session summary.
+
+    Call at the end of a session to log what was accomplished.
+
+    Args:
+        session_id: Unique session identifier
+        task_summary: Brief description of what was done
+        project: Primary project worked on (if any)
+        model: Model used (e.g. 'claude-opus-4-6')
+        tokens_in: Input tokens consumed
+        tokens_out: Output tokens generated
+        cost_usd: Estimated cost in USD
+    """
+    from .learnings import ConversationRecord
+
+    ldb = _get_learnings_db()
+    rec = ConversationRecord(
+        session_id=session_id,
+        project=project,
+        task_summary=task_summary,
+        model=model,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cost_usd=cost_usd,
+    )
+    conv_id = ldb.record_conversation(rec)
+    return json.dumps({"conversation_id": conv_id, "status": "recorded"})
+
+
+@mcp.tool()
+def relevant_learnings(
+    query: str,
+    project: str | None = None,
+    kind: str | None = None,
+    limit: int = 10,
+) -> str:
+    """Find relevant learnings using hybrid search (keyword + semantic).
+
+    Searches past decisions, corrections, discoveries, patterns, blockers,
+    and conventions. Returns the most relevant learnings for your current context.
+
+    Call this at the START of a session or when making a decision that might
+    have been addressed before.
+
+    Args:
+        query: What you're looking for (natural language or keywords)
+        project: Filter to a specific project (omit for all)
+        kind: Filter by kind: 'decision', 'correction', 'discovery', 'pattern', 'blocker', 'convention'
+        limit: Max results (default 10)
+    """
+    ldb = _get_learnings_db()
+
+    # FTS search
+    fts_results = ldb.search_fts(query, kind=kind, project=project, limit=limit * 2)
+
+    # Try embedding search if available
+    embedding_results = []
+    # (Embedding search is a bonus — FTS alone is sufficient)
+
+    if embedding_results:
+        results = ldb.hybrid_search(fts_results, embedding_results, limit=limit)
+    else:
+        results = fts_results[:limit]
+
+    if not results:
+        return json.dumps({"results": [], "message": "No relevant learnings found."})
+
+    # Format results
+    formatted = []
+    for r in results:
+        entry = {
+            "kind": r["kind"],
+            "content": r["content"],
+            "project": r["project"],
+            "created_at": r["created_at"],
+        }
+        if r.get("reasoning"):
+            entry["reasoning"] = r["reasoning"]
+        if r.get("rrf_score"):
+            entry["rrf_score"] = r["rrf_score"]
+        formatted.append(entry)
+
+    return json.dumps({"results": formatted, "count": len(formatted)}, indent=2)
+
+
+@mcp.tool()
+def learning_stats(
+    project: str | None = None,
+    days: int | None = None,
+) -> str:
+    """Get learning statistics — counts by kind over time.
+
+    Shows how many decisions, corrections, discoveries, etc. have been captured.
+
+    Args:
+        project: Filter to a specific project (omit for all)
+        days: Look back N days (omit for all time)
+    """
+    ldb = _get_learnings_db()
+    s = ldb.stats(project=project, days=days)
+    return json.dumps(s, indent=2)
+
+
+@mcp.tool()
+def get_communities(project: str | None = None) -> str:
+    """Get detected functional communities (module clusters) in the call graph.
+
+    Communities are auto-detected using the Louvain algorithm on call-graph edges.
+    Each community has a TF-IDF auto-label, member count, and cohesion score.
+
+    Args:
+        project: Project name (required in workspace mode)
+    """
+    if _is_workspace_mode():
+        if not project:
+            return _project_required_error("community analysis")
+        from .workspace import WorkspaceConfig
+        config = WorkspaceConfig.load(_workspace_name)
+        path = config.projects.get(project)
+        if not path:
+            return _project_not_found_error(project)
+        db_path = Path(path) / ".srclight" / "index.db"
+        if not db_path.exists():
+            return json.dumps({"error": f"Project '{project}' not indexed"})
+        db = Database(db_path)
+        db.open()
+        communities = db.get_communities()
+        db.close()
+    else:
+        db = _get_db()
+        communities = db.get_communities()
+
+    if not communities:
+        return json.dumps({"info": "No communities detected. Run reindex to generate.", "communities": []})
+
+    return json.dumps({
+        "project": project,
+        "community_count": len(communities),
+        "communities": communities,
+    }, indent=2)
+
+
+@mcp.tool()
+def get_community(symbol_name: str, project: str | None = None) -> str:
+    """Get the community that a specific symbol belongs to, with all co-members.
+
+    Answers: "What functional module does this symbol belong to?"
+
+    Args:
+        symbol_name: Name of the symbol to look up
+        project: Project name (required in workspace mode)
+    """
+    if _is_workspace_mode():
+        if not project:
+            return _project_required_error("community lookup")
+        from .workspace import WorkspaceConfig
+        config = WorkspaceConfig.load(_workspace_name)
+        path = config.projects.get(project)
+        if not path:
+            return _project_not_found_error(project)
+        db_path = Path(path) / ".srclight" / "index.db"
+        if not db_path.exists():
+            return json.dumps({"error": f"Project '{project}' not indexed"})
+        db = Database(db_path)
+        db.open()
+        sym = db.get_symbol_by_name(symbol_name)
+        if sym is None:
+            db.close()
+            return _symbol_not_found_error(symbol_name, project)
+        comm_id = db.get_community_for_symbol(sym.id)
+        if comm_id is None:
+            db.close()
+            return json.dumps({"symbol": symbol_name, "community": None, "info": "Symbol not assigned to any community"})
+        members = db.get_community_members(comm_id)
+        communities = db.get_communities()
+        db.close()
+    else:
+        db = _get_db()
+        sym = db.get_symbol_by_name(symbol_name)
+        if sym is None:
+            return _symbol_not_found_error(symbol_name)
+        comm_id = db.get_community_for_symbol(sym.id)
+        if comm_id is None:
+            return json.dumps({"symbol": symbol_name, "community": None, "info": "Symbol not assigned to any community"})
+        members = db.get_community_members(comm_id)
+        communities = db.get_communities()
+
+    # Find the community metadata
+    comm_info = next((c for c in communities if c["id"] == comm_id), None)
+
+    return json.dumps({
+        "symbol": symbol_name,
+        "community_id": comm_id,
+        "label": comm_info["label"] if comm_info else "unknown",
+        "keywords": comm_info.get("keywords", []) if comm_info else [],
+        "cohesion": comm_info["cohesion"] if comm_info else None,
+        "member_count": len(members),
+        "members": members,
+    }, indent=2)
+
+
+@mcp.tool()
+def get_execution_flows(project: str | None = None) -> str:
+    """Get traced execution flows through the call graph.
+
+    Flows are paths from entry points (like main, run, handle) through the call graph,
+    showing how execution moves across functional communities.
+
+    Args:
+        project: Project name (required in workspace mode)
+    """
+    if _is_workspace_mode():
+        if not project:
+            return _project_required_error("execution flow analysis")
+        from .workspace import WorkspaceConfig
+        config = WorkspaceConfig.load(_workspace_name)
+        path = config.projects.get(project)
+        if not path:
+            return _project_not_found_error(project)
+        db_path = Path(path) / ".srclight" / "index.db"
+        if not db_path.exists():
+            return json.dumps({"error": f"Project '{project}' not indexed"})
+        db = Database(db_path)
+        db.open()
+        flows = db.get_execution_flows()
+        db.close()
+    else:
+        db = _get_db()
+        flows = db.get_execution_flows()
+
+    if not flows:
+        return json.dumps({"info": "No execution flows traced. Run reindex to generate.", "flows": []})
+
+    return json.dumps({
+        "project": project,
+        "flow_count": len(flows),
+        "flows": flows,
+    }, indent=2)
+
+
+@mcp.tool()
+def get_impact(symbol_name: str, project: str | None = None) -> str:
+    """Compute blast radius and risk for modifying a symbol.
+
+    Answers: "How risky is it to change this?" Analyzes direct/transitive dependents,
+    affected communities, and affected execution flows to assign a risk level
+    (LOW / MEDIUM / HIGH / CRITICAL).
+
+    Args:
+        symbol_name: Name of the symbol to analyze
+        project: Project name (required in workspace mode)
+    """
+    from .community import compute_impact
+
+    if _is_workspace_mode():
+        if not project:
+            return _project_required_error("impact analysis")
+        from .workspace import WorkspaceConfig
+        config = WorkspaceConfig.load(_workspace_name)
+        path = config.projects.get(project)
+        if not path:
+            return _project_not_found_error(project)
+        db_path = Path(path) / ".srclight" / "index.db"
+        if not db_path.exists():
+            return json.dumps({"error": f"Project '{project}' not indexed"})
+        db = Database(db_path)
+        db.open()
+        sym = db.get_symbol_by_name(symbol_name)
+        if sym is None:
+            db.close()
+            return _symbol_not_found_error(symbol_name, project)
+        # Build sym_to_community map from stored data
+        communities = db.get_communities()
+        sym_to_comm: dict[int, int] = {}
+        for c in communities:
+            for m in db.get_community_members(c["id"]):
+                sym_to_comm[m["id"]] = c["id"]
+        flows = db.get_execution_flows()
+        # Reconstruct flow step dicts for compute_impact
+        flow_dicts = _reconstruct_flows(db, flows)
+        result = compute_impact(db, sym.id, sym_to_comm, flow_dicts)
+        db.close()
+    else:
+        db = _get_db()
+        sym = db.get_symbol_by_name(symbol_name)
+        if sym is None:
+            return _symbol_not_found_error(symbol_name)
+        communities = db.get_communities()
+        sym_to_comm = {}
+        for c in communities:
+            for m in db.get_community_members(c["id"]):
+                sym_to_comm[m["id"]] = c["id"]
+        flows = db.get_execution_flows()
+        flow_dicts = _reconstruct_flows(db, flows)
+        result = compute_impact(db, sym.id, sym_to_comm, flow_dicts)
+
+    return json.dumps({
+        "symbol": symbol_name,
+        "project": project,
+        **result,
+    }, indent=2)
+
+
+def _reconstruct_flows(db: Database, stored_flows: list[dict]) -> list[dict]:
+    """Reconstruct flow dicts with steps from stored flow data."""
+    result = []
+    for flow in stored_flows:
+        steps = db.get_flow_steps(flow["id"])
+        result.append({
+            "entry_symbol_id": flow["entry_symbol_id"],
+            "terminal_symbol_id": flow["terminal_symbol_id"],
+            "label": flow["label"],
+            "step_count": flow["step_count"],
+            "communities_crossed": flow["communities_crossed"],
+            "steps": [{"symbol_id": s["symbol_id"], "community_id": s["community_id"], "order": s["step_order"]} for s in steps],
+        })
+    return result
+
+
+@mcp.tool()
+def detect_changes(
+    ref: str | None = None,
+    project: str | None = None,
+) -> str:
+    """Detect which symbols were changed and compute their aggregate blast radius.
+
+    Maps git diff hunks to indexed symbols, then runs impact analysis on each
+    to show what breaks. Call this after editing files or before committing to
+    understand the full impact of your changes.
+
+    Args:
+        ref: Git ref to diff against (default: uncommitted changes vs HEAD).
+             Use "HEAD~1" for last commit's impact, or a branch name.
+        project: Project name (required in workspace mode)
+    """
+    from . import git as git_mod
+    from .community import compute_impact
+
+    if _is_workspace_mode() and not project:
+        return _project_required_error("detect_changes")
+
+    repo_root = _resolve_repo_root(project)
+    if not repo_root:
+        return _project_not_found_error(project)
+
+    # Get per-project DB
+    if _is_workspace_mode():
+        from .workspace import WorkspaceConfig
+        config = WorkspaceConfig.load(_workspace_name)
+        path = config.projects.get(project)
+        db_path = Path(path) / ".srclight" / "index.db"
+        if not db_path.exists():
+            return json.dumps({"error": f"Project '{project}' not indexed"})
+        db = Database(db_path)
+        db.open()
+    else:
+        db = _get_db()
+
+    # Parse diff into changed file/line ranges
+    changed_files = git_mod.detect_changes(repo_root, ref=ref)
+    if not changed_files:
+        if _is_workspace_mode():
+            db.close()
+        return json.dumps({"info": "No changes detected", "changed_symbols": []})
+
+    # Map hunks to symbols
+    changed_symbols: list[dict] = []
+    seen_sym_ids: set[int] = set()
+
+    for file_change in changed_files:
+        file_path = file_change["file"]
+        symbols = db.symbols_in_file(file_path)
+        if not symbols:
+            continue
+
+        for sym in symbols:
+            if sym.id in seen_sym_ids:
+                continue
+            # Check if any hunk overlaps this symbol's line range
+            for hunk in file_change["hunks"]:
+                hunk_start = hunk["new_start"]
+                hunk_end = hunk_start + max(hunk["new_count"] - 1, 0)
+                if hunk_start <= sym.end_line and hunk_end >= sym.start_line:
+                    seen_sym_ids.add(sym.id)
+                    changed_symbols.append({
+                        "id": sym.id,
+                        "name": sym.name,
+                        "qualified_name": sym.qualified_name,
+                        "kind": sym.kind,
+                        "file": file_path,
+                        "lines": f"{sym.start_line}-{sym.end_line}",
+                    })
+                    break
+
+    if not changed_symbols:
+        if _is_workspace_mode():
+            db.close()
+        return json.dumps({
+            "info": "Changes detected but no indexed symbols affected",
+            "changed_files": [f["file"] for f in changed_files],
+            "changed_symbols": [],
+        })
+
+    # Load community and flow data for impact analysis
+    communities = db.get_communities()
+    sym_to_comm: dict[int, int] = {}
+    for c in communities:
+        for m in db.get_community_members(c["id"]):
+            sym_to_comm[m["id"]] = c["id"]
+
+    flows = db.get_execution_flows()
+    flow_dicts = _reconstruct_flows(db, flows)
+
+    # Run impact analysis on each changed symbol
+    all_affected_comms: set[int] = set()
+    all_affected_flows: set[str] = set()
+    total_direct = 0
+    total_transitive = 0
+    max_risk = "LOW"
+    risk_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+    symbol_impacts: list[dict] = []
+
+    for sym_info in changed_symbols:
+        impact = compute_impact(db, sym_info["id"], sym_to_comm, flow_dicts)
+        sym_info["risk"] = impact["risk"]
+        sym_info["direct_dependents"] = impact["direct_dependents"]
+        sym_info["affected_flows"] = impact["affected_flows"]
+        symbol_impacts.append(sym_info)
+
+        total_direct += impact["direct_dependents"]
+        total_transitive += impact["transitive_dependents"]
+        all_affected_comms.update(impact["affected_communities"])
+        all_affected_flows.update(impact["affected_flows"])
+        if risk_order.get(impact["risk"], 0) > risk_order.get(max_risk, 0):
+            max_risk = impact["risk"]
+
+    if _is_workspace_mode():
+        db.close()
+
+    # Sort by risk descending
+    symbol_impacts.sort(key=lambda s: risk_order.get(s["risk"], 0), reverse=True)
+
+    return json.dumps({
+        "project": project,
+        "ref": ref or "HEAD (uncommitted)",
+        "overall_risk": max_risk,
+        "changed_symbol_count": len(symbol_impacts),
+        "total_direct_dependents": total_direct,
+        "total_transitive_dependents": total_transitive,
+        "communities_affected": len(all_affected_comms),
+        "flows_affected": len(all_affected_flows),
+        "changed_symbols": symbol_impacts,
+    }, indent=2)
+
+
 def make_sse_and_streamable_http_app(mount_path: str | None = "/"):
     """Return a Starlette app serving both SSE and Streamable HTTP on one port (Cursor compatibility)."""
     streamable_app = mcp.streamable_http_app()
@@ -2248,11 +2807,14 @@ def configure(db_path: Path | None = None, repo_root: Path | None = None) -> Non
 
 def configure_workspace(workspace_name: str) -> None:
     """Configure the server for workspace (multi-repo) mode."""
-    global _workspace_name, _workspace_db
+    global _workspace_name, _workspace_db, _learnings_db
     _workspace_name = workspace_name
     if _workspace_db is not None:
         _workspace_db.close()
         _workspace_db = None
+    if _learnings_db is not None:
+        _learnings_db.close()
+        _learnings_db = None
     _refresh_instructions()
 
 

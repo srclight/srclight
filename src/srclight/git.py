@@ -307,3 +307,60 @@ def changes_to_file(
             })
 
     return commits
+
+
+def detect_changes(
+    repo_root: Path,
+    ref: str | None = None,
+) -> list[dict[str, Any]]:
+    """Parse git diff to find changed line ranges per file.
+
+    Args:
+        repo_root: Repository root path
+        ref: Compare against this ref (default: uncommitted changes vs HEAD).
+             Use "HEAD~1" for last commit, a branch name, or a commit SHA.
+
+    Returns list of dicts with keys:
+        file, hunks (list of {old_start, old_count, new_start, new_count})
+    """
+    import re
+
+    if ref:
+        diff_output = _run_git(repo_root, "diff", "-U0", ref)
+    else:
+        diff_output = _run_git(repo_root, "diff", "-U0", "HEAD")
+
+    if not diff_output:
+        return []
+
+    hunk_re = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+    results: list[dict[str, Any]] = []
+    current_file: str | None = None
+    current_hunks: list[dict[str, int]] = []
+
+    for line in diff_output.splitlines():
+        if line.startswith("diff --git"):
+            if current_file and current_hunks:
+                results.append({"file": current_file, "hunks": current_hunks})
+            current_file = None
+            current_hunks = []
+        elif line.startswith("+++ b/"):
+            current_file = line[6:]
+        elif line.startswith("+++ /dev/null"):
+            current_file = None  # deleted file
+        elif m := hunk_re.match(line):
+            old_start = int(m.group(1))
+            old_count = int(m.group(2)) if m.group(2) else 1
+            new_start = int(m.group(3))
+            new_count = int(m.group(4)) if m.group(4) else 1
+            current_hunks.append({
+                "old_start": old_start,
+                "old_count": old_count,
+                "new_start": new_start,
+                "new_count": new_count,
+            })
+
+    if current_file and current_hunks:
+        results.append({"file": current_file, "hunks": current_hunks})
+
+    return results

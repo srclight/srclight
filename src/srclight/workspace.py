@@ -59,6 +59,11 @@ class WorkspaceConfig:
     def config_path(self) -> Path:
         return WORKSPACES_DIR / f"{self.name}.json"
 
+    @property
+    def learnings_db_path(self) -> Path:
+        """Path to the workspace-level learnings database."""
+        return WORKSPACES_DIR / f"{self.name}_learnings.db"
+
     def save(self) -> None:
         if not self.name or not re.match(r"^[a-zA-Z0-9_-]+$", self.name):
             raise ValueError(

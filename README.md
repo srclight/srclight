@@ -8,7 +8,7 @@
 
 **Deep code indexing for AI agents.** SQLite FTS5 + tree-sitter + embeddings + MCP.
 
-Srclight builds a rich, searchable index of your codebase that AI coding agents can query instantly — replacing dozens of grep/glob calls with precise, structured lookups. It is the most comprehensive code intelligence MCP server available: 29 tools covering symbol search, relationship graphs, git change intelligence, semantic search, build system awareness, and document extraction — capabilities no other single MCP server combines. Fully local and private: your code never leaves your machine.
+Srclight builds a rich, searchable index of your codebase that AI coding agents can query instantly — replacing dozens of grep/glob calls with precise, structured lookups. It is the most comprehensive code intelligence MCP server available: 42 tools covering symbol search, relationship graphs, community detection, impact analysis, git change intelligence, semantic search, build system awareness, and document extraction — capabilities no other single MCP server combines. Fully local and private: your code never leaves your machine.
 
 ## Why?
 
@@ -19,6 +19,7 @@ AI coding agents (Claude Code, Cursor, etc.) spend **40-60% of their tokens on o
 | 8-12 grep rounds to find callers | `get_callers("lookup")` — one call |
 | Read 5 files to understand module | `codebase_map()` — instant overview |
 | "Find code that does X" → 20 greps | `semantic_search("dictionary lookup")` — one call |
+| Edit a function, break 47 callers | `detect_changes()` — shows blast radius before you commit |
 | 15-25 tool calls per bug fix | 5-8 tool calls per bug fix |
 
 ## Features
@@ -284,9 +285,9 @@ Any MCP-compatible client can connect to the SSE endpoint:
 http://127.0.0.1:8742/sse
 ```
 
-## MCP Tools (29)
+## MCP Tools (42)
 
-Srclight exposes 29 MCP tools organized in six tiers. The MCP server includes built-in instructions that guide AI agents on which tool to use and when — agents receive a session protocol, tool selection guide, and `project` parameter documentation automatically on connection.
+Srclight exposes 42 MCP tools organized in seven tiers. The MCP server includes built-in instructions that guide AI agents on which tool to use and when — agents receive a session protocol, tool selection guide, and `project` parameter documentation automatically on connection.
 
 ### Tier 1: Instant Orientation
 | Tool | What it does |
@@ -307,6 +308,15 @@ Srclight exposes 29 MCP tools organized in six tiers. The MCP server includes bu
 | `get_implementors(interface)` | All classes implementing an interface |
 | `get_tests_for(name)` | Test functions covering a symbol |
 | `get_type_hierarchy(name)` | Inheritance tree (base classes + subclasses) |
+
+### Tier 2b: Community & Impact Analysis
+| Tool | What it does |
+|------|-------------|
+| `get_communities(project)` | Auto-detected functional module clusters (Louvain algorithm) |
+| `get_community(name, project)` | Which community a symbol belongs to, with all co-members |
+| `get_execution_flows(project)` | Traced execution paths from entry points through the call graph |
+| `get_impact(name, project)` | Blast radius + risk level (LOW / MEDIUM / HIGH / CRITICAL) |
+| `detect_changes(project, ref?)` | Map git diff to affected symbols — aggregate blast radius of your edits |
 
 ### Tier 3: Git Change Intelligence
 | Tool | What it does |
@@ -341,7 +351,7 @@ Srclight exposes 29 MCP tools organized in six tiers. The MCP server includes bu
 | `server_stats()` | Server uptime and process info |
 | `restart_server()` | Request server restart (SSE only) |
 
-In workspace mode, `search_symbols`, `get_symbol`, `codebase_map`, and `hybrid_search` accept an optional `project` filter. Graph/git/build tools require `project` in workspace mode.
+In workspace mode, `search_symbols`, `get_symbol`, `codebase_map`, and `hybrid_search` accept an optional `project` filter. Graph/git/build/community tools require `project` in workspace mode.
 
 ## Deployment Guide
 
@@ -378,10 +388,12 @@ The hooks run `srclight index` in the background after each commit and branch sw
    - **Names**: code-aware tokenization (splits `camelCase`, handles `::`, `->`)
    - **Content**: trigram index for substring matching
    - **Docs**: Porter stemming for natural language in docstrings
-5. Optional: **embedding vectors** are generated via Ollama or Voyage API and stored as BLOBs
-6. A `.npy` **sidecar snapshot** is built and loaded to **GPU VRAM** (cupy) or CPU RAM (numpy) for fast search
-7. The **MCP server** exposes structured query tools that AI agents call instead of grep
-8. **Hybrid search** merges keyword (FTS5) and semantic (embedding) results via RRF
+5. **Community detection** clusters symbols into functional modules via Louvain algorithm on call-graph edges, with TF-IDF auto-labeling
+6. **Execution flows** are traced via BFS from entry points, and **impact analysis** scores each symbol's blast radius (LOW/MEDIUM/HIGH/CRITICAL)
+7. Optional: **embedding vectors** are generated via Ollama or Voyage API and stored as BLOBs
+8. A `.npy` **sidecar snapshot** is built and loaded to **GPU VRAM** (cupy) or CPU RAM (numpy) for fast search
+9. The **MCP server** exposes structured query tools that AI agents call instead of grep
+10. **Hybrid search** merges keyword (FTS5) and semantic (embedding) results via RRF
 
 ### Architecture (Workspace Mode)
 
@@ -403,13 +415,15 @@ A survey of 50+ MCP code intelligence servers across all major registries (Offic
 | Semantic search (embeddings) | GPU-accelerated, ~3ms | None | None | OpenAI API + Milvus |
 | Hybrid search (keyword + semantic) | RRF fusion | None | None | BM25 + vector |
 | Relationship graph (callers, callees) | tree-sitter edges | None | SCIP edges | None |
-| Git change intelligence | blame, hotspots, WIP | None | None | None |
+| Community detection (module clusters) | Louvain on call graph | None | None | None |
+| Impact analysis (blast radius + risk) | Per-symbol + diff-level | None | None | None |
+| Git change intelligence | blame, hotspots, WIP, detect_changes | None | None | None |
 | Build system awareness | CMake, .csproj, #ifdef | None | None | None |
 | Multi-repo workspace | ATTACH+UNION | None | None | None |
 | Infrastructure required | `pip install`, SQLite | None | SCIP indexer | Docker, Milvus, OpenAI API |
 | Fully local / private | Yes, zero API calls | Yes | Yes | No (needs OpenAI) |
 | Languages | 11 | Any (regex) | 5 (SCIP) | Any (chunking) |
-| MCP tools | 29 | 2 (grep, glob) | 80+ | ~10 |
+| MCP tools | 42 | 2 (grep, glob) | 80+ | ~10 |
 
 Unlike grep-based tools, srclight builds a persistent index with structured lookups. Unlike cloud-based solutions, everything runs locally — your code never leaves your machine. Unlike IDE plugins, srclight works with any MCP client.
 
@@ -431,6 +445,10 @@ Unlike grep-based tools, srclight builds a persistent index with structured look
 - [x] Workspace config hot-reload (no server restart needed to add repos)
 - [x] VectorCache sidecar re-discovery (no restart needed after embedding)
 - [x] Project name suggestions in error messages
+- [x] Community detection: Louvain clustering on call-graph edges with TF-IDF auto-labeling
+- [x] Execution flow tracing: BFS from entry points across community boundaries
+- [x] Impact analysis: per-symbol blast radius with risk scoring (LOW/MEDIUM/HIGH/CRITICAL)
+- [x] `detect_changes`: map git diff to affected symbols and aggregate blast radius
 
 ### Next
 - [ ] Cross-language concept mapping (explicit edges between equivalent symbols across languages)

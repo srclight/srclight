@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "srclight"
-version = "0.19.0"
+version = "0.20.0"
 description = "Deep code indexing for AI agents. SQLite FTS5 + tree-sitter + embeddings + MCP."
 readme = "README.md"
 license = "MIT"
@@ -46,6 +46,7 @@ dependencies = [
     "tree-sitter-sql>=0.3.0",
     "tree-sitter-groovy>=0.1.0",
     "numpy>=1.26.0",
+    "networkx>=3.0",
 ]
 
 [project.optional-dependencies]

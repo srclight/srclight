@@ -69,7 +69,7 @@ def split_identifier(name: str) -> str:
 
     return " ".join(result_parts)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -193,6 +193,49 @@ CREATE INDEX IF NOT EXISTS idx_symbols_parent ON symbols(parent_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_edges_source ON symbol_edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON symbol_edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_type ON symbol_edges(edge_type);
+
+-- Communities (Louvain clusters of call-graph symbols)
+CREATE TABLE IF NOT EXISTS communities (
+    id INTEGER PRIMARY KEY,
+    label TEXT,
+    symbol_count INTEGER DEFAULT 0,
+    cohesion REAL,
+    keywords TEXT,
+    metadata TEXT
+);
+
+-- Junction: which symbols belong to which community
+CREATE TABLE IF NOT EXISTS symbol_communities (
+    symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    PRIMARY KEY (symbol_id, community_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sym_comm_community ON symbol_communities(community_id);
+
+-- Execution flows (BFS traces from entry points)
+CREATE TABLE IF NOT EXISTS execution_flows (
+    id INTEGER PRIMARY KEY,
+    label TEXT,
+    entry_symbol_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
+    terminal_symbol_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
+    step_count INTEGER,
+    communities_crossed INTEGER DEFAULT 0,
+    metadata TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_flows_entry ON execution_flows(entry_symbol_id);
+
+-- Ordered steps in a flow
+CREATE TABLE IF NOT EXISTS flow_steps (
+    flow_id INTEGER NOT NULL REFERENCES execution_flows(id) ON DELETE CASCADE,
+    step_order INTEGER NOT NULL,
+    symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    community_id INTEGER,
+    PRIMARY KEY (flow_id, step_order)
+);
+
+CREATE INDEX IF NOT EXISTS idx_flow_steps_symbol ON flow_steps(symbol_id);
 """
 
 
@@ -285,6 +328,38 @@ class Database:
             self.conn.execute("ALTER TABLE index_state ADD COLUMN indexer_version TEXT")
         except Exception:
             pass  # column already exists
+        # Migrate v4 -> v5: add community/flow tables
+        try:
+            self.conn.execute("SELECT 1 FROM communities LIMIT 1")
+        except Exception:
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS communities (
+                    id INTEGER PRIMARY KEY, label TEXT,
+                    symbol_count INTEGER DEFAULT 0, cohesion REAL,
+                    keywords TEXT, metadata TEXT
+                );
+                CREATE TABLE IF NOT EXISTS symbol_communities (
+                    symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+                    PRIMARY KEY (symbol_id, community_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_sym_comm_community ON symbol_communities(community_id);
+                CREATE TABLE IF NOT EXISTS execution_flows (
+                    id INTEGER PRIMARY KEY, label TEXT,
+                    entry_symbol_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
+                    terminal_symbol_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
+                    step_count INTEGER, communities_crossed INTEGER DEFAULT 0, metadata TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_flows_entry ON execution_flows(entry_symbol_id);
+                CREATE TABLE IF NOT EXISTS flow_steps (
+                    flow_id INTEGER NOT NULL REFERENCES execution_flows(id) ON DELETE CASCADE,
+                    step_order INTEGER NOT NULL,
+                    symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                    community_id INTEGER,
+                    PRIMARY KEY (flow_id, step_order)
+                );
+                CREATE INDEX IF NOT EXISTS idx_flow_steps_symbol ON flow_steps(symbol_id);
+            """)
         self.conn.commit()
 
     # --- Files ---
@@ -1175,6 +1250,135 @@ class Database:
             }
             for row in rows
         ]
+
+    # --- Communities ---
+
+    def store_communities(self, communities: list[dict]) -> None:
+        """Store detected communities and their symbol memberships."""
+        assert self.conn is not None
+        self.conn.execute("DELETE FROM symbol_communities")
+        self.conn.execute("DELETE FROM communities")
+
+        for c in communities:
+            self.conn.execute(
+                """INSERT INTO communities (id, label, symbol_count, cohesion, keywords, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (c["id"], c["label"], c["symbol_count"], c["cohesion"],
+                 json.dumps(c.get("keywords", [])), json.dumps(c.get("metadata"))),
+            )
+            for member in c.get("members", []):
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO symbol_communities (symbol_id, community_id) VALUES (?, ?)",
+                    (member["id"], c["id"]),
+                )
+
+    def get_communities(self) -> list[dict]:
+        """Get all communities with stats."""
+        assert self.conn is not None
+        rows = self.conn.execute(
+            "SELECT * FROM communities ORDER BY symbol_count DESC"
+        ).fetchall()
+        return [
+            {
+                "id": r["id"], "label": r["label"],
+                "symbol_count": r["symbol_count"], "cohesion": r["cohesion"],
+                "keywords": json.loads(r["keywords"] or "[]"),
+            }
+            for r in rows
+        ]
+
+    def get_community_for_symbol(self, symbol_id: int) -> int | None:
+        """Get the community ID for a symbol, or None."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT community_id FROM symbol_communities WHERE symbol_id = ?",
+            (symbol_id,),
+        ).fetchone()
+        return row["community_id"] if row else None
+
+    def get_community_members(self, community_id: int) -> list[dict]:
+        """Get all symbols in a community."""
+        assert self.conn is not None
+        rows = self.conn.execute(
+            """SELECT s.id, s.name, s.qualified_name, s.kind, f.path as file_path
+               FROM symbol_communities sc
+               JOIN symbols s ON sc.symbol_id = s.id
+               JOIN files f ON s.file_id = f.id
+               WHERE sc.community_id = ?
+               ORDER BY s.name""",
+            (community_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Execution Flows ---
+
+    def store_execution_flows(self, flows: list[dict]) -> None:
+        """Store execution flows and their steps."""
+        assert self.conn is not None
+        self.conn.execute("DELETE FROM flow_steps")
+        self.conn.execute("DELETE FROM execution_flows")
+
+        for flow in flows:
+            cursor = self.conn.execute(
+                """INSERT INTO execution_flows
+                   (label, entry_symbol_id, terminal_symbol_id, step_count, communities_crossed)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (flow["label"], flow["entry_symbol_id"], flow["terminal_symbol_id"],
+                 flow["step_count"], flow["communities_crossed"]),
+            )
+            flow_id = cursor.lastrowid
+            for step in flow["steps"]:
+                self.conn.execute(
+                    """INSERT INTO flow_steps (flow_id, step_order, symbol_id, community_id)
+                       VALUES (?, ?, ?, ?)""",
+                    (flow_id, step["order"], step["symbol_id"], step.get("community_id")),
+                )
+
+    def get_execution_flows(self, limit: int = 50) -> list[dict]:
+        """Get top execution flows ordered by step count."""
+        assert self.conn is not None
+        rows = self.conn.execute(
+            """SELECT ef.*, s1.name as entry_name, s2.name as terminal_name
+               FROM execution_flows ef
+               LEFT JOIN symbols s1 ON ef.entry_symbol_id = s1.id
+               LEFT JOIN symbols s2 ON ef.terminal_symbol_id = s2.id
+               ORDER BY ef.step_count DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_flows_for_symbol(self, symbol_id: int) -> list[dict]:
+        """Get all execution flows that pass through a symbol."""
+        assert self.conn is not None
+        rows = self.conn.execute(
+            """SELECT DISTINCT ef.*, s1.name as entry_name, s2.name as terminal_name
+               FROM flow_steps fs
+               JOIN execution_flows ef ON fs.flow_id = ef.id
+               LEFT JOIN symbols s1 ON ef.entry_symbol_id = s1.id
+               LEFT JOIN symbols s2 ON ef.terminal_symbol_id = s2.id
+               WHERE fs.symbol_id = ?
+               ORDER BY ef.step_count DESC""",
+            (symbol_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_flow_steps(self, flow_id: int) -> list[dict]:
+        """Get ordered steps for a specific flow."""
+        assert self.conn is not None
+        rows = self.conn.execute(
+            """SELECT fs.step_order, fs.symbol_id, fs.community_id,
+                      s.name, s.qualified_name, s.kind, f.path as file_path
+               FROM flow_steps fs
+               JOIN symbols s ON fs.symbol_id = s.id
+               JOIN files f ON s.file_id = f.id
+               WHERE fs.flow_id = ?
+               ORDER BY fs.step_order""",
+            (flow_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Stats ---
 
     def stats(self) -> dict:
         assert self.conn is not None
