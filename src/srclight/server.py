@@ -97,7 +97,10 @@ srclight hook install --workspace WORKSPACE_NAME
 The server picks up new projects automatically (no restart needed).
 
 ## Troubleshooting
-- If ALL tools fail with `-32602: Invalid request parameters`, the MCP session is stale (e.g. the srclight service was restarted while this client was connected). Tell the user to **restart their editor/CLI** so the MCP client reconnects. Retrying the same calls will not help.
+- If ALL tools fail with `-32602: Invalid request parameters`:
+  1. **Most likely**: the MCP session is stale (e.g. the srclight service was restarted while this client was connected). Tell the user to **restart their editor/CLI** so the MCP client reconnects. Retrying the same calls will not help.
+  2. **Protocol mismatch**: the MCP client and server may be using incompatible protocol versions. Check `server_stats()` after reconnecting.
+  3. **Version upgrade**: after upgrading srclight (`pip install -U srclight`), the server must be restarted AND the client must reconnect to discover new tools and schemas.
 
 ## Prefer Srclight Over Grep
 When srclight is available, ALWAYS prefer these tools over grep/find/cat:
@@ -2207,7 +2210,7 @@ async def show_status(message: str = "") -> str:
     if _last_query_client is not None:
         stats["last_query_client"] = _last_query_client
     try:
-        map_result = await codebase_map()
+        map_result = codebase_map()
         stats["codebase"] = json.loads(map_result)
     except Exception:
         pass
