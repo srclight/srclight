@@ -22,6 +22,26 @@ from .db import Database
 logger = logging.getLogger("srclight.community")
 
 
+# SQLite caps bound parameters per statement (default 999). Batch large
+# `WHERE id IN (...)` lookups so community detection works on 50k+ symbol repos.
+_IN_CHUNK = 500
+
+
+def _chunked_in_select(conn, columns: str, table: str, ids, *, chunk: int = _IN_CHUNK):
+    """Run ``SELECT {columns} FROM {table} WHERE id IN (...)`` over ``ids`` in chunks.
+
+    ``columns`` and ``table`` are internal literal strings (not user input).
+    Yields matching rows. Avoids SQLite's bound-parameter limit on large repos.
+    """
+    id_list = list(ids)
+    for start in range(0, len(id_list), chunk):
+        batch = id_list[start:start + chunk]
+        placeholders = ",".join("?" * len(batch))
+        yield from conn.execute(
+            f"SELECT {columns} FROM {table} WHERE id IN ({placeholders})", batch,
+        )
+
+
 def detect_communities(db: Database) -> list[dict[str, Any]]:
     """Detect communities in the call graph using Louvain algorithm.
 
@@ -67,10 +87,8 @@ def detect_communities(db: Database) -> list[dict[str, Any]]:
 
     id_to_name = {}
     if all_ids:
-        placeholders = ",".join("?" * len(all_ids))
-        for row in db.conn.execute(
-            f"SELECT id, name, qualified_name, kind FROM symbols WHERE id IN ({placeholders})",
-            list(all_ids),
+        for row in _chunked_in_select(
+            db.conn, "id, name, qualified_name, kind", "symbols", all_ids
         ):
             id_to_name[row["id"]] = {
                 "id": row["id"],
@@ -229,11 +247,9 @@ def trace_execution_flows(
     if not edge_node_ids:
         return []
 
-    placeholders = ",".join("?" * len(edge_node_ids))
     id_to_info: dict[int, dict] = {}
-    for row in db.conn.execute(
-        f"SELECT id, name, kind, file_id FROM symbols WHERE id IN ({placeholders})",
-        list(edge_node_ids),
+    for row in _chunked_in_select(
+        db.conn, "id, name, kind, file_id", "symbols", edge_node_ids
     ):
         id_to_info[row["id"]] = {
             "name": row["name"], "kind": row["kind"], "file_id": row["file_id"],
@@ -258,10 +274,7 @@ def trace_execution_flows(
     file_ids = {info["file_id"] for info in id_to_info.values() if info.get("file_id")}
     test_file_ids: set[int] = set()
     if file_ids:
-        fp = ",".join("?" * len(file_ids))
-        for row in db.conn.execute(
-            f"SELECT id, path FROM files WHERE id IN ({fp})", list(file_ids)
-        ):
+        for row in _chunked_in_select(db.conn, "id, path", "files", file_ids):
             if "test" in row["path"].lower():
                 test_file_ids.add(row["id"])
 
