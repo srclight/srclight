@@ -789,16 +789,24 @@ class Database:
     # --- Edges ---
 
     def delete_edges_for_symbols(self, symbol_ids: list[int]) -> None:
-        """Delete all edges where source or target is in the given symbol IDs."""
+        """Delete all edges where source or target is in the given symbol IDs.
+
+        Batched to stay under SQLite's bound-parameter limit (default 999) on
+        large reindexes. A chunked OR-delete across all batches removes exactly
+        the edges whose source OR target is anywhere in ``symbol_ids``.
+        """
         assert self.conn is not None
         if not symbol_ids:
             return
-        placeholders = ",".join("?" * len(symbol_ids))
-        self.conn.execute(
-            f"DELETE FROM symbol_edges WHERE source_id IN ({placeholders})"
-            f" OR target_id IN ({placeholders})",
-            symbol_ids + symbol_ids,
-        )
+        chunk = 500
+        for start in range(0, len(symbol_ids), chunk):
+            batch = symbol_ids[start:start + chunk]
+            placeholders = ",".join("?" * len(batch))
+            self.conn.execute(
+                f"DELETE FROM symbol_edges WHERE source_id IN ({placeholders})"
+                f" OR target_id IN ({placeholders})",
+                batch + batch,
+            )
 
     def all_symbol_names(self) -> dict[str, list[int]]:
         """Return a mapping of symbol name -> list of symbol IDs.
@@ -1272,6 +1280,8 @@ class Database:
                     (member["id"], c["id"]),
                 )
 
+        self.conn.commit()
+
     def get_communities(self) -> list[dict]:
         """Get all communities with stats."""
         assert self.conn is not None
@@ -1333,6 +1343,8 @@ class Database:
                        VALUES (?, ?, ?, ?)""",
                     (flow_id, step["order"], step["symbol_id"], step.get("community_id")),
                 )
+
+        self.conn.commit()
 
     def get_execution_flows(self, limit: int = 50) -> list[dict]:
         """Get top execution flows ordered by step count."""

@@ -318,3 +318,34 @@ def test_store_and_retrieve_flows(db):
 
     login_flows = db.get_flows_for_symbol(syms["login"])
     assert len(login_flows) >= 1
+
+
+def test_detect_communities_large_graph_above_sql_variable_limit(db):
+    """Regression: >999 symbols must not hit SQLite's bound-parameter limit.
+
+    detect_communities builds ``WHERE id IN (?,?,...)`` over all community member
+    ids; without chunking this raised sqlite3.OperationalError "too many SQL
+    variables" on repos with 50k+ symbols. See community._chunked_in_select.
+    """
+    from srclight.community import detect_communities
+
+    f = db.upsert_file(FileRecord(
+        path="big.py", content_hash="z", mtime=1.0,
+        language="python", size=10, line_count=5,
+    ))
+    ids = [
+        db.insert_symbol(SymbolRecord(
+            file_id=f, kind="function", name=f"fn_{i}",
+            qualified_name=f"big.fn_{i}", start_line=1, end_line=2,
+            content="pass",
+        ), file_path="big.py")
+        for i in range(1100)  # well above SQLite's default 999-variable limit
+    ]
+    # Chain edges so the graph is connected and forms at least one community.
+    for a, b in zip(ids, ids[1:]):
+        db.insert_edge(EdgeRecord(source_id=a, target_id=b, edge_type="calls"))
+    db.commit()
+
+    communities = detect_communities(db)  # must not raise "too many SQL variables"
+    assert len(communities) >= 1
+    assert sum(c["symbol_count"] for c in communities) >= 1000
