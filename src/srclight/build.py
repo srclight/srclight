@@ -51,19 +51,41 @@ PLATFORM_MACROS = {
     "__GNUC__": "gcc",
 }
 
-# CMake platform conditionals
+# Bare CMake platform variables, matched as `if(<VAR>)`.
 CMAKE_PLATFORM_VARS = {
     "WIN32": "windows",
+    "MINGW": "mingw",
     "APPLE": "apple",
     "UNIX": "unix",
     "LINUX": "linux",
     "ANDROID": "android",
     "IOS": "ios",
-    "CMAKE_SYSTEM_NAME STREQUAL \"Windows\"": "windows",
-    "CMAKE_SYSTEM_NAME STREQUAL \"Linux\"": "linux",
-    "CMAKE_SYSTEM_NAME STREQUAL \"Darwin\"": "macos",
-    "CMAKE_SYSTEM_NAME STREQUAL \"Android\"": "android",
 }
+
+# CMAKE_SYSTEM_NAME values, matched as
+# `if(CMAKE_SYSTEM_NAME STREQUAL "<value>")`.
+CMAKE_SYSTEM_NAMES = {
+    "Windows": "windows",
+    "Linux": "linux",
+    "Darwin": "macos",
+    "Android": "android",
+}
+
+# Built from the tables above so that adding a platform in one place is
+# enough. Group 1 captures a bare variable, group 2 a CMAKE_SYSTEM_NAME
+# string.
+_CMAKE_CONDITIONAL_RE = re.compile(
+    r"if\s*\(\s*(?:(%s)|CMAKE_SYSTEM_NAME\s+STREQUAL\s+\"([^\"]+)\")\s*\)"
+    % "|".join(sorted(CMAKE_PLATFORM_VARS, key=len, reverse=True))
+)
+
+
+def _cmake_conditional_platform(match: "re.Match[str]") -> str | None:
+    """Resolve a CMake conditional match to a platform name."""
+    var, system_name = match.group(1), match.group(2)
+    if var:
+        return CMAKE_PLATFORM_VARS.get(var, var.lower())
+    return CMAKE_SYSTEM_NAMES.get(system_name)
 
 
 def scan_platform_conditionals(repo_root: Path) -> list[dict[str, Any]]:
@@ -262,11 +284,11 @@ def parse_cmake_targets(repo_root: Path) -> list[dict[str, Any]]:
                     t.setdefault("dependencies", []).extend(deps)
 
         # Find platform conditionals in CMake
-        for m in re.finditer(
-            r"if\s*\(\s*(WIN32|APPLE|UNIX|LINUX|ANDROID|IOS|MINGW)\s*\)",
-            content,
-        ):
-            platform = CMAKE_PLATFORM_VARS.get(m.group(1), m.group(1).lower())
+        for m in _CMAKE_CONDITIONAL_RE.finditer(content):
+            platform = _cmake_conditional_platform(m)
+            if platform is None:
+                # A CMAKE_SYSTEM_NAME we do not have a mapping for.
+                continue
             # Find what's inside this if block
             start = m.end()
             depth = 1
