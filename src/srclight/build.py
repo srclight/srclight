@@ -49,6 +49,18 @@ PLATFORM_MACROS = {
     # Compilers
     "__clang__": "clang",
     "__GNUC__": "gcc",
+    # QNX
+    "__QNX__": "qnx",
+    "__QNXNTO__": "qnx",
+    # DOS and 16/32-bit real-mode toolchains
+    "MSDOS": "dos",
+    "__MSDOS__": "dos",
+    "__DOS__": "dos",
+    "_DOS": "dos",
+    "__DJGPP__": "dos-djgpp",
+    "__WATCOMC__": "dos-watcom",
+    "__TURBOC__": "dos-turboc",
+    "__BORLANDC__": "dos-borland",
 }
 
 # Bare CMake platform variables, matched as `if(<VAR>)`.
@@ -60,6 +72,7 @@ CMAKE_PLATFORM_VARS = {
     "LINUX": "linux",
     "ANDROID": "android",
     "IOS": "ios",
+    "QNX": "qnx",
 }
 
 # CMAKE_SYSTEM_NAME values, matched as
@@ -69,6 +82,7 @@ CMAKE_SYSTEM_NAMES = {
     "Linux": "linux",
     "Darwin": "macos",
     "Android": "android",
+    "QNX": "qnx",
 }
 
 # Built from the tables above so that adding a platform in one place is

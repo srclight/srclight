@@ -171,6 +171,54 @@ def test_cmake_bare_platform_vars(tmp_path):
         assert targets[name].get("platform_conditions") == [platform], var
 
 
+def test_qnx_and_dos_platform_conditionals(tmp_path):
+    """#ifdef guards for QNX and DOS toolchains are recognised."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "hcd.c").write_text("""
+#ifdef __QNXNTO__
+int qnx_attach(void) { return 0; }
+#endif
+
+#if defined(__WATCOMC__) || defined(MSDOS)
+int dos_dma_alloc(unsigned n) { return 0; }
+#endif
+
+#ifdef __DJGPP__
+int djgpp_lock(void) { return 0; }
+#endif
+""")
+
+    platforms = set()
+    for c in scan_platform_conditionals(tmp_path):
+        platforms.update(c["platforms"])
+
+    assert "qnx" in platforms
+    assert "dos" in platforms
+    assert "dos-watcom" in platforms
+    assert "dos-djgpp" in platforms
+
+    assert get_platform_variants(tmp_path, "qnx_attach")
+    assert get_platform_variants(tmp_path, "dos_dma_alloc")
+
+
+def test_cmake_qnx_conditionals(tmp_path):
+    """Both CMake spellings of a QNX guard tag their targets."""
+    (tmp_path / "CMakeLists.txt").write_text("""
+if(QNX)
+    add_library(qnx_glue STATIC src/qnx_res.c)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "QNX")
+    add_executable(qnx_tool src/qnx_tool.c)
+endif()
+""")
+
+    targets = {t["name"]: t for t in parse_cmake_targets(tmp_path)}
+    assert targets["qnx_glue"].get("platform_conditions") == ["qnx"]
+    assert targets["qnx_tool"].get("platform_conditions") == ["qnx"]
+
+
 def test_parse_csproj_deps(csproj_repo):
     deps = parse_csproj_deps(csproj_repo)
     assert len(deps) == 1
