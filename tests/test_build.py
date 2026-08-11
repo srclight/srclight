@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from srclight.build import (
+    CMAKE_PLATFORM_VARS,
     get_build_info,
     get_platform_variants,
     parse_cmake_targets,
@@ -119,6 +120,103 @@ def test_get_platform_variants(cmake_repo):
     platform_sets = [tuple(v["platforms"]) for v in variants]
     assert any("windows" in ps for ps in platform_sets)
     assert any("linux" in ps for ps in platform_sets)
+
+
+def test_cmake_system_name_conditionals(tmp_path):
+    """if(CMAKE_SYSTEM_NAME STREQUAL "...") must tag its targets."""
+    (tmp_path / "CMakeLists.txt").write_text("""
+add_library(core STATIC src/core.c)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(linux_helper STATIC src/linux_helper.c)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    add_executable(mac_tool src/mac_tool.c)
+endif()
+""")
+
+    targets = {t["name"]: t for t in parse_cmake_targets(tmp_path)}
+
+    assert targets["linux_helper"].get("platform_conditions") == ["linux"]
+    assert targets["mac_tool"].get("platform_conditions") == ["macos"]
+    # An unconditional target must not be tagged.
+    assert "platform_conditions" not in targets["core"]
+
+
+def test_cmake_unknown_system_name_is_ignored(tmp_path):
+    """An unmapped CMAKE_SYSTEM_NAME must not tag a target."""
+    (tmp_path / "CMakeLists.txt").write_text("""
+if(CMAKE_SYSTEM_NAME STREQUAL "Haiku")
+    add_library(haiku_helper STATIC src/haiku_helper.c)
+endif()
+""")
+
+    targets = {t["name"]: t for t in parse_cmake_targets(tmp_path)}
+    assert "platform_conditions" not in targets["haiku_helper"]
+
+
+def test_cmake_bare_platform_vars(tmp_path):
+    """Every bare variable in CMAKE_PLATFORM_VARS must be matched."""
+    body = "\n".join(
+        "if(%s)\n    add_library(%s STATIC src/%s.c)\nendif()"
+        % (var, var.lower() + "_helper", var.lower())
+        for var in CMAKE_PLATFORM_VARS
+    )
+    (tmp_path / "CMakeLists.txt").write_text(body)
+
+    targets = {t["name"]: t for t in parse_cmake_targets(tmp_path)}
+    for var, platform in CMAKE_PLATFORM_VARS.items():
+        name = var.lower() + "_helper"
+        assert targets[name].get("platform_conditions") == [platform], var
+
+
+def test_qnx_and_dos_platform_conditionals(tmp_path):
+    """#ifdef guards for QNX and DOS toolchains are recognised."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "hcd.c").write_text("""
+#ifdef __QNXNTO__
+int qnx_attach(void) { return 0; }
+#endif
+
+#if defined(__WATCOMC__) || defined(MSDOS)
+int dos_dma_alloc(unsigned n) { return 0; }
+#endif
+
+#ifdef __DJGPP__
+int djgpp_lock(void) { return 0; }
+#endif
+""")
+
+    platforms = set()
+    for c in scan_platform_conditionals(tmp_path):
+        platforms.update(c["platforms"])
+
+    assert "qnx" in platforms
+    assert "dos" in platforms
+    assert "dos-watcom" in platforms
+    assert "dos-djgpp" in platforms
+
+    assert get_platform_variants(tmp_path, "qnx_attach")
+    assert get_platform_variants(tmp_path, "dos_dma_alloc")
+
+
+def test_cmake_qnx_conditionals(tmp_path):
+    """Both CMake spellings of a QNX guard tag their targets."""
+    (tmp_path / "CMakeLists.txt").write_text("""
+if(QNX)
+    add_library(qnx_glue STATIC src/qnx_res.c)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "QNX")
+    add_executable(qnx_tool src/qnx_tool.c)
+endif()
+""")
+
+    targets = {t["name"]: t for t in parse_cmake_targets(tmp_path)}
+    assert targets["qnx_glue"].get("platform_conditions") == ["qnx"]
+    assert targets["qnx_tool"].get("platform_conditions") == ["qnx"]
 
 
 def test_parse_csproj_deps(csproj_repo):

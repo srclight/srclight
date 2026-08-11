@@ -1,1 +1,0 @@
-/mnt/c/Users/timuy/Dropbox/personal/Vault/Areas/Srclight/CLAUDE.md

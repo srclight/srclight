@@ -198,6 +198,20 @@ def test_get_provider_ollama_explicit():
     assert "nomic-embed-text" in provider.name
 
 
+def test_get_provider_ollama_tagged_model():
+    """Ollama's `model:tag` format must not be split on the colon (issue #12)."""
+    provider = get_provider("qwen3-embedding:0.6b")
+    assert isinstance(provider, OllamaProvider)
+    assert provider.name == "ollama:qwen3-embedding:0.6b"
+
+
+def test_get_provider_ollama_explicit_tagged_model():
+    """Explicit `ollama:` prefix on a tagged model preserves the tag."""
+    provider = get_provider("ollama:qwen3-embedding:0.6b")
+    assert isinstance(provider, OllamaProvider)
+    assert provider.name == "ollama:qwen3-embedding:0.6b"
+
+
 def test_get_provider_voyage():
     with patch.dict("os.environ", {"VOYAGE_API_KEY": "test-key"}):
         provider = get_provider("voyage-code-3")
@@ -264,9 +278,14 @@ def test_get_provider_cohere_no_key():
             get_provider("cohere:embed-v4.0")
 
 
-def test_get_provider_unknown():
-    with pytest.raises(ValueError, match="Unknown embedding provider"):
-        get_provider("unknown:model")
+def test_get_provider_unknown_prefix_falls_through_to_ollama():
+    """An unknown colon prefix is treated as part of an Ollama model name
+    (issue #12): Ollama's `model:tag` format uses colons too, so we can't
+    treat every colon-containing string as `provider:model`.
+    """
+    provider = get_provider("unknown:model")
+    assert isinstance(provider, OllamaProvider)
+    assert provider.name == "ollama:unknown:model"
 
 
 # --- Test embed_symbols ---
