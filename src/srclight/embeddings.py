@@ -528,22 +528,24 @@ def get_provider(model: str, **kwargs) -> EmbeddingProvider:
     OpenAI-compatible providers (Together, Fireworks, Mistral, vLLM, etc.)
     use the "openai:" prefix with OPENAI_BASE_URL env var to set the endpoint.
     """
-    if ":" in model:
-        provider_type, model_name = model.split(":", 1)
+    # Only treat the leading colon segment as a provider prefix if it's one
+    # of our known providers. Otherwise the colon belongs to the model name
+    # itself (Ollama uses `model:tag`, e.g. `qwen3-embedding:0.6b`). See #12.
+    _KNOWN_PROVIDERS = ("ollama", "openai", "cohere", "voyage")
+    prefix, _, tail = model.partition(":")
+    if tail and prefix in _KNOWN_PROVIDERS:
+        provider_type, model_name = prefix, tail
     else:
         # Default: infer provider from model name prefix
+        model_name = model
         if model.startswith("voyage"):
             provider_type = "voyage"
-            model_name = model
         elif model.startswith("embed-") and ("v3" in model or "v4" in model):
             provider_type = "cohere"
-            model_name = model
         elif model.startswith("text-embedding"):
             provider_type = "openai"
-            model_name = model
         else:
             provider_type = "ollama"
-            model_name = model
 
     if provider_type == "ollama":
         base_url = kwargs.get("base_url", "http://localhost:11434")
