@@ -32,8 +32,10 @@ _INSTRUCTIONS_TEMPLATE = """Welcome to Srclight — deep code indexing for AI ag
 
 ## Which Search Tool to Use
 - **`hybrid_search(query)`** — BEST for most queries. Combines keyword + semantic search via RRF fusion. Use for natural language ("find dictionary lookup code") or keywords.
-- **`search_symbols(query)`** — keyword-only search. Faster, good for exact symbol names or code fragments.
+- **`search_symbols(query)`** — keyword-only (FTS5) search. Faster, good for exact symbol names or code fragments. **Keyword semantics:** a bare multi-word query is implicitly ANDed — every token must match, so a long keyword list can return zero and read as "not indexed." Prefer a single distinctive symbol/term (or a `"quoted phrase"`); when a keyword miss might just be wording, route to `hybrid_search`/`semantic_search` for concept-level recall rather than concluding absence.
 - **`semantic_search(query)`** — embedding-only search. Good when you know the concept but not the terminology.
+
+A zero result under a `project` filter means "absent from that project," not "absent from the workspace" — retry without `project` to search all repos.
 
 ## The `project` Parameter
 In workspace mode (multi-repo), many tools accept an optional `project` parameter:
@@ -462,11 +464,20 @@ def search_symbols(
 ) -> str:
     """Search for code symbols (functions, classes, methods, structs, etc.).
 
-    Uses tiered search: symbol names → source code content → documentation.
-    In workspace mode, searches across all projects simultaneously.
+    Keyword-only (FTS5) search using tiered matching: symbol names →
+    source code content → documentation. In workspace mode, searches
+    across all projects simultaneously.
+
+    Keyword semantics: a bare multi-word query is implicitly ANDed —
+    every token must match the same symbol, so long keyword lists can
+    return zero and read as "not indexed." Prefer a single distinctive
+    symbol/term or a "quoted phrase". For concept-level recall (where a
+    miss may just be different wording), use hybrid_search/semantic_search
+    instead of concluding the symbol is absent. A zero result under a
+    project filter means absent from that project, not the whole workspace.
 
     Args:
-        query: Search query — can be a symbol name, code fragment, or natural language
+        query: Search query — a symbol name or code fragment (keyword/FTS, not semantic)
         kind: Optional filter: 'function', 'class', 'method', 'struct', 'enum', etc.
         project: Optional project filter (workspace mode only, e.g. 'intuition')
         limit: Max results to return (default 20)

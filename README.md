@@ -293,7 +293,7 @@ Srclight exposes 42 MCP tools organized in seven tiers. The MCP server includes 
 | Tool | What it does |
 |------|-------------|
 | `codebase_map()` | Full project overview — call first every session |
-| `search_symbols(query)` | Search across symbol names, code, and docs |
+| `search_symbols(query)` | Keyword (FTS5) search across symbol names, code, and docs |
 | `get_symbol(name)` | Full source code + metadata for a symbol |
 | `get_signature(name)` | Just the signature (lightweight) |
 | `symbols_in_file(path)` | Table of contents for a file |
@@ -352,6 +352,10 @@ Srclight exposes 42 MCP tools organized in seven tiers. The MCP server includes 
 | `restart_server()` | Request server restart (SSE only) |
 
 In workspace mode, `search_symbols`, `get_symbol`, `codebase_map`, and `hybrid_search` accept an optional `project` filter. Graph/git/build/community tools require `project` in workspace mode.
+
+### Choosing a search tool
+
+`search_symbols` is keyword-exact (FTS5); `semantic_search` is embedding-based; `hybrid_search` fuses both via RRF. In FTS5, a **bare multi-word query is implicitly ANDed** — every token must match the same symbol, so a long keyword list can return zero and read as "not indexed." For keyword search, prefer a single distinctive symbol/term or a `"quoted phrase"`. When a keyword miss might just be different wording, reach for `hybrid_search`/`semantic_search` rather than concluding the symbol is absent. A zero result under a `project` filter means absent from *that project*, not the whole workspace — retry without `project` to search all repos.
 
 ## Deployment Guide
 
