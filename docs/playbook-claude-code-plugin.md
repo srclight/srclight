@@ -113,7 +113,7 @@ Agents need `name`, `description` (with examples), `model`, `color`, and `tools`
 Simple — no git flow needed for the plugin repo (it's a flat master branch):
 
 ```bash
-cd ~/Projects/srclight/claude-code-plugin
+cd ~/repos/srclight/claude-code-plugin
 git add -A && git commit -m "description"
 git tag -a vX.Y.Z -m "vX.Y.Z — description"
 git push origin master --tags
@@ -144,7 +144,7 @@ This works because `marketplace.json` at the repo root lists the plugin.
 ## Testing
 
 ```bash
-claude --plugin-dir ~/Projects/srclight/claude-code-plugin
+claude --plugin-dir ~/repos/srclight/claude-code-plugin
 ```
 
 Test checklist:
