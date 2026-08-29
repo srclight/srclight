@@ -385,6 +385,14 @@ way to learn their filter was ignored.
 - **Zero-parameter tools are closed too** (`index_status`, `codebase_map`, and three others). An
   empty property set means "this tool takes no arguments", not "anything goes".
 
+### Scope: top-level arguments
+
+This validates the **top-level** argument object. An argument that is itself a structured object is
+validated by its own model, which this layer does not descend into. No srclight tool currently takes
+an object argument, so the distinction is not reachable here today — but the guarantee is
+"top-level", and a future tool taking a typed nested model would need `extra="forbid"` on that model
+to get the same protection.
+
 ### If this breaks your caller
 
 The error names exactly what it received and what the tool accepts:
@@ -396,6 +404,15 @@ Nothing was executed and no result was computed.
 
 Fix the argument name. If you believe the argument *should* exist, the server may be running older
 code than you expect — check its reported revision and reconnect.
+
+**If you cannot update your caller right now**, pin the previous behaviour and update when you can:
+
+```
+pip install "srclight<0.20.2"
+```
+
+That is a deliberate escape hatch, not an endorsement — the older versions still return wrong
+answers for mistyped filters, silently. Prefer fixing the argument name.
 
 ### For contributors
 
