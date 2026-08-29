@@ -1,64 +1,49 @@
-"""Unknown tool arguments must be REFUSED, never silently dropped.
+"""Consumer smoke test: the object the DAEMON launches enforces the shared policy.
 
-Stock FastMCP discards unknown keys before the tool function runs. On this server that
-turns a typo into a wrong answer rather than a failure — measured 2026-08-28:
+Deliberately NOT a copy of mcpkit's suite — mcpkit tests the policy (28 tests, its own repo). This
+tests the only thing mcpkit cannot: that *this server* actually uses it. If server.py were reverted
+to a bare FastMCP while src/srclight/_mcpkit.py sat unused in the tree, this is the test that fails
+and nothing else would.
 
-    search_symbols(query="main", project="zhcorpus")   -> 20 hits, all zhcorpus
-    search_symbols(query="main", projects="zhcorpus")  -> 20 hits, ZERO zhcorpus
-
-Same shape, same count, real symbols, no error, wrong repos. These tests exist because
-that failure is invisible at the call site, so nothing else would catch a regression.
+It therefore asserts against `srclight.server.mcp` itself, never a freshly constructed lookalike.
+A lookalike proves the class works; it proves nothing about what the daemon serves.
 """
-
-# pytest-asyncio is NOT installed here and these are the repo's first async tests, so the
-# coroutines are driven with asyncio.run rather than adding a test dependency.
 
 import asyncio
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
-from srclight.server import _StrictArgsMCP
+from srclight.server import mcp
 
 
-def _server():
-    srv = _StrictArgsMCP("test")
-
-    @srv.tool()
-    def scoped_search(query: str, project: str | None = None, limit: int = 10) -> dict:
-        # Mirrors the real shape: the filter argument is optional, so dropping it
-        # silently widens the search instead of failing.
-        return {"query": query, "project": project, "limit": limit}
-
-    return srv
+def test_the_daemons_own_object_is_the_strict_one():
+    from srclight._mcpkit import StrictArgsMCP
+    assert isinstance(mcp, StrictArgsMCP)
 
 
-def test_known_arguments_still_work():
-    # The guard must not become a tax on correct calls.
-    res = asyncio.run(_server().call_tool("scoped_search", {"query": "main", "project": "zhcorpus"}))
-    assert "zhcorpus" in str(res)
-
-
-def test_typo_on_the_filter_argument_is_refused_not_dropped():
-    # The exact defect: 'projects' instead of 'project'. Stock FastMCP drops it and
-    # searches everything; we must refuse instead.
+def test_a_mistyped_filter_is_refused_not_silently_widened():
+    """The measured defect: `projects` for `project` returned 20 real symbols from the wrong
+    repos — same hit count, same shape, no error."""
     with pytest.raises(ToolError) as e:
-        asyncio.run(_server().call_tool("scoped_search", {"query": "main", "projects": "zhcorpus"}))
+        asyncio.run(mcp.call_tool("search_symbols", {"query": "main", "projects": "zhcorpus"}))
     msg = str(e.value)
-    assert "projects" in msg              # names the offending key
-    assert "project" in msg               # shows what was accepted
-    assert "Nothing was executed" in msg  # states no result was computed
+    assert "projects" in msg
+    assert "project" in msg
+    assert "Nothing was executed" in msg
 
 
-def test_error_names_the_stale_server_diagnosis():
-    # Whoever hits this has no other route to the conclusion: the call looked fine and
-    # the tool exists. If this hint is ever dropped, the error stops being actionable.
+def test_zero_parameter_tools_are_closed_too():
+    """srclight's hand-written guard skipped these: all five zero-parameter tools accepted
+    anything, silently, because an empty property set was read as 'schema unknown'."""
     with pytest.raises(ToolError) as e:
-        asyncio.run(_server().call_tool("scoped_search", {"query": "x", "bogus": 1}))
-    assert "reconnect" in str(e.value).lower()
+        asyncio.run(mcp.call_tool("index_status", {"zz_bogus": 1}))
+    assert "zz_bogus" in str(e.value)
 
 
-def test_every_unknown_key_is_reported_not_just_the_first():
-    with pytest.raises(ToolError) as e:
-        asyncio.run(_server().call_tool("scoped_search", {"query": "x", "aaa": 1, "zzz": 2}))
-    assert "aaa" in str(e.value) and "zzz" in str(e.value)
+def test_every_tool_advertises_the_closed_contract():
+    """Runtime refusal alone left the catalog lying by omission: 0 of 42 tools advertised
+    additionalProperties:false, so callers kept sending extras."""
+    tools = asyncio.run(mcp.list_tools())
+    unstamped = [t.name for t in tools if t.inputSchema.get("additionalProperties") is not False]
+    assert not unstamped, f"{len(unstamped)} tools advertise a permissive contract: {unstamped[:5]}"

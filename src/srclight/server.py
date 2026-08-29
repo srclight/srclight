@@ -19,6 +19,8 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
+from ._mcpkit import StrictArgsMCP
+
 from .db import Database
 from .indexer import IndexConfig, Indexer
 
@@ -172,54 +174,19 @@ def _refresh_instructions() -> None:
         pass  # Keep existing instructions on error
 
 
-class _StrictArgsMCP(FastMCP):
-    """FastMCP that REFUSES unknown tool arguments instead of silently discarding them.
+# Shared estate policy, vendored as a single generated file (mcpkit). This REPLACES the
+# hand-written _StrictArgsMCP that shipped in 4fa3bee, which carried two defects the shared
+# version has since fixed:
+#   * it treated an EMPTY property set as "schema unknown" and skipped the check, so all five
+#     zero-parameter tools (index_status among them) still accepted anything, silently;
+#   * it refused at runtime but never stamped additionalProperties:false, so all 42 tools kept
+#     advertising a permissive contract and callers kept sending extras.
+# Two independent implementations of one 30-line policy were independently wrong -- which is the
+# argument for sharing it rather than copying it.
+#   regenerate: python -m mcpkit.vendor --out src/srclight/_mcpkit.py
+#   verify:     python -m mcpkit.vendor --check src/srclight/_mcpkit.py
 
-    Stock FastMCP drops keys that are not in the tool signature, and it does so BEFORE
-    the tool function is entered — so a check inside a tool body can never fire, the key
-    is already gone. The advertised inputSchema also carries no ``additionalProperties:
-    false``, so nothing at the protocol layer flags it either. The only seam that still
-    sees the raw argument dict is ``call_tool``.
-
-    Why it matters more here than elsewhere. Measured against this server, 2026-08-28::
-
-        search_symbols(query="main", project="zhcorpus")   -> 20 hits, all zhcorpus
-        search_symbols(query="main", projects="zhcorpus")  -> 20 hits, ZERO zhcorpus
-                                                              (19 bible, 1 bank-scraper)
-
-    One added letter. No error, same result shape, same hit count, real symbols — from
-    repos the caller did not ask about. That is not a lossy call, it is a *wrong* one:
-    the caller gets a genuine answer to a question they never asked, with no way to
-    learn their constraint was ignored. With 42 tools that agents are instructed to
-    reach for first on every code question, a silent drop here is a silent wrong answer
-    downstream.
-
-    The error names the stale-server diagnosis deliberately. Whoever hits this has no
-    other route to it: the call looked fine and the tool exists, so "older code than you
-    think" is invisible from the caller's side.
-    """
-
-    async def call_tool(self, name: str, arguments: dict):  # type: ignore[override]
-        tool = self._tool_manager.get_tool(name)
-        if tool is not None and isinstance(arguments, dict):
-            accepted = set((tool.parameters or {}).get("properties") or {})
-            # An empty property set means "schema unknown", not "accepts nothing".
-            # Refusing everything in that case would break tools rather than guard them.
-            if accepted:
-                unknown = sorted(k for k in arguments if k not in accepted)
-                if unknown:
-                    raise ToolError(
-                        f"unknown argument(s): {', '.join(unknown)}. "
-                        f"Tool {name!r} accepts: {', '.join(sorted(accepted))}. "
-                        "Nothing was executed and no result was computed. "
-                        "If you expected these arguments to work, this server process is "
-                        "probably running older code than you think - check index_status "
-                        "and ask the user to reconnect the srclight MCP."
-                    )
-        return await super().call_tool(name, arguments)
-
-
-mcp = _StrictArgsMCP(
+mcp = StrictArgsMCP(
     "srclight",
     instructions=_INSTRUCTIONS_TEMPLATE.format(
         dynamic_section="You have access to a code index with searchable symbols, call graphs, and git history.\n\n"
