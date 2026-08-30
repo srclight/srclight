@@ -1,17 +1,15 @@
 """mcpkit 0.1.0 - GENERATED SINGLE-FILE BUILD. DO NOT EDIT.
 
 Regenerate with:  python -m mcpkit.vendor --out <path>
-Upstream:         github.com/srclight/mcpkit @ e1b807a
+Upstream:         github.com/srclight/mcpkit @ a1a4bb5+dirty
 
 Hand-editing this file is the failure this package exists to prevent: six copies of one policy,
 independently wrong. `mcpkit.vendor.verify()` recomputes the hash below and rejects a modified
 copy, so divergence is caught mechanically rather than discovered in a wrong answer.
 """
-# mcpkit-vendored-sha256: 472d1c92fa6464c4f0f1d83b902428cfa17fb332f27b0b1be528cfe4650321f9
+# mcpkit-vendored-sha256: 5c740cbdbc432cb194f79f59d4c40b051b203424c1a97bc3dfab39817dac93ea
+# mcpkit-policy-sha256: d0d2e9a887e83a0abac6838b8132b3aad04fa0c171a28c9d62fb8d528dfee665
 from __future__ import annotations
-
-__version__ = "0.1.0"
-__mcpkit_upstream_sha__ = "e1b807a"
 
 # ---- from mcpkit/seams.py -----------------------------------------------------
 """Verify at import that the SDK seams this package depends on still exist.
@@ -364,3 +362,7 @@ class StrictArgsMCP(FastMCP):
             if isinstance(schema, dict) and schema.get("type") == "object" and "properties" in schema:
                 schema.setdefault("additionalProperties", False)
         return tools
+
+# ==== mcpkit provenance - nothing below this line is policy code ====
+__version__ = "0.1.0"
+__mcpkit_upstream_sha__ = "a1a4bb5+dirty"
