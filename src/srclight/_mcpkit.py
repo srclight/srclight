@@ -1,14 +1,14 @@
-"""mcpkit 0.1.0 - GENERATED SINGLE-FILE BUILD. DO NOT EDIT.
+"""mcpkit 0.2.1 - GENERATED SINGLE-FILE BUILD. DO NOT EDIT.
 
 Regenerate with:  python -m mcpkit.vendor --out <path>
-Upstream:         github.com/srclight/mcpkit @ a1a4bb5+dirty
+Upstream:         github.com/srclight/mcpkit @ 2fb7fe2
 
 Hand-editing this file is the failure this package exists to prevent: six copies of one policy,
 independently wrong. `mcpkit.vendor.verify()` recomputes the hash below and rejects a modified
 copy, so divergence is caught mechanically rather than discovered in a wrong answer.
 """
-# mcpkit-vendored-sha256: 5c740cbdbc432cb194f79f59d4c40b051b203424c1a97bc3dfab39817dac93ea
-# mcpkit-policy-sha256: d0d2e9a887e83a0abac6838b8132b3aad04fa0c171a28c9d62fb8d528dfee665
+# mcpkit-vendored-sha256: 22eb231ef9b05bf397508a36b74c2fd3576e5e8a939334be627d7cf03f9f82c1
+# mcpkit-policy-sha256: 0346df332b8f55848b3edd94447f8e7159ab88de876b629ba978b6b325e10d30
 from __future__ import annotations
 
 # ---- from mcpkit/seams.py -----------------------------------------------------
@@ -25,6 +25,14 @@ server would advertise ``additionalProperties: false`` and accept extras.
 
 So the seams are checked once at import and the failure is an exception naming what moved. Louder
 than a wrong answer, and it happens at start-up rather than at the first mistyped argument.
+
+ONE FastMCP, NOT TWO. These seams are the shapes of the FastMCP BUNDLED IN THE OFFICIAL ``mcp`` SDK
+(``mcp.server.fastmcp``), pinned ``mcp>=1.28,<2``. They are NOT the shapes of the standalone
+PrefectHQ ``fastmcp`` v3 package (which vaultlight runs) -- there ``get_tool`` is public, middleware
+is first-class, and the internals mcpkit reaches into do not exist under these names. mcpkit does not
+work on fastmcp v3 as-is; adopting it there is a rewrite, not a config change. Written down here so
+nobody vendors this file into a v3 server and is surprised when the seam-check passes and enforcement
+still does not fit.
 """
 
 
@@ -244,7 +252,13 @@ def bearer_middleware(token: str, *, exempt: tuple[str, ...] = (HEALTH_PATH,)):
             prefix = "Bearer "
             # compare_digest, not ==: an early-exit comparison leaks the token a byte at a time.
             if not (got.startswith(prefix) and hmac.compare_digest(got[len(prefix):], token)):
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
+                # WWW-Authenticate on the 401 is what the MCP spec's OAuth flow expects: it names
+                # the scheme the client must use, so a compliant client knows HOW to retry rather
+                # than only THAT it failed. The scheme is Bearer; there is no realm to leak.
+                return JSONResponse(
+                    {"error": "unauthorized"}, status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
             return await call_next(request)
 
     return _Bearer
@@ -302,6 +316,7 @@ runtime refusal AND stamps ``additionalProperties: false`` onto the listed schem
 """
 
 
+import unicodedata
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -314,55 +329,194 @@ verify_seams()
 
 __all__ = ["StrictArgsMCP"]
 
+# The generic stale-server diagnosis, used when a server does not name its own revision surface.
+# A server that HAS one (caneslight -> pack_status, srclight -> index_status) supplies a better
+# string via the reconnect_hint constructor argument. It is DATA, never a method: a consumer hands
+# over a string and nothing else, so a later change to the surrounding message still reaches every
+# consumer. A method hook would re-fork call_tool's neighbourhood -- the exact thing vendoring one
+# shared policy exists to prevent.
+_DEFAULT_RECONNECT_HINT = "check the server's reported revision and reconnect the MCP"
+
 
 class StrictArgsMCP(FastMCP):
     """A FastMCP that rejects unknown tool arguments and advertises that it does."""
+
+    def __init__(self, *args: Any, reconnect_hint: str | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._reconnect_hint = reconnect_hint or _DEFAULT_RECONNECT_HINT
 
     async def call_tool(self, name: str, arguments: dict[str, Any]):  # type: ignore[override]
         tool = self._tool_manager.get_tool(name)
         if tool is not None and isinstance(arguments, dict):
             params = tool.parameters or {}
-            # ABSENT "properties" vs PRESENT-BUT-EMPTY are different facts, and conflating them
-            # leaves a hole (found 2026-08-29 by exhaustive testing against a realistic server):
-            #   * key ABSENT           -> the schema could not be introspected. Say nothing;
-            #                             refusing everything would brick the tool, and a guard
-            #                             that becomes a wall is worse than the bug it prevents.
-            #   * key PRESENT, empty   -> FastMCP generated {"properties": {}} because the tool
-            #                             genuinely takes NO arguments. Extras must be refused,
-            #                             or a zero-parameter tool is the one place a typo still
-            #                             slips through silently.
-            if "properties" in params:
+            # THREE facts about a schema, and each wants a different answer. Conflating any two of
+            # them has bitten this estate once each:
+            #   * "properties" ABSENT              -> schema uninstrospectable. Stay permissive;
+            #                                         a guard that bricks what it cannot read is a
+            #                                         wall, worse than the bug it prevents.
+            #   * "properties" PRESENT, empty      -> FastMCP emits {"properties": {}} for a tool
+            #                                         that genuinely takes NO arguments. Refuse
+            #                                         extras, or a zero-parameter tool is the one
+            #                                         place a typo still slips through silently.
+            #   * additionalProperties is True     -> the author OPTED OUT: a passthrough/proxy tool
+            #                                         that accepts arbitrary keys (the JSON-Schema
+            #                                         standard way to say so). Honour it -- refusing
+            #                                         here would advertise-open-but-refuse, the same
+            #                                         catalog-lies-about-runtime bug this guard
+            #                                         exists to close, pointing the other way.
+            if "properties" in params and params.get("additionalProperties") is not True:
                 accepted = set(params.get("properties") or {})
                 unknown = sorted(k for k in arguments if k not in accepted)
                 if unknown:
-                    accepts = ", ".join(sorted(accepted)) if accepted else "(no arguments)"
-                    raise ToolError(
-                        f"unknown argument(s): {', '.join(unknown)}. "
-                        f"Tool {name!r} accepts: {accepts}. "
-                        "Nothing was executed and no result was computed. "
-                        # The stale-server hint is load-bearing: whoever hits this has no other
-                        # route to the conclusion, because the call looked fine and the tool
-                        # exists. A long-lived daemon serves the code it launched with.
-                        "If you expected these arguments to work, this server process is probably "
-                        "running older code than you think - check the server's reported revision "
-                        "and reconnect the MCP."
-                    )
+                    raise ToolError(_unknown_args_message(name, unknown, accepted, self._reconnect_hint))
         return await super().call_tool(name, arguments)
 
     async def list_tools(self):  # type: ignore[override]
-        """Advertise the closed contract the runtime actually enforces."""
+        """Advertise exactly the contract the runtime enforces -- no more, no less."""
         tools = await super().list_tools()
         for t in tools:
             schema = getattr(t, "inputSchema", None)
-            # Only stamp object schemas that declare properties. Stamping a schema with no
-            # properties would advertise "accepts nothing", contradicting the call_tool rule
-            # above that treats an empty property set as unknown rather than closed.
-            # Stamp whenever "properties" is present -- including when empty, because an empty
-            # property set is now enforced as "accepts nothing" rather than "unknown".
+            # setdefault, NOT force: an author who set additionalProperties:true meant it (opt-out
+            # above), so leave it true and advertise open. Stamp false only when the key is absent.
+            # Skip a schema with no "properties" -- stamping "accepts nothing" there would
+            # contradict call_tool, which treats an absent property set as unknown, not closed.
+            # The invariant this preserves is ADVERTISEMENT == RUNTIME for every tool; pin that,
+            # never "true becomes false", or a proxy tool later fights its own conformance test.
             if isinstance(schema, dict) and schema.get("type") == "object" and "properties" in schema:
                 schema.setdefault("additionalProperties", False)
         return tools
 
+
+# The error message's SIZE is bounded by the server, never by its input. A caller sending 5,000
+# unknown keys must not be able to reflect a 59kB error back over MCP and into the log
+# (canes-fideles-d8, 2026-08-30). Values are NEVER echoed, only key NAMES — a rejected argument
+# cannot be used to bounce data into logs, and that is deliberate, not incidental.
+_MAX_ENUMERATED = 10
+
+
+def _unknown_args_message(
+    name: str, unknown: list[str], accepted: set[str],
+    reconnect_hint: str = _DEFAULT_RECONNECT_HINT,
+) -> str:
+    shown = unknown[:_MAX_ENUMERATED]
+    more = len(unknown) - len(shown)
+    listed = ", ".join(shown) + (f", and {more} more" if more > 0 else "")
+    accepts = ", ".join(sorted(accepted)) if accepted else "(no arguments)"
+
+    # NFKC confusables. Python normalises identifiers at PARSE time, so a parameter written with
+    # U+00B5 MICRO SIGN is advertised as U+03BC GREEK MU — two glyphs identical in nearly every
+    # font. A developer copying the name from source is refused by something that looks exactly
+    # like what they were told to send. Diagnose it by naming the CODEPOINT, since whoever hits
+    # this has no other route to the answer. THE SCHEMA IS AUTHORITATIVE FOR ARGUMENT NAMES,
+    # NEVER THE SOURCE, because normalisation happens between them.
+    hints = []
+    norm_accepted = {unicodedata.normalize("NFKC", a): a for a in accepted}
+    for k in shown:
+        canon = unicodedata.normalize("NFKC", k)
+        if canon != k and canon in norm_accepted:
+            cps = " ".join(f"U+{ord(c):04X}" for c in k)
+            hints.append(f"{k!r} ({cps}) normalises to {norm_accepted[canon]!r}, which IS accepted")
+
+    parts = [
+        f"unknown argument(s): {listed}.",
+        f"Tool {name!r} accepts: {accepts}.",
+        "Nothing was executed and no result was computed.",
+    ]
+    if hints:
+        parts.append("Note: " + "; ".join(hints) + ".")
+    parts.append(
+        "If you expected these arguments to work, this server process is probably running older "
+        f"code than you think - {reconnect_hint}."
+    )
+    return " ".join(parts)
+
+# ---- from mcpkit/conformance.py -----------------------------------------------
+"""One shared conformance check, so five hand-written copies cannot drift into six.
+
+WHY THIS EXISTS. Every consumer that adopted StrictArgsMCP also hand-wrote an "all tools are
+closed" test -- srclight, conductor, model-radar, zhcorpus, caneslight: five copies of one
+assertion. They ALREADY diverged (caneslight's asserted different refusal wording), which is this
+package's own addition rule met exactly: three copies AND drifted. So the check moves here and each
+consumer calls it in one line.
+
+WHAT IT PINS, and why it is the RIGHT invariant. Not "additionalProperties always becomes false" --
+that would cement the two-state model and fight a legitimate passthrough tool that opts out with
+``additionalProperties: true``. The invariant is ADVERTISEMENT == RUNTIME: whatever the catalog
+tells an agent about extra arguments, the runtime must actually do. That single property catches
+BOTH failures this estate shipped -- advertised-closed-but-runtime-open (the original silent-discard
+bug) and advertised-open-but-runtime-refuses (its reverse) -- and both StrictArgsMCP and any future
+opt-out-aware design satisfy it.
+
+PROVEN TO FIRE. A conformance check that never fails is theatre. ``assert_enforces`` raises against a
+bare FastMCP (whose object-with-properties tools advertise NO additionalProperties -- neither closed
+nor explicitly open), and ``test_conformance.py`` pins exactly that. A check you have not watched
+reject a non-conforming server is a check you cannot trust.
+"""
+
+
+import asyncio
+from typing import Any
+
+__all__ = ["assert_enforces", "aassert_enforces"]
+
+# A key no real tool declares. Sent as the lone argument to prove the closed contract is enforced.
+_PROBE_KEY = "zz_mcpkit_conformance_probe_key"
+
+
+async def aassert_enforces(mcp: Any, *, probe_key: str = _PROBE_KEY) -> int:
+    """Assert ADVERTISEMENT == RUNTIME for every introspectable tool. Returns the count actually
+    exercised. Raises AssertionError naming the first tool that lies. Async form; see the sync
+    ``assert_enforces`` wrapper for use inside a normal test."""
+    tools = await mcp.list_tools()
+    if not tools:
+        raise AssertionError("assert_enforces: the server advertises no tools -- nothing was checked")
+
+    enforced = 0
+    for t in tools:
+        schema = getattr(t, "inputSchema", None)
+        if not (isinstance(schema, dict) and schema.get("type") == "object" and "properties" in schema):
+            # Uninstrospectable schema -> permissive by design; there is no closed contract to hold.
+            continue
+
+        adv = schema.get("additionalProperties")
+        if adv is True:
+            # The author opted the tool OPEN (a passthrough/proxy accepting arbitrary keys). That is
+            # a declared, honoured contract, not a lie -- leave it be.
+            continue
+        if adv is not False:
+            raise AssertionError(
+                f"{t.name}: advertised schema is neither closed (additionalProperties:false) nor "
+                "explicitly open (true). The catalog is silent, so an agent is told extras are fine "
+                "while stock FastMCP would drop them -- the exact silent-discard this guard exists "
+                "to close. Serve this tool through StrictArgsMCP."
+            )
+
+        # adv is False: the catalog promises extras are refused, so the runtime MUST refuse them.
+        try:
+            await mcp.call_tool(t.name, {probe_key: 1})
+        except Exception:
+            enforced += 1
+            continue
+        raise AssertionError(
+            f"{t.name}: advertises additionalProperties:false but call_tool accepted the unknown "
+            f"argument {probe_key!r} instead of refusing it. The guarantee the catalog makes to "
+            "agents is not enforced at runtime -- the discarded-argument bug, back again."
+        )
+
+    if enforced == 0:
+        raise AssertionError(
+            "assert_enforces: no tool actually enforced a closed contract, so nothing was proven. "
+            "A conformance check that verifies nothing is worse than none -- it manufactures "
+            "confidence. Register at least one tool with arguments, or serve through StrictArgsMCP."
+        )
+    return enforced
+
+
+def assert_enforces(mcp: Any, *, probe_key: str = _PROBE_KEY) -> int:
+    """Synchronous wrapper for ``aassert_enforces`` -- drives the coroutine with ``asyncio.run`` so a
+    plain test needs no async runner. Call from OUTSIDE an event loop (an ordinary test body)."""
+    return asyncio.run(aassert_enforces(mcp, probe_key=probe_key))
+
 # ==== mcpkit provenance - nothing below this line is policy code ====
-__version__ = "0.1.0"
-__mcpkit_upstream_sha__ = "a1a4bb5+dirty"
+__version__ = "0.2.1"
+__mcpkit_upstream_sha__ = "2fb7fe2"
