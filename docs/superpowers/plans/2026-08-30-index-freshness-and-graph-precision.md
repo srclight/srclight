@@ -69,6 +69,7 @@ def repo(tmp_path):
     """A tiny on-disk repo plus an index that matches it."""
     db = Database(tmp_path / "index.db")
     db.open()
+    db.initialize()   # open() only connects; initialize() creates the schema
     src = tmp_path / "src"
     src.mkdir()
     f = src / "a.py"
@@ -180,7 +181,9 @@ def file_freshness(db: "Database", repo_root: Path, rel_paths: Iterable[str]) ->
         except OSError:
             out[rel] = MISSING
             continue
-        if st.st_mtime == rec.mtime:
+        # Fast path needs mtime AND size to match — mtime alone misses a
+        # same-tick edit (found during Task 1 implementation).
+        if st.st_mtime == rec.mtime and st.st_size == rec.size:
             out[rel] = FRESH          # fast path: no read
             continue
         try:
@@ -352,6 +355,7 @@ def wired_repo(tmp_path, monkeypatch):
     """Point the server's single-repo globals at a tiny real repo + index."""
     db = Database(tmp_path / "index.db")
     db.open()
+    db.initialize()   # open() only connects; initialize() creates the schema
     f = tmp_path / "main.py"
     f.write_text("def main(): pass\n")
     raw = f.read_bytes()
