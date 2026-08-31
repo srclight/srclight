@@ -236,10 +236,10 @@ Chosen targets get edges with the existing `_compute_confidence` (unchanged) plu
 
 **Files:** Modify `src/srclight/db.py` (`get_callers`/`get_callees` row dicts include `"resolution": r["resolution"]`), `README.md`.
 
-- [ ] **Step 1: Add `resolution` to the two row dicts** (db.py:837/858 region — they already select `s.*`-adjacent fields; add the column to the SELECT and dict).
-- [ ] **Step 2: Test** (append to tests/test_edge_resolution.py): call `db.get_callers(dup_id)` on the Task 3 fixture and assert rows carry `resolution`.
-- [ ] **Step 3: README** — extend the *Index freshness* area with a short **Graph resolution labels** paragraph: every caller/callee edge carries `resolution` (`same_file | unique_file | import | same_dir | name_only`); `name_only` means a ranked candidate list across same-named symbols — treat it as "one of these", not a confirmed link.
-- [ ] **Step 4: Full suite, commit** — `git add src/srclight/db.py tests/test_edge_resolution.py README.md && git commit -m "feat(graph): resolution labels surfaced in get_callers/get_callees; docs"`
+- [x] **Step 1: Add `resolution` to the two row dicts** (db.py:837/858 region — they already select `s.*`-adjacent fields; add the column to the SELECT and dict).
+- [x] **Step 2: Test** (append to tests/test_edge_resolution.py): call `db.get_callers(dup_id)` on the Task 3 fixture and assert rows carry `resolution`.
+- [x] **Step 3: README** — extend the *Index freshness* area with a short **Graph resolution labels** paragraph: every caller/callee edge carries `resolution` (`same_file | unique_file | import | same_dir | name_only`); `name_only` means a ranked candidate list across same-named symbols — treat it as "one of these", not a confirmed link.
+- [x] **Step 4: Full suite, commit** — `git add src/srclight/db.py tests/test_edge_resolution.py README.md && git commit -m "feat(graph): resolution labels surfaced in get_callers/get_callees; docs"`
 
 ---
 

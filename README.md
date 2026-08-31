@@ -65,6 +65,20 @@ line numbers or bodies from it. `"verified-fresh"` is the affirmative signal;
 its absence on a workspace-mode result means freshness was not checkable for
 that result, never that it is fresh.
 
+## Graph resolution labels
+
+Reference edges are built by name matching plus ranked evidence, and every
+caller/callee edge carries a `resolution` label saying how its target was
+chosen: `same_file` (the caller's own file defines the name), `unique_file`
+(all same-named candidates live in one file), `import` (the caller's imports
+single out one file), `same_dir`, or `name_only`. Names appearing only in
+comments or strings never become edges.
+
+**AI agents:** `name_only` means a **ranked candidate list** across same-named
+symbols — read it as "one of these", not a confirmed link; verify with
+`get_symbol` or a reference search before acting on it. The stronger labels
+are safe to treat as resolved.
+
 ## Requirements
 
 - **Python 3.11+**

@@ -91,3 +91,25 @@ def test_comment_only_reference_creates_no_edge(db, project):
     Indexer(db, IndexConfig(root=project)).index(project)
     assert _edges(db, "other_caller", "ghost_func") == [], (
         "a name appearing only in a comment must not become an edge")
+
+
+def test_get_callers_surfaces_resolution(db, project):
+    """Task 4: the label must reach the tool layer, not just the table."""
+    Indexer(db, IndexConfig(root=project)).index(project)
+    dup = db.conn.execute(
+        """SELECT s.id FROM symbols s JOIN files f ON s.file_id=f.id
+           WHERE s.name='dup_worker' AND f.path='a.py'"""
+    ).fetchone()
+    callers = db.get_callers(dup["id"])
+    assert callers
+    assert all(c["resolution"] == "same_file" for c in callers
+               if c["symbol"].name == "caller_one")
+
+
+def test_get_callees_surfaces_resolution(db, project):
+    Indexer(db, IndexConfig(root=project)).index(project)
+    other = db.conn.execute(
+        "SELECT id FROM symbols WHERE name='other_caller'").fetchone()
+    callees = db.get_callees(other["id"])
+    assert callees
+    assert all("resolution" in c for c in callees)

@@ -849,7 +849,7 @@ class Database:
         """Get all symbols that call/reference the given symbol."""
         assert self.conn is not None
         rows = self.conn.execute(
-            """SELECT s.*, f.path as file_path, e.edge_type, e.confidence
+            """SELECT s.*, f.path as file_path, e.edge_type, e.confidence, e.resolution
                FROM symbol_edges e
                JOIN symbols s ON e.source_id = s.id
                JOIN files f ON s.file_id = f.id
@@ -862,6 +862,9 @@ class Database:
                 "symbol": self._row_to_symbol(r),
                 "edge_type": r["edge_type"],
                 "confidence": r["confidence"],
+                # How the edge was resolved (same_file|unique_file|import|same_dir|
+                # name_only). name_only = ranked candidate list, not a confirmed link.
+                "resolution": r["resolution"],
             }
             for r in rows
         ]
@@ -870,7 +873,7 @@ class Database:
         """Get all symbols that the given symbol calls/references."""
         assert self.conn is not None
         rows = self.conn.execute(
-            """SELECT s.*, f.path as file_path, e.edge_type, e.confidence
+            """SELECT s.*, f.path as file_path, e.edge_type, e.confidence, e.resolution
                FROM symbol_edges e
                JOIN symbols s ON e.target_id = s.id
                JOIN files f ON s.file_id = f.id
@@ -883,6 +886,7 @@ class Database:
                 "symbol": self._row_to_symbol(r),
                 "edge_type": r["edge_type"],
                 "confidence": r["confidence"],
+                "resolution": r["resolution"],
             }
             for r in rows
         ]
