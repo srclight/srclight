@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS symbol_edges (
     edge_type TEXT NOT NULL,
     confidence REAL DEFAULT 1.0,
     metadata TEXT,           -- JSON
+    resolution TEXT,         -- same_file | unique_file | import | same_dir | name_only
     UNIQUE(source_id, target_id, edge_type)
 );
 
@@ -284,6 +285,10 @@ class EdgeRecord:
     edge_type: str = ""
     confidence: float = 1.0
     metadata: dict | None = None
+    # HOW the target was chosen: same_file | unique_file | import | same_dir |
+    # name_only (ranked fan-out kept — "one of these", not a confirmed link).
+    # NULL only in DBs indexed before 0.20.5; readers must tolerate it.
+    resolution: str | None = None
 
 
 class Database:
@@ -326,6 +331,11 @@ class Database:
         # Migrate: add indexer_version column if missing (pre-0.10.1 DBs)
         try:
             self.conn.execute("ALTER TABLE index_state ADD COLUMN indexer_version TEXT")
+        except Exception:
+            pass  # column already exists
+        # Migrate: add edge resolution column if missing (pre-0.20.5 DBs)
+        try:
+            self.conn.execute("ALTER TABLE symbol_edges ADD COLUMN resolution TEXT")
         except Exception:
             pass  # column already exists
         # Migrate v4 -> v5: add community/flow tables
@@ -828,9 +838,10 @@ class Database:
         meta_json = json.dumps(rec.metadata) if rec.metadata else None
         cur = self.conn.execute(
             """INSERT OR IGNORE INTO symbol_edges
-               (source_id, target_id, edge_type, confidence, metadata)
-               VALUES (?, ?, ?, ?, ?)""",
-            (rec.source_id, rec.target_id, rec.edge_type, rec.confidence, meta_json),
+               (source_id, target_id, edge_type, confidence, metadata, resolution)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (rec.source_id, rec.target_id, rec.edge_type, rec.confidence, meta_json,
+             rec.resolution),
         )
         return cur.lastrowid
 
@@ -838,7 +849,7 @@ class Database:
         """Get all symbols that call/reference the given symbol."""
         assert self.conn is not None
         rows = self.conn.execute(
-            """SELECT s.*, f.path as file_path, e.edge_type, e.confidence
+            """SELECT s.*, f.path as file_path, e.edge_type, e.confidence, e.resolution
                FROM symbol_edges e
                JOIN symbols s ON e.source_id = s.id
                JOIN files f ON s.file_id = f.id
@@ -851,6 +862,9 @@ class Database:
                 "symbol": self._row_to_symbol(r),
                 "edge_type": r["edge_type"],
                 "confidence": r["confidence"],
+                # How the edge was resolved (same_file|unique_file|import|same_dir|
+                # name_only). name_only = ranked candidate list, not a confirmed link.
+                "resolution": r["resolution"],
             }
             for r in rows
         ]
@@ -859,7 +873,7 @@ class Database:
         """Get all symbols that the given symbol calls/references."""
         assert self.conn is not None
         rows = self.conn.execute(
-            """SELECT s.*, f.path as file_path, e.edge_type, e.confidence
+            """SELECT s.*, f.path as file_path, e.edge_type, e.confidence, e.resolution
                FROM symbol_edges e
                JOIN symbols s ON e.target_id = s.id
                JOIN files f ON s.file_id = f.id
@@ -872,6 +886,7 @@ class Database:
                 "symbol": self._row_to_symbol(r),
                 "edge_type": r["edge_type"],
                 "confidence": r["confidence"],
+                "resolution": r["resolution"],
             }
             for r in rows
         ]

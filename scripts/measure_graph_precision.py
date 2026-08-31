@@ -81,10 +81,16 @@ def measure(db_path: str, sample: int = 500, seed: int = 42) -> dict:
         ORDER BY RANDOM() LIMIT 20
     """)]
 
+    # How the edge builder resolved targets (0.20.5+; absent/None = pre-resolution DB)
+    resolution_rows = conn.execute(
+        "SELECT COALESCE(resolution,'(none)') r, COUNT(*) c FROM symbol_edges "
+        "WHERE edge_type='calls' GROUP BY resolution ORDER BY c DESC").fetchall()
+
     n = max(len(sampled), 1)
     return {
         "db": db_path,
         "total_calls_edges": total_edges,
+        "resolution_distribution": {r["r"]: r["c"] for r in resolution_rows},
         "ambiguous_target_name_rate": round(ambiguous / max(total_edges, 1), 4),
         "confidence_distribution": {str(r["confidence"]): r["c"] for r in conf_rows},
         "sampled": len(sampled),

@@ -1035,35 +1035,85 @@ class Indexer:
         MAX_REFS_PER_SYMBOL = 30
 
         content_rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.content FROM symbols s
+            f"""SELECT s.id, s.name, s.content, f.path as file_path, f.language
+               FROM symbols s
                JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
         ).fetchall()
 
+        from .imports import extract_imports
+        from .refmask import mask_noncode
+
+        # Per-file import evidence (a boost/filter for the import tier, never a
+        # resolver). Reads the file head from disk at index time; a file gone
+        # missing simply never hits the import tier.
+        file_imports: dict[str, set[str]] = {}
+
+        def _imports_for(file_path: str, language: str | None) -> set[str]:
+            if file_path not in file_imports:
+                names: set[str] = set()
+                try:
+                    head = "\n".join(
+                        (self.config.root / file_path).read_text(errors="ignore")
+                        .splitlines()[:100]
+                    )
+                    for imp in extract_imports(head, language or ""):
+                        mod = imp.get("module") or ""
+                        if mod:
+                            stem = mod.rsplit(".", 1)[-1].rsplit("/", 1)[-1]
+                            names.add(stem.rsplit(".", 1)[0] or stem)
+                        for nm in imp.get("names") or []:
+                            names.add(nm)
+                except OSError:
+                    pass
+                file_imports[file_path] = names
+            return file_imports[file_path]
+
+        def _select_targets(targets: list[dict], source_file: str,
+                            imported: set[str], ref_name: str) -> tuple[list[dict], str]:
+            """Ranked, field-standard selection (grain-0399): prefer evidence,
+            and when none discriminates, keep the ranked LIST as name_only —
+            a labeled candidate list beats a fabricated winner."""
+            same_file = [t for t in targets if t["file"] == source_file]
+            if same_file:
+                return same_file, "same_file"
+            files = {t["file"] for t in targets}
+            if len(files) == 1:
+                return targets, "unique_file"
+            if imported:
+                imp = [t for t in targets
+                       if t["file"].rsplit("/", 1)[-1].rsplit(".", 1)[0] in imported]
+                if imp and len({t["file"] for t in imp}) == 1:
+                    return imp, "import"
+            sdir = _dir_of(source_file)
+            sd = [t for t in targets if _dir_of(t["file"]) == sdir]
+            if sd and len({t["file"] for t in sd}) == 1:
+                return sd, "same_dir"
+            return targets, "name_only"
+
         for row in content_rows:
             source_id = row["id"]
             source_name = row["name"]
-            content = row["content"]
-            source_info = symbol_info.get(source_id)
-            if not source_info:
-                continue
-            source_file = source_info["file"]
+            source_file = row["file_path"]
+            # Mask comments/strings BEFORE scanning: a name that appears only in
+            # prose is not a reference (12.8% of sampled edges were this class).
+            content = mask_noncode(row["content"], row["language"] or "")
 
             referenced_names = set(pattern.findall(content))
             referenced_names.discard(source_name)
 
+            imported = _imports_for(source_file, row["language"])
             refs_for_this = 0
             for ref_name in referenced_names:
                 if refs_for_this >= MAX_REFS_PER_SYMBOL:
                     break
-                targets = filtered_names.get(ref_name, [])
-                for target in targets:
-                    if target["id"] == source_id:
-                        continue
-                    # Only link to meaningful symbol kinds
-                    if target["kind"] not in EDGE_TARGET_KINDS:
-                        continue
+                targets = [t for t in filtered_names.get(ref_name, [])
+                           if t["id"] != source_id and t["kind"] in EDGE_TARGET_KINDS]
+                if not targets:
+                    continue
+                chosen, resolution = _select_targets(targets, source_file, imported, ref_name)
+                for target in chosen:
                     confidence = _compute_confidence(source_file, target["file"])
                     # Skip very low confidence edges
                     if confidence < 0.2:
@@ -1073,6 +1123,7 @@ class Indexer:
                         target_id=target["id"],
                         edge_type="calls",
                         confidence=confidence,
+                        resolution=resolution,
                     ))
                     edge_count += 1
                     refs_for_this += 1
