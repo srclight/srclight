@@ -85,3 +85,30 @@ def test_search_symbols_carries_freshness(wired_repo):
     _index_symbol(db, root)
     res = json.loads(_run(server.search_symbols(query="main")))
     assert "index_freshness" in res
+
+
+# --- Task 5: graph tools + index_status ---
+
+def test_find_dead_code_carries_freshness(wired_repo):
+    db, root = wired_repo
+    # NOT named "main": get_dead_symbols excludes entry-point names, and an
+    # excluded symbol would leave the dead list empty — nothing to stamp.
+    from srclight.db import SymbolRecord
+    fid = db.get_file("main.py").id
+    db.insert_symbol(SymbolRecord(
+        file_id=fid, kind="function", name="orphan_fn",
+        start_line=3, end_line=3, content="def orphan_fn(): pass",
+        line_count=1,
+    ), "main.py")
+    db.commit()
+    res = json.loads(_run(server.find_dead_code()))
+    assert res["total_unreferenced"] >= 1
+    assert "index_freshness" in res
+
+
+def test_index_status_carries_whole_index_counts(wired_repo):
+    db, root = wired_repo
+    (root / "main.py").write_text("changed\n")
+    res = json.loads(_run(server.index_status()))
+    assert res["index_freshness"]["stale_count"] == 1
+    assert res["index_freshness"]["checked"] == 1

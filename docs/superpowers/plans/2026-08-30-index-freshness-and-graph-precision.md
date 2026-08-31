@@ -565,7 +565,7 @@ git commit -m "feat(freshness): stamp index_freshness into symbol-reading tool r
 - Consumes: same `annotate` pattern as Task 4; graph tool rows carry `file`/`file_path` for each related symbol.
 - Produces: `get_callers`/`get_callees`/`find_dead_code` results gain `index_freshness` (union of the files of every symbol in the answer — a stale caller file makes the whole edge list suspect); `index_status` gains `"index_freshness": {"checked": N, "stale_count": N}` whole-index summary (counts only — index_status is the dashboard, not the detail).
 
-- [ ] **Step 1: Write the failing tests (append)**
+- [x] **Step 1: Write the failing tests (append)**
 
 ```python
 def test_find_dead_code_carries_freshness(wired_repo):
@@ -583,12 +583,12 @@ def test_index_status_carries_whole_index_counts(wired_repo):
     assert res["index_freshness"]["checked"] == 1
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest tests/test_freshness_tools.py -q`
 Expected: the two new tests FAIL (`KeyError: 'index_freshness'`)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Graph tools: apply the Task 4 pattern. For `index_status`, compute counts inline:
 
@@ -602,12 +602,12 @@ Graph tools: apply the Task 4 pattern. For `index_status`, compute counts inline
         result["index_freshness"] = {"checked": len(statuses), "stale_count": stale_n}
 ```
 
-- [ ] **Step 4: Run the full suite**
+- [x] **Step 4: Run the full suite**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest -q`
 Expected: all pass
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/repos/srclight/srclight

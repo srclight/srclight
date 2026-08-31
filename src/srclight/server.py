@@ -791,11 +791,11 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
     callers = db.get_callers(sym.id)
     result = _dedup_edges(callers)
 
-    return json.dumps({
-        "symbol": symbol_name,
-        "caller_count": len(result),
-        "callers": result,
-    }, indent=2)
+    payload = {"symbol": symbol_name, "caller_count": len(result), "callers": result}
+    # A stale caller file makes the whole edge list suspect — stamp the union.
+    _stamp_freshness(payload, (c.get("file") or c.get("file_path")
+                               for c in result if isinstance(c, dict)))
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -844,11 +844,10 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
     callees = db.get_callees(sym.id)
     result = _dedup_edges(callees)
 
-    return json.dumps({
-        "symbol": symbol_name,
-        "callee_count": len(result),
-        "callees": result,
-    }, indent=2)
+    payload = {"symbol": symbol_name, "callee_count": len(result), "callees": result}
+    _stamp_freshness(payload, (c.get("file") or c.get("file_path")
+                               for c in result if isinstance(c, dict)))
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -1164,6 +1163,15 @@ def index_status() -> str:
     signal = _read_index_signal(_repo_root)
     if signal:
         result["last_indexed_at"] = signal.get("timestamp")
+
+    # Whole-index freshness COUNTS only (stat fast path makes this cheap) — the
+    # dashboard number; per-path detail lives in the check_freshness probe.
+    if _repo_root is not None:
+        from .freshness import FRESH, file_freshness
+        rels = [r["path"] for r in db.conn.execute("SELECT path FROM files")]
+        statuses = file_freshness(db, Path(_repo_root), rels)
+        stale_n = sum(1 for s in statuses.values() if s != FRESH)
+        result["index_freshness"] = {"checked": len(statuses), "stale_count": stale_n}
 
     return json.dumps(result, indent=2)
 
@@ -2121,6 +2129,8 @@ def find_dead_code(project: str | None = None, kind: str | None = None) -> str:
     if not dead:
         result["hint"] = "No unreferenced symbols found. This may mean the codebase is well-connected, or edges haven't been indexed yet."
 
+    # Dead-code verdicts on drifted files are stale advice — stamp the files involved.
+    _stamp_freshness(result, (p for p in by_file if p != "unknown"))
     return json.dumps(result, indent=2)
 
 
