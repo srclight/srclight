@@ -381,6 +381,23 @@ def _symbol_to_dict(sym) -> dict:
     }
 
 
+def _stamp_freshness(payload: dict, rel_paths) -> dict:
+    """Stamp payload['index_freshness'] for the files this result draws on.
+
+    SINGLE-REPO MODE ONLY: in workspace mode there is no one repo root to stat
+    against per row, so the key is OMITTED rather than guessed — an unverifiable
+    "fresh" would be the exact lie the freshness feature exists to kill (the
+    README documents that absence means "not checked", never "fresh").
+    """
+    if _is_workspace_mode() or _repo_root is None:
+        return payload
+    paths = {p for p in rel_paths if p}
+    if not paths:
+        return payload
+    from .freshness import annotate
+    return annotate(payload, _get_db(), Path(_repo_root), paths)
+
+
 def _project_required_error(tool_name: str) -> str:
     """Return a JSON error with the list of valid project names."""
     wdb = _get_workspace_db()
@@ -502,7 +519,12 @@ def search_symbols(
             "hint": f"No keyword matches. Try hybrid_search(\"{query}\") for semantic matching.",
         }, indent=2)
 
-    return json.dumps(results, indent=2)
+    # Wrapped (not a bare list) so the payload can carry index_freshness — and so
+    # the hit shape matches the no-hit shape above instead of flip-flopping.
+    payload = {"query": query, "result_count": len(results), "results": results}
+    _stamp_freshness(payload, (m.get("file") or m.get("file_path")
+                               for m in results if isinstance(m, dict)))
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -541,6 +563,7 @@ def get_symbol(name: str, project: str | None = None) -> str:
         result["parameters"] = sym.parameters
         result["return_type"] = sym.return_type
         result["metadata"] = sym.metadata
+        _stamp_freshness(result, [sym.file_path])
         return json.dumps(result, indent=2)
 
     results = []
@@ -551,10 +574,9 @@ def get_symbol(name: str, project: str | None = None) -> str:
         d["return_type"] = sym.return_type
         results.append(d)
 
-    return json.dumps({
-        "match_count": len(results),
-        "symbols": results,
-    }, indent=2)
+    payload = {"match_count": len(results), "symbols": results}
+    _stamp_freshness(payload, (d.get("file") for d in results))
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -606,8 +628,11 @@ def get_signature(name: str) -> str:
         })
 
     if len(results) == 1:
+        _stamp_freshness(results[0], [results[0].get("file")])
         return json.dumps(results[0], indent=2)
-    return json.dumps({"match_count": len(results), "signatures": results}, indent=2)
+    payload = {"match_count": len(results), "signatures": results}
+    _stamp_freshness(payload, (r.get("file") for r in results))
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -672,11 +697,9 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
             "doc": sym.doc_comment[:100] if sym.doc_comment else None,
         })
 
-    return json.dumps({
-        "file": path,
-        "symbol_count": len(result),
-        "symbols": result,
-    }, indent=2)
+    payload = {"file": path, "symbol_count": len(result), "symbols": result}
+    _stamp_freshness(payload, [path])
+    return json.dumps(payload, indent=2)
 
 
 # --- Tier 2: Graph tools ---
@@ -768,11 +791,11 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
     callers = db.get_callers(sym.id)
     result = _dedup_edges(callers)
 
-    return json.dumps({
-        "symbol": symbol_name,
-        "caller_count": len(result),
-        "callers": result,
-    }, indent=2)
+    payload = {"symbol": symbol_name, "caller_count": len(result), "callers": result}
+    # A stale caller file makes the whole edge list suspect — stamp the union.
+    _stamp_freshness(payload, (c.get("file") or c.get("file_path")
+                               for c in result if isinstance(c, dict)))
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -821,11 +844,10 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
     callees = db.get_callees(sym.id)
     result = _dedup_edges(callees)
 
-    return json.dumps({
-        "symbol": symbol_name,
-        "callee_count": len(result),
-        "callees": result,
-    }, indent=2)
+    payload = {"symbol": symbol_name, "callee_count": len(result), "callees": result}
+    _stamp_freshness(payload, (c.get("file") or c.get("file_path")
+                               for c in result if isinstance(c, dict)))
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -1055,6 +1077,56 @@ def get_implementors(interface_name: str, project: str | None = None) -> str:
 
 
 @mcp.tool()
+def check_freshness(paths: list[str] | None = None, project: str | None = None) -> str:
+    """Is the index current for these files (or the whole index)?
+
+    Compares on-disk files against the index (mtime+size fast path, content-hash
+    fallback; never writes). Use BEFORE trusting symbol results on a repo under
+    active edit, or when a result's `index_freshness` flagged staleness.
+
+    Args:
+        paths: Repo-relative paths to check. Omit to check every indexed file
+               (cheap: unchanged files cost one stat each).
+        project: Project name (required in workspace mode).
+    """
+    from .freshness import file_freshness, freshness_summary
+
+    if _is_workspace_mode():
+        if not project:
+            return _project_required_error("check_freshness")
+        from .workspace import WorkspaceConfig
+        config = WorkspaceConfig.load(_workspace_name)
+        proj_path = config.projects.get(project)
+        if not proj_path:
+            return _project_not_found_error(project)
+        repo_root = Path(proj_path)
+        db_path = repo_root / ".srclight" / "index.db"
+        if not db_path.exists():
+            return json.dumps({"error": f"Project '{project}' not indexed"})
+        db = Database(db_path)
+        db.open()
+        try:
+            rels = paths if paths is not None else [
+                r["path"] for r in db.conn.execute("SELECT path FROM files")
+            ]
+            statuses = file_freshness(db, repo_root, rels)
+        finally:
+            db.close()
+    else:
+        db = _get_db()
+        repo_root = _repo_root or Path.cwd()
+        rels = paths if paths is not None else [
+            r["path"] for r in db.conn.execute("SELECT path FROM files")
+        ]
+        statuses = file_freshness(db, repo_root, rels)
+
+    return json.dumps(
+        {"index_freshness": freshness_summary(statuses), "checked": len(statuses)},
+        indent=2,
+    )
+
+
+@mcp.tool()
 def index_status() -> str:
     """Check the current state of the code index.
 
@@ -1091,6 +1163,15 @@ def index_status() -> str:
     signal = _read_index_signal(_repo_root)
     if signal:
         result["last_indexed_at"] = signal.get("timestamp")
+
+    # Whole-index freshness COUNTS only (stat fast path makes this cheap) — the
+    # dashboard number; per-path detail lives in the check_freshness probe.
+    if _repo_root is not None:
+        from .freshness import FRESH, file_freshness
+        rels = [r["path"] for r in db.conn.execute("SELECT path FROM files")]
+        statuses = file_freshness(db, Path(_repo_root), rels)
+        stale_n = sum(1 for s in statuses.values() if s != FRESH)
+        result["index_freshness"] = {"checked": len(statuses), "stale_count": stale_n}
 
     return json.dumps(result, indent=2)
 
@@ -1614,6 +1695,8 @@ def hybrid_search(
         }
         if not final:
             payload["hint"] = "No results. Try broadening your query or check that the index is up to date with reindex()."
+        _stamp_freshness(payload, (m.get("file") or m.get("file_path")
+                                   for m in final if isinstance(m, dict)))
         return json.dumps(payload, indent=2)
     else:
         payload = {
@@ -1626,6 +1709,8 @@ def hybrid_search(
             payload["hint"] = "No results. Try broadening your query or check that the index is up to date with reindex()."
         if embedding_error is not None:
             payload["embedding_error"] = embedding_error
+        _stamp_freshness(payload, (m.get("file") or m.get("file_path")
+                                   for m in fts_results[:limit] if isinstance(m, dict)))
         return json.dumps(payload, indent=2)
 
 
@@ -2044,6 +2129,8 @@ def find_dead_code(project: str | None = None, kind: str | None = None) -> str:
     if not dead:
         result["hint"] = "No unreferenced symbols found. This may mean the codebase is well-connected, or edges haven't been indexed yet."
 
+    # Dead-code verdicts on drifted files are stale advice — stamp the files involved.
+    _stamp_freshness(result, (p for p in by_file if p != "unknown"))
     return json.dumps(result, indent=2)
 
 
