@@ -37,7 +37,7 @@
 **Interfaces:**
 - Produces: `mask_noncode(content: str, language: str) -> str` — same length as input, newlines preserved, every character inside a comment or string literal replaced with a space. Handles: `#` tails (python/shell/ruby), `//` tails and `/* ... */` blocks (c/cpp/js/ts/java/go/rust/dart/swift), `'...'`/`"..."` single-line strings with `\\` escapes (all languages), `'''...'''`/`\"\"\"...\"\"\"` multi-line strings (python). Unknown language → apply the generic set (`#`, `//`, block, quotes): over-masking a comment-like tail in an exotic language is cheaper than keeping the measured false-edge class.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_refmask.py
@@ -86,9 +86,9 @@ def test_python_hash_not_treated_as_comment_in_c_include():
     assert out.count("helper") >= 1           # the call survives
 ```
 
-- [ ] **Step 2: Run to verify fail** — `.venv/bin/python -m pytest tests/test_refmask.py -q` → `ModuleNotFoundError: srclight.refmask`
+- [x] **Step 2: Run to verify fail** — `.venv/bin/python -m pytest tests/test_refmask.py -q` → `ModuleNotFoundError: srclight.refmask`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 # src/srclight/refmask.py
@@ -170,8 +170,8 @@ def mask_noncode(content: str, language: str) -> str:
     return "".join(out)
 ```
 
-- [ ] **Step 4: Verify pass** — `.venv/bin/python -m pytest tests/test_refmask.py -q` → 7 passed
-- [ ] **Step 5: Full suite, then commit** — `git add src/srclight/refmask.py tests/test_refmask.py && git commit -m "feat(graph): comment/string masking for the edge builder"`
+- [x] **Step 4: Verify pass** — `.venv/bin/python -m pytest tests/test_refmask.py -q` → 7 passed
+- [x] **Step 5: Full suite, then commit** — `git add src/srclight/refmask.py tests/test_refmask.py && git commit -m "feat(graph): comment/string masking for the edge builder"`
 
 ---
 
