@@ -336,7 +336,7 @@ git commit -m "feat(freshness): bounded summary + result annotation — verbose 
 - Consumes: Task 2's `file_freshness`, `freshness_summary`; server helpers `_get_db()` (server.py:288), `_repo_root` module global, `_is_workspace_mode()` (server.py:213), `WorkspaceConfig.load(_workspace_name)` + `config.projects.get(project)` (pattern at server.py:2100 in `find_pattern`).
 - Produces: MCP tool `check_freshness(paths: list[str] | None = None, project: str | None = None) -> str` returning JSON: `{"index_freshness": <summary>, "checked": N}` — with `paths=None` it checks EVERY file in the index (stat fast path makes this cheap); with paths, just those. Workspace mode requires `project` (same `_project_required_error` pattern as `find_pattern`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/test_freshness_tools.py
@@ -392,12 +392,12 @@ def test_check_freshness_specific_paths(wired_repo):
     assert res["index_freshness"]["not_indexed"] == ["ghost.py"]
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest tests/test_freshness_tools.py -q`
 Expected: FAIL with `AttributeError: module 'srclight.server' has no attribute 'check_freshness'`
 
-- [ ] **Step 3: Implement the tool (insert in server.py directly above `def index_status`, server.py:1058)**
+- [x] **Step 3: Implement the tool (insert in server.py directly above `def index_status`, server.py:1058)**
 
 ```python
 @mcp.tool()
@@ -450,17 +450,17 @@ def check_freshness(paths: list[str] | None = None, project: str | None = None) 
     )
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest tests/test_freshness_tools.py -q`
 Expected: 3 passed
 
-- [ ] **Step 5: Run the FULL suite (the tool touches server import order)**
+- [x] **Step 5: Run the FULL suite (the tool touches server import order)**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest -q`
 Expected: 234+ passed, 0 failed (231 baseline + the new files)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/repos/srclight/srclight

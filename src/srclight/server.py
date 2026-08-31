@@ -1055,6 +1055,56 @@ def get_implementors(interface_name: str, project: str | None = None) -> str:
 
 
 @mcp.tool()
+def check_freshness(paths: list[str] | None = None, project: str | None = None) -> str:
+    """Is the index current for these files (or the whole index)?
+
+    Compares on-disk files against the index (mtime+size fast path, content-hash
+    fallback; never writes). Use BEFORE trusting symbol results on a repo under
+    active edit, or when a result's `index_freshness` flagged staleness.
+
+    Args:
+        paths: Repo-relative paths to check. Omit to check every indexed file
+               (cheap: unchanged files cost one stat each).
+        project: Project name (required in workspace mode).
+    """
+    from .freshness import file_freshness, freshness_summary
+
+    if _is_workspace_mode():
+        if not project:
+            return _project_required_error("check_freshness")
+        from .workspace import WorkspaceConfig
+        config = WorkspaceConfig.load(_workspace_name)
+        proj_path = config.projects.get(project)
+        if not proj_path:
+            return _project_not_found_error(project)
+        repo_root = Path(proj_path)
+        db_path = repo_root / ".srclight" / "index.db"
+        if not db_path.exists():
+            return json.dumps({"error": f"Project '{project}' not indexed"})
+        db = Database(db_path)
+        db.open()
+        try:
+            rels = paths if paths is not None else [
+                r["path"] for r in db.conn.execute("SELECT path FROM files")
+            ]
+            statuses = file_freshness(db, repo_root, rels)
+        finally:
+            db.close()
+    else:
+        db = _get_db()
+        repo_root = _repo_root or Path.cwd()
+        rels = paths if paths is not None else [
+            r["path"] for r in db.conn.execute("SELECT path FROM files")
+        ]
+        statuses = file_freshness(db, repo_root, rels)
+
+    return json.dumps(
+        {"index_freshness": freshness_summary(statuses), "checked": len(statuses)},
+        indent=2,
+    )
+
+
+@mcp.tool()
 def index_status() -> str:
     """Check the current state of the code index.
 
