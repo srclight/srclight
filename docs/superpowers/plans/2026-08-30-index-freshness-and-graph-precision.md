@@ -876,12 +876,12 @@ Print the three headline rates in the final summary for Tim and the pack — the
 **Files:**
 - Modify: `pyproject.toml` (version `0.20.3` → `0.20.4`)
 
-- [ ] **Step 1: Full suite**
+- [x] **Step 1: Full suite**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest -q`
 Expected: 240+ passed, 0 failed
 
-- [ ] **Step 2: Bump version, commit, release (estate pattern — no GitHub Release)**
+- [x] **Step 2: Bump version, commit, release (estate pattern — no GitHub Release)**
 
 ```bash
 cd ~/repos/srclight/srclight
@@ -895,7 +895,7 @@ git push origin master && git push origin v0.20.4
 git checkout develop
 ```
 
-- [ ] **Step 3: Land the closing grain**
+- [x] **Step 3: Land the closing grain**
 
 Through the caneslight MCP (`pack_learn`, dog=gromit, dimension=work): freshness shipped (what the stamp/probe are, the "absence on workspace results means unchecked, never fresh" rule), harness numbers headline, AST decision handed back to Tim + pack. Include `origin_repo=srclight/srclight` and the release commit sha.
 
