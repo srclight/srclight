@@ -662,7 +662,7 @@ git commit -m "docs: index freshness — the stamp, the probe, agent semantics"
 - Consumes: an existing `.srclight/index.db` (read-only), `re`, `sqlite3`, `json`, `argparse`. NOT part of the srclight package — a standalone script.
 - Produces: `classify_reference(content: str, name: str) -> str` returning `"code"`, `"comment_or_string_only"`, or `"absent"`; `measure(db_path: str, sample: int = 500) -> dict` report; CLI `python scripts/measure_graph_precision.py <db_path> [--sample N] [--out report.md]`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_graph_precision.py
@@ -701,12 +701,12 @@ def test_absent_name():
     assert classify_reference("def f(): pass\n", "helper") == "absent"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest tests/test_graph_precision.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'measure_graph_precision'`
 
-- [ ] **Step 3: Write the harness**
+- [x] **Step 3: Write the harness**
 
 ```python
 #!/usr/bin/env python3
@@ -825,12 +825,12 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest tests/test_graph_precision.py -q`
 Expected: 5 passed
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/repos/srclight/srclight
