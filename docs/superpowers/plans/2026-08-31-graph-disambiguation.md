@@ -182,9 +182,9 @@ def mask_noncode(content: str, language: str) -> str:
 **Interfaces:**
 - Produces: `extract_imports(content: str, language: str) -> list[dict]` and `IMPORT_PATTERNS` — MOVED verbatim from server.py:1829's `_extract_imports` (plus its `IMPORT_PATTERNS` constant, wherever it is defined in server.py; find with `grep -n "IMPORT_PATTERNS" src/srclight/server.py`). server.py replaces its definitions with `from .imports import IMPORT_PATTERNS, extract_imports as _extract_imports` so `find_imports` and its tests keep working unchanged. The indexer may then import it without touching server.
 
-- [ ] **Step 1: Move the code** (no behavior change, so the existing `TestExtractImports` suite in tests/test_new_tools.py IS the test — it already passes and must still pass, now exercising the moved module through server's re-import).
-- [ ] **Step 2: Full suite** — `.venv/bin/python -m pytest -q` → all pass (existing import tests prove the move).
-- [ ] **Step 3: Commit** — `git add src/srclight/imports.py src/srclight/server.py && git commit -m "refactor: lift import extraction into srclight.imports (indexer needs it without importing server)"`
+- [x] **Step 1: Move the code** (no behavior change, so the existing `TestExtractImports` suite in tests/test_new_tools.py IS the test — it already passes and must still pass, now exercising the moved module through server's re-import).
+- [x] **Step 2: Full suite** — `.venv/bin/python -m pytest -q` → all pass (existing import tests prove the move).
+- [x] **Step 3: Commit** — `git add src/srclight/imports.py src/srclight/server.py && git commit -m "refactor: lift import extraction into srclight.imports (indexer needs it without importing server)"`
 
 ---
 
