@@ -247,10 +247,10 @@ Chosen targets get edges with the existing `_compute_confidence` (unchanged) plu
 
 **Files:** Modify `scripts/measure_graph_precision.py`; regenerate `docs/graph-precision-report.md`.
 
-- [ ] **Step 1: Add tier distribution to `measure()`** — `"resolution_distribution": {tier: count}` via `SELECT resolution, COUNT(*) c FROM symbol_edges WHERE edge_type='calls' GROUP BY resolution`, and keep every existing metric so before/after compares.
-- [ ] **Step 2: Reindex + run** — `.venv/bin/srclight index . && .venv/bin/python scripts/measure_graph_precision.py .srclight/index.db --sample 500 --out docs/graph-precision-report.md`
-- [ ] **Step 3: THE GATE** — compare to baseline (62.5% ambiguity / 12.8% false-ref): ambiguity ≤30% and false-ref ≈0 → proceed. Otherwise STOP: commit the report with a `## Gate: FAILED` note, land a grain, report to Tim — no release.
-- [ ] **Step 4: Commit** — `git add scripts/measure_graph_precision.py docs/graph-precision-report.md && git commit -m "docs: graph precision re-measured after disambiguation (before/after)"`
+- [x] **Step 1: Add tier distribution to `measure()`** — `"resolution_distribution": {tier: count}` via `SELECT resolution, COUNT(*) c FROM symbol_edges WHERE edge_type='calls' GROUP BY resolution`, and keep every existing metric so before/after compares.
+- [x] **Step 2: Reindex + run** — `.venv/bin/srclight index . && .venv/bin/python scripts/measure_graph_precision.py .srclight/index.db --sample 500 --out docs/graph-precision-report.md`
+- [x] **Step 3: THE GATE** — compare to baseline (62.5% ambiguity / 12.8% false-ref): ambiguity ≤30% and false-ref ≈0 → proceed. Otherwise STOP: commit the report with a `## Gate: FAILED` note, land a grain, report to Tim — no release.
+- [x] **Step 4: Commit** — `git add scripts/measure_graph_precision.py docs/graph-precision-report.md && git commit -m "docs: graph precision re-measured after disambiguation (before/after)"`
 
 ---
 
