@@ -848,7 +848,7 @@ git commit -m "feat(scripts): graph precision harness — measure before AST inv
 **Interfaces:**
 - Consumes: Task 7's script; srclight's own index at `~/repos/srclight/srclight/.srclight/index.db` (reindex first so the data is current).
 
-- [ ] **Step 1: Reindex srclight itself, then run the harness**
+- [x] **Step 1: Reindex srclight itself, then run the harness**
 
 ```bash
 cd ~/repos/srclight/srclight
@@ -858,14 +858,14 @@ cd ~/repos/srclight/srclight
 
 Expected: JSON report printed; `docs/graph-precision-report.md` written. Record the headline numbers (ambiguity rate, false-reference rate, confidence distribution).
 
-- [ ] **Step 2: Commit the report**
+- [x] **Step 2: Commit the report**
 
 ```bash
 git add docs/graph-precision-report.md
 git commit -m "docs: graph precision report — the measure-first gate for AST work"
 ```
 
-- [ ] **Step 3: Surface the numbers**
+- [x] **Step 3: Surface the numbers**
 
 Print the three headline rates in the final summary for Tim and the pack — the AST-resolution decision (build/skip) is made FROM this report, not in this plan.
 
