@@ -73,3 +73,42 @@ def test_mtime_fast_path_does_not_read_the_file(repo, monkeypatch):
         raise AssertionError("read_bytes called on the fast path")
     monkeypatch.setattr(Path, "read_bytes", boom)
     assert file_freshness(db, root, ["src/a.py"]) == {"src/a.py": FRESH}
+
+
+# --- Task 2: summary + annotation ---
+
+from srclight.freshness import annotate, freshness_summary  # noqa: E402
+
+
+def test_summary_all_fresh_is_one_short_string():
+    assert freshness_summary({"a.py": FRESH, "b.py": FRESH}) == "verified-fresh"
+
+
+def test_summary_names_stale_files_and_caps_the_list():
+    statuses = {f"f{i}.py": STALE for i in range(15)}
+    s = freshness_summary(statuses, cap=10)
+    assert s["checked"] == 15
+    assert len(s["stale"]) == 11            # 10 paths + the "+5 more" sentinel
+    assert s["stale"][-1] == "+5 more"
+    assert "reindex" in s["note"].lower()
+
+
+def test_summary_reports_missing_and_not_indexed_separately():
+    s = freshness_summary({"gone.py": MISSING, "new.py": NOT_INDEXED})
+    assert s["missing_on_disk"] == ["gone.py"]
+    assert s["not_indexed"] == ["new.py"]
+
+
+def test_annotate_stamps_result_in_place(repo):
+    db, root = repo
+    result = {"symbol": "a"}
+    out = annotate(result, db, root, ["src/a.py"])
+    assert out is result
+    assert out["index_freshness"] == "verified-fresh"
+
+
+def test_annotate_verbose_when_stale(repo):
+    db, root = repo
+    (root / "src" / "a.py").write_text("changed\n")
+    out = annotate({}, db, root, ["src/a.py"])
+    assert out["index_freshness"]["stale"] == ["src/a.py"]

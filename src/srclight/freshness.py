@@ -30,7 +30,10 @@ STALE = "stale"
 MISSING = "missing_on_disk"
 NOT_INDEXED = "not_indexed"
 
-__all__ = ["FRESH", "STALE", "MISSING", "NOT_INDEXED", "file_freshness"]
+__all__ = [
+    "FRESH", "STALE", "MISSING", "NOT_INDEXED",
+    "file_freshness", "freshness_summary", "annotate",
+]
 
 
 def file_freshness(db: "Database", repo_root: Path, rel_paths: Iterable[str]) -> dict[str, str]:
@@ -63,3 +66,37 @@ def file_freshness(db: "Database", repo_root: Path, rel_paths: Iterable[str]) ->
             continue
         out[rel] = FRESH if content_hash(raw) == rec.content_hash else STALE
     return out
+
+
+def freshness_summary(statuses: dict[str, str], cap: int = 10) -> dict | str:
+    """One short string when all fresh; a bounded, explicit object otherwise.
+
+    The SIZE is bounded by the server, never by how much drifted (the mcpkit
+    error-cap lesson): lists cap at `cap` paths plus a "+N more" sentinel, and
+    `checked` keeps the exact total.
+    """
+    def bucket(status: str) -> list[str]:
+        hits = sorted(p for p, s in statuses.items() if s == status)
+        if len(hits) > cap:
+            return hits[:cap] + [f"+{len(hits) - cap} more"]
+        return hits
+
+    stale, missing, unknown = bucket(STALE), bucket(MISSING), bucket(NOT_INDEXED)
+    if not stale and not missing and not unknown:
+        return "verified-fresh"
+    return {
+        "checked": len(statuses),
+        "stale": stale,
+        "missing_on_disk": missing,
+        "not_indexed": unknown,
+        "note": (
+            "Results for stale/missing files describe the code AS INDEXED, not as it "
+            "is now. Reindex (`srclight index`) to refresh, or read the live file."
+        ),
+    }
+
+
+def annotate(result: dict, db: "Database", repo_root: Path, rel_paths: Iterable[str]) -> dict:
+    """Stamp result['index_freshness'] for the files this result draws on."""
+    result["index_freshness"] = freshness_summary(file_freshness(db, repo_root, set(rel_paths)))
+    return result

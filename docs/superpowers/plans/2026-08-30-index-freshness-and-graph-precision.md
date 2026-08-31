@@ -44,7 +44,7 @@
 - Consumes: `Database.get_file(path) -> FileRecord | None` (db.py:388), `content_hash(data: bytes) -> str` (db.py:1643), `FileRecord.content_hash`, `FileRecord.mtime`.
 - Produces: constants `FRESH = "fresh"`, `STALE = "stale"`, `MISSING = "missing_on_disk"`, `NOT_INDEXED = "not_indexed"`; function `file_freshness(db, repo_root: Path, rel_paths: Iterable[str]) -> dict[str, str]`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_freshness.py
@@ -124,12 +124,12 @@ def test_mtime_fast_path_does_not_read_the_file(repo, monkeypatch):
     assert file_freshness(db, root, ["src/a.py"]) == {"src/a.py": FRESH}
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest tests/test_freshness.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'srclight.freshness'`
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```python
 # src/srclight/freshness.py
@@ -195,12 +195,12 @@ def file_freshness(db: "Database", repo_root: Path, rel_paths: Iterable[str]) ->
     return out
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest tests/test_freshness.py -q`
 Expected: 6 passed
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/repos/srclight/srclight
@@ -220,7 +220,7 @@ git commit -m "feat(freshness): per-file index freshness — mtime fast path, ha
 - Consumes: Task 1's `file_freshness`, statuses.
 - Produces: `freshness_summary(statuses: dict[str, str], cap: int = 10) -> dict | str` — returns the string `"verified-fresh"` when everything is FRESH, else `{"stale": [...], "missing_on_disk": [...], "not_indexed": [...], "checked": N, "note": "..."}` with each list capped at `cap` (count preserved via `checked` and per-list `"+N more"` sentinel string as final element when capped); `annotate(result: dict, db, repo_root: Path, rel_paths: Iterable[str]) -> dict` — stamps `result["index_freshness"]` and returns result.
 
-- [ ] **Step 1: Write the failing tests (append to tests/test_freshness.py)**
+- [x] **Step 1: Write the failing tests (append to tests/test_freshness.py)**
 
 ```python
 from srclight.freshness import annotate, freshness_summary
@@ -260,12 +260,12 @@ def test_annotate_verbose_when_stale(repo):
     assert out["index_freshness"]["stale"] == ["src/a.py"]
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest tests/test_freshness.py -q`
 Expected: FAIL with `ImportError: cannot import name 'annotate'`
 
-- [ ] **Step 3: Write the implementation (append to freshness.py; add names to __all__)**
+- [x] **Step 3: Write the implementation (append to freshness.py; add names to __all__)**
 
 ```python
 def freshness_summary(statuses: dict[str, str], cap: int = 10) -> dict | str:
@@ -311,12 +311,12 @@ __all__ = [
 ]
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest tests/test_freshness.py -q`
 Expected: 11 passed
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/repos/srclight/srclight
