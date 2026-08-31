@@ -224,11 +224,11 @@ Chosen targets get edges with the existing `_compute_confidence` (unchanged) plu
 
 **Test sketch (tests/test_edge_resolution.py):** build a Database in tmp_path (open+initialize), upsert 3 files (`a.py`, `b.py`, `c.py`), insert symbols: `caller` in a.py whose content references `dup`, plus `dup` defined in a.py AND b.py (same-file tier wins → all edges from caller→dup have `resolution='same_file'` and target only a.py's dup); a second caller in c.py referencing `dup` (no same-file, two files → `name_only`, edges to BOTH); a symbol `solo` defined twice in b.py only (unique_file). Drive `Indexer` via its public index/edge-build path the way tests/test_indexer.py does (copy its fixture pattern — read that file first), or instantiate the indexer on a real tmp dir with three small .py files and let it index end-to-end, then assert on `symbol_edges` rows (join names) — end-to-end is PREFERRED (it also proves masking: put one reference in a comment and assert no edge).
 
-- [ ] **Step 1: Write failing tests** (end-to-end fixture per tests/test_indexer.py's pattern; assertions above + a comment-reference producing NO edge)
-- [ ] **Step 2: Verify fail** (no `resolution` column / all-candidates edges present)
-- [ ] **Step 3: Implement** (db.py column+record+insert+migration; indexer masking+selection)
-- [ ] **Step 4: Verify pass, full suite** (`get_dead_symbols` tests must still pass — selection only REDUCES spurious edges)
-- [ ] **Step 5: Commit** — `git add src/srclight/db.py src/srclight/indexer.py tests/test_edge_resolution.py && git commit -m "feat(graph): ranked single-target selection with per-edge resolution labels"`
+- [x] **Step 1: Write failing tests** (end-to-end fixture per tests/test_indexer.py's pattern; assertions above + a comment-reference producing NO edge)
+- [x] **Step 2: Verify fail** (no `resolution` column / all-candidates edges present)
+- [x] **Step 3: Implement** (db.py column+record+insert+migration; indexer masking+selection)
+- [x] **Step 4: Verify pass, full suite** (`get_dead_symbols` tests must still pass — selection only REDUCES spurious edges)
+- [x] **Step 5: Commit** — `git add src/srclight/db.py src/srclight/indexer.py tests/test_edge_resolution.py && git commit -m "feat(graph): ranked single-target selection with per-edge resolution labels"`
 
 ---
 
