@@ -256,9 +256,9 @@ Chosen targets get edges with the existing `_compute_confidence` (unchanged) plu
 
 ### Task 6: release 0.20.5 + closing grain
 
-- [ ] **Step 1: Full suite green**, bump `version = "0.20.4"` → `"0.20.5"` in pyproject.toml, commit `release: 0.20.5 — graph disambiguation (masking + ranked resolution labels)`.
-- [ ] **Step 2: Release chain** — push develop; `git checkout master && git merge --no-ff develop -m "Release 0.20.5: graph disambiguation"`; `git tag -a v0.20.5 -m "srclight v0.20.5: comment/string masking, ranked edge resolution"`; push master + tag; back to develop.
-- [ ] **Step 3: Closing grain** (pack_learn, dog=gromit, dimension=work, origin_repo=srclight/srclight, origin_commit=<release sha>): before/after numbers, tier distribution, what stayed `name_only`, and the SCIP-ingestion note as the only sanctioned path to more precision.
+- [x] **Step 1: Full suite green**, bump `version = "0.20.4"` → `"0.20.5"` in pyproject.toml, commit `release: 0.20.5 — graph disambiguation (masking + ranked resolution labels)`.
+- [x] **Step 2: Release chain** — push develop; `git checkout master && git merge --no-ff develop -m "Release 0.20.5: graph disambiguation"`; `git tag -a v0.20.5 -m "srclight v0.20.5: comment/string masking, ranked edge resolution"`; push master + tag; back to develop.
+- [x] **Step 3: Closing grain** (pack_learn, dog=gromit, dimension=work, origin_repo=srclight/srclight, origin_commit=<release sha>): before/after numbers, tier distribution, what stayed `name_only`, and the SCIP-ingestion note as the only sanctioned path to more precision.
 
 ## Self-Review Notes
 
