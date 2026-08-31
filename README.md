@@ -37,6 +37,19 @@ AI coding agents (Claude Code, Cursor, etc.) spend **40-60% of their tokens on o
 - **CLI** — index, search, and inspect from the terminal
 - **Auto-reindex** — git post-commit/post-checkout hooks keep indexes fresh
 
+## MCP argument validation
+
+Srclight's MCP server **refuses unknown tool arguments** instead of silently dropping them — a
+mistyped filter like `projects=` (for `project=`) is rejected with an error, never answered as if
+the constraint were applied. Every tool advertises `additionalProperties: false`. The guard is the
+shared [`mcpkit`](https://github.com/srclight/mcpkit) policy, vendored as one hash-verified file
+(`src/srclight/_mcpkit.py`).
+
+**AI agents:** if a call returns `unknown argument(s): … running older code than you think …
+reconnect`, the running server predates the argument you sent (a long-lived daemon serves the code
+it launched with). Nothing ran — check the reported revision and reconnect the MCP; don't retry the
+same call.
+
 ## Requirements
 
 - **Python 3.11+**

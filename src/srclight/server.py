@@ -2102,11 +2102,11 @@ def find_pattern(
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        matches = db.search_pattern(pattern, language=language, kind=kind, limit=limit)
+        matches = db.find_pattern_in_symbols(pattern, language=language, kind=kind, limit=limit)
         db.close()
     else:
         db = _get_db()
-        matches = db.search_pattern(pattern, language=language, kind=kind, limit=limit)
+        matches = db.find_pattern_in_symbols(pattern, language=language, kind=kind, limit=limit)
 
     # Group by file for readability
     by_file: dict[str, list[dict]] = {}
