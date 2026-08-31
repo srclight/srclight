@@ -16,10 +16,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver import MCPServer
 
-from ._mcpkit import StrictArgsMCP
 
 from .db import Database
 from .indexer import IndexConfig, Indexer
@@ -183,11 +181,12 @@ def _refresh_instructions() -> None:
 #     advertising a permissive contract and callers kept sending extras.
 # Two independent implementations of one 30-line policy were independently wrong -- which is the
 # argument for sharing it rather than copying it.
-#   regenerate: python -m mcpkit.vendor --out src/srclight/_mcpkit.py
-#   verify:     python -m mcpkit.vendor --check src/srclight/_mcpkit.py
 
-mcp = StrictArgsMCP(
-    "srclight",
+from ironmcp import strict_server
+
+mcp = strict_server(
+    name="srclight",
+    reconnect_hint="call index_status and reconnect the srclight MCP",
     instructions=_INSTRUCTIONS_TEMPLATE.format(
         dynamic_section="You have access to a code index with searchable symbols, call graphs, and git history.\n\n"
     ),
@@ -2811,7 +2810,7 @@ def detect_changes(
 def make_sse_and_streamable_http_app(mount_path: str | None = "/"):
     """Return a Starlette app serving both SSE and Streamable HTTP on one port (Cursor compatibility)."""
     streamable_app = mcp.streamable_http_app()
-    sse_app = mcp.sse_app(mount_path=mount_path)
+    sse_app = mcp.sse_app()
     sse_routes = [r for r in sse_app.routes if getattr(r, "path", None) in ("/sse", "/messages")]
     streamable_app.router.routes.extend(sse_routes)
     return streamable_app
@@ -2848,6 +2847,6 @@ def run_server(transport: str = "sse", port: int = 8742):
     if _server_start_time is None:
         _server_start_time = time.time()
     if transport == "sse":
-        mcp.settings.host = "127.0.0.1"
-        mcp.settings.port = port
-    mcp.run(transport=transport)
+        mcp.run(transport=transport, host="127.0.0.1", port=port)
+    else:
+        mcp.run(transport=transport)
