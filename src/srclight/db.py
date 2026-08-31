@@ -1509,21 +1509,25 @@ class Database:
         """Find symbols with no incoming edges — potential dead code.
 
         Returns symbols never referenced as a target in symbol_edges. Excludes
-        entry points, test code, and vendored paths. Two further exclusions keep
-        false positives down:
+        entry points, test code, and vendored paths.
 
+        * **Types ARE eligible** (struct/enum/interface/class): the reference
+          extractor links a symbol to any known symbol NAME appearing in its
+          content (EDGE_TARGET_KINDS includes the type kinds), so a used type
+          accumulates incoming edges and an unused one is genuinely detectable.
+          Verified empirically 2026-08-30 — an earlier version narrowed this to
+          callable kinds on the untested assumption that types get no edges,
+          which hid real dead types. CAVEAT for enum in C-like languages: members
+          can be used unqualified (`RED` without `Color` appearing), so an enum
+          reported here deserves a reference-check on its members before deletion.
         * **Public / exported symbols are excluded.** An absent incoming edge only
-          means nothing *in this index* calls it; a `public`/`export` symbol is
-          API surface reachable from outside the index, so it is not dead. Symbols
-          with unknown (NULL) visibility stay eligible.
-        * **Only callable kinds are considered** — `function`, `method`, `class`.
-          NOTE: this deliberately drops `struct`/`enum`/`interface`, so unused
-          types in C/C++/Rust/TS are no longer reported. Widen `allowed_kinds` if
-          multi-language type dead-code detection is wanted back.
+          means nothing *in this index* references it; a `public`/`export` symbol
+          is API surface reachable from outside the index, so it is not dead.
+          Symbols with unknown (NULL) visibility stay eligible.
         """
         assert self.conn is not None
 
-        allowed_kinds = ("function", "method", "class")
+        allowed_kinds = ("function", "method", "class", "struct", "enum", "interface")
         sql = """
             SELECT s.*, f.path as file_path
             FROM symbols s

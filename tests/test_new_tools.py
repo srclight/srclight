@@ -103,18 +103,28 @@ class TestFindDeadCode:
         assert "exported_fn" not in dead_names
         assert "private_fn" in dead_names
 
-    def test_only_relevant_kinds(self, db):
-        """Only function, method, class kinds are checked for dead code."""
+    def test_types_are_eligible_and_edges_decide(self, db):
+        """Types (struct/enum/interface) ARE checked for dead code — the reference
+        extractor creates edges to type names appearing in symbol content, so a
+        used type has incoming edges and an unused one is genuinely detectable.
+
+        This test previously asserted the opposite ("enum not in checked kinds"),
+        codifying an untested assumption that types get no edges; narrowing the
+        kinds on that basis hid real dead types (verified empirically 2026-08-30).
+        """
         fid = _insert_file(db)
-        _insert_symbol(db, fid, "MyEnum", kind="enum", start_line=1, end_line=5,
-                       content="enum MyEnum { A, B }")
-        _insert_symbol(db, fid, "my_func", kind="function", start_line=7, end_line=10)
+        used_id = _insert_symbol(db, fid, "UsedStruct", kind="struct", start_line=1, end_line=4,
+                                 content="struct UsedStruct { int x; }")
+        _insert_symbol(db, fid, "DeadStruct", kind="struct", start_line=6, end_line=9,
+                       content="struct DeadStruct { int y; }")
+        user_id = _insert_symbol(db, fid, "consumer", kind="function", start_line=11, end_line=14,
+                                 content="int consumer(struct UsedStruct s) { return s.x; }")
+        db.insert_edge(EdgeRecord(source_id=user_id, target_id=used_id, edge_type="calls"))
         db.commit()
 
-        dead = db.get_dead_symbols()
-        dead_names = [d.name for d in dead]
-        assert "MyEnum" not in dead_names  # enum not in checked kinds
-        assert "my_func" in dead_names
+        dead_names = [d.name for d in db.get_dead_symbols()]
+        assert "DeadStruct" in dead_names   # unreferenced type IS reported
+        assert "UsedStruct" not in dead_names  # referenced type is not
 
     def test_limit_respected(self, db):
         """get_dead_symbols respects the limit parameter."""
