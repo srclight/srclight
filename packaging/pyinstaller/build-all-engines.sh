@@ -16,7 +16,7 @@
 # Options:
 #   --app-dir PATH    Path to srclight-app (default: ../srclight-app relative to repo)
 #   --mac-host HOST   Mac Mini SSH host (default: tim@10.1.10.103)
-#   --mac-repo PATH   Srclight repo on Mac (default: ~/Projects/srclight/srclight)
+#   --mac-repo PATH   Srclight repo on Mac (default: ~/repos/srclight/srclight)
 #   --skip-linux      Skip Linux engine build
 #   --skip-macos      Skip macOS engine build
 #   --skip-venv       Pass SKIP_VENV=1 to build-engine.sh (use existing venv)
@@ -36,7 +36,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Defaults
 APP_DIR=""
 MAC_HOST="tim@10.1.10.103"
-MAC_REPO="\$HOME/Projects/srclight/srclight"
+MAC_REPO="\$HOME/repos/srclight/srclight"
 DO_LINUX=true
 DO_MACOS=true
 SKIP_VENV=0

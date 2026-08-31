@@ -1503,15 +1503,27 @@ class Database:
 
         return None
 
-    def get_dead_symbols(self, kind: str | None = None) -> list[SymbolRecord]:
+    def get_dead_symbols(
+        self, kind: str | None = None, limit: int | None = None
+    ) -> list[SymbolRecord]:
         """Find symbols with no incoming edges — potential dead code.
 
-        Returns symbols that are never referenced as a target in symbol_edges.
-        Excludes entry points, test code, vendored paths, and non-code kinds.
+        Returns symbols never referenced as a target in symbol_edges. Excludes
+        entry points, test code, and vendored paths. Two further exclusions keep
+        false positives down:
+
+        * **Public / exported symbols are excluded.** An absent incoming edge only
+          means nothing *in this index* calls it; a `public`/`export` symbol is
+          API surface reachable from outside the index, so it is not dead. Symbols
+          with unknown (NULL) visibility stay eligible.
+        * **Only callable kinds are considered** — `function`, `method`, `class`.
+          NOTE: this deliberately drops `struct`/`enum`/`interface`, so unused
+          types in C/C++/Rust/TS are no longer reported. Widen `allowed_kinds` if
+          multi-language type dead-code detection is wanted back.
         """
         assert self.conn is not None
 
-        allowed_kinds = ("function", "method", "class", "struct", "enum", "interface")
+        allowed_kinds = ("function", "method", "class")
         sql = """
             SELECT s.*, f.path as file_path
             FROM symbols s
@@ -1519,6 +1531,7 @@ class Database:
             LEFT JOIN symbol_edges e ON e.target_id = s.id
             WHERE e.id IS NULL
               AND s.kind IN ({kinds})
+              AND (s.visibility IS NULL OR s.visibility NOT IN ('public', 'export'))
               AND s.name NOT LIKE 'test\\_%' ESCAPE '\\'
               AND s.name NOT LIKE 'Test%'
               AND s.name NOT IN ('main', '__init__', '__main__', '__new__', '__del__')
@@ -1536,10 +1549,14 @@ class Database:
 
         sql += "ORDER BY f.path, s.start_line"
 
+        if limit is not None:
+            sql += "\nLIMIT ?"
+            params.append(limit)
+
         rows = self.conn.execute(sql, params).fetchall()
         return [self._row_to_symbol(r) for r in rows]
 
-    def search_pattern(
+    def find_pattern_in_symbols(
         self,
         pattern: str,
         language: str | None = None,
@@ -1550,7 +1567,9 @@ class Database:
 
         Fetches candidate symbols from the database (filtered by language/kind),
         then applies the regex in Python against each symbol's content field.
-        Returns matching symbols with match context.
+        Each result carries ``match_count`` (how many lines in the symbol matched)
+        and ``matched_lines`` — per matching line, its offset within the symbol,
+        its absolute file line, the line text, and the substring the pattern hit.
         """
         assert self.conn is not None
 
@@ -1582,21 +1601,19 @@ class Database:
             if not content:
                 continue
 
-            matches = []
+            matched_lines = []
             lines = content.split("\n")
             for i, line in enumerate(lines):
-                if compiled.search(line):
-                    # Build snippet: matching line + 1 line context each side
-                    start = max(0, i - 1)
-                    end = min(len(lines), i + 2)
-                    snippet = "\n".join(lines[start:end])
-                    matches.append({
-                        "line_offset": i + 1,  # 1-based within symbol
+                m = compiled.search(line)
+                if m:
+                    matched_lines.append({
+                        "line_offset": i + 1,              # 1-based within the symbol
                         "absolute_line": row["start_line"] + i,
-                        "snippet": snippet,
+                        "line": line,                      # the matching source line
+                        "match": m.group(0),               # the substring the pattern matched
                     })
 
-            if matches:
+            if matched_lines:
                 sym = self._row_to_symbol(row)
                 results.append({
                     "name": sym.name,
@@ -1606,7 +1623,8 @@ class Database:
                     "start_line": sym.start_line,
                     "end_line": sym.end_line,
                     "language": row["language"],
-                    "matches": matches,
+                    "match_count": len(matched_lines),
+                    "matched_lines": matched_lines,
                 })
                 if len(results) >= limit:
                     break

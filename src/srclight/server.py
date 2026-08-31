@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+
+from ._mcpkit import StrictArgsMCP
 
 from .db import Database
 from .indexer import IndexConfig, Indexer
@@ -171,7 +174,19 @@ def _refresh_instructions() -> None:
         pass  # Keep existing instructions on error
 
 
-mcp = FastMCP(
+# Shared estate policy, vendored as a single generated file (mcpkit). This REPLACES the
+# hand-written _StrictArgsMCP that shipped in 4fa3bee, which carried two defects the shared
+# version has since fixed:
+#   * it treated an EMPTY property set as "schema unknown" and skipped the check, so all five
+#     zero-parameter tools (index_status among them) still accepted anything, silently;
+#   * it refused at runtime but never stamped additionalProperties:false, so all 42 tools kept
+#     advertising a permissive contract and callers kept sending extras.
+# Two independent implementations of one 30-line policy were independently wrong -- which is the
+# argument for sharing it rather than copying it.
+#   regenerate: python -m mcpkit.vendor --out src/srclight/_mcpkit.py
+#   verify:     python -m mcpkit.vendor --check src/srclight/_mcpkit.py
+
+mcp = StrictArgsMCP(
     "srclight",
     instructions=_INSTRUCTIONS_TEMPLATE.format(
         dynamic_section="You have access to a code index with searchable symbols, call graphs, and git history.\n\n"
@@ -2087,11 +2102,11 @@ def find_pattern(
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        matches = db.search_pattern(pattern, language=language, kind=kind, limit=limit)
+        matches = db.find_pattern_in_symbols(pattern, language=language, kind=kind, limit=limit)
         db.close()
     else:
         db = _get_db()
-        matches = db.search_pattern(pattern, language=language, kind=kind, limit=limit)
+        matches = db.find_pattern_in_symbols(pattern, language=language, kind=kind, limit=limit)
 
     # Group by file for readability
     by_file: dict[str, list[dict]] = {}

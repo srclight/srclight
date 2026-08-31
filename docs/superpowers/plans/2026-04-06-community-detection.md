@@ -41,7 +41,7 @@ In `pyproject.toml`, add `networkx` to the dependencies list:
 
 - [ ] **Step 2: Install**
 
-Run: `cd /home/tim/Projects/srclight/srclight && .venv/bin/pip install -e .`
+Run: `cd /home/tim/repos/srclight/srclight && .venv/bin/pip install -e .`
 
 - [ ] **Step 3: Write failing test for community detection on a small graph**
 
@@ -1748,7 +1748,7 @@ git commit -m "feat: add 4 MCP tools for communities, flows, and impact"
 - [ ] **Step 1: Run community detection on srclight's own index**
 
 ```bash
-cd /home/tim/Projects/srclight/srclight
+cd /home/tim/repos/srclight/srclight
 .venv/bin/python -c "
 from srclight.db import Database
 from srclight.community import detect_communities, trace_execution_flows
@@ -1792,7 +1792,7 @@ from srclight.db import Database
 from srclight.community import detect_communities
 import time
 
-db = Database('/home/tim/Projects/loqu8/bitcoin/.srclight/index.db')
+db = Database('/home/tim/repos/loqu8/bitcoin/.srclight/index.db')
 db.open()
 
 t0 = time.monotonic()

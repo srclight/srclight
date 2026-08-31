@@ -37,6 +37,19 @@ AI coding agents (Claude Code, Cursor, etc.) spend **40-60% of their tokens on o
 - **CLI** — index, search, and inspect from the terminal
 - **Auto-reindex** — git post-commit/post-checkout hooks keep indexes fresh
 
+## MCP argument validation
+
+Srclight's MCP server **refuses unknown tool arguments** instead of silently dropping them — a
+mistyped filter like `projects=` (for `project=`) is rejected with an error, never answered as if
+the constraint were applied. Every tool advertises `additionalProperties: false`. The guard is the
+shared [`mcpkit`](https://github.com/srclight/mcpkit) policy, vendored as one hash-verified file
+(`src/srclight/_mcpkit.py`).
+
+**AI agents:** if a call returns `unknown argument(s): … running older code than you think …
+reconnect`, the running server predates the argument you sent (a long-lived daemon serves the code
+it launched with). Nothing ran — check the reported revision and reconnect the MCP; don't retry the
+same call.
+
 ## Requirements
 
 - **Python 3.11+**
@@ -352,6 +365,86 @@ Srclight exposes 42 MCP tools organized in seven tiers. The MCP server includes 
 | `restart_server()` | Request server restart (SSE only) |
 
 In workspace mode, `search_symbols`, `get_symbol`, `codebase_map`, and `hybrid_search` accept an optional `project` filter. Graph/git/build/community tools require `project` in workspace mode.
+
+## Strict Argument Validation
+
+**Since v0.20.2, srclight refuses unknown tool arguments instead of silently discarding them.**
+This is a deliberate behaviour change and it can break callers that were previously sending extra
+keys without noticing.
+
+### Why
+
+The MCP Python SDK's FastMCP drops arguments that are not in a tool's signature, and it does so
+*before* the tool function runs. Combined with an `inputSchema` that omitted
+`additionalProperties: false`, a mistyped argument produced a confident wrong answer rather than an
+error. Measured on this server:
+
+```
+search_symbols(query="main", project="zhcorpus")    ->  20 hits, all from zhcorpus
+search_symbols(query="main", projects="zhcorpus")   ->  20 hits, ZERO from zhcorpus
+                                                        (19 from "bible", 1 from "bank-scraper")
+```
+
+One added letter. No error, identical hit count, identical result shape, real symbols — from repos
+the caller never asked about. That is not a lossy call, it is a wrong one, and the caller has no
+way to learn their filter was ignored.
+
+### What changed
+
+- **Unknown arguments now return an error** naming the offending key, the accepted set, and stating
+  that nothing was executed. The tool body is never entered.
+- **Every tool advertises `additionalProperties: false`** in `tools/list`, so the catalog matches
+  what the runtime enforces. Previously the runtime and the advertised schema disagreed.
+- **Zero-parameter tools are closed too** (`index_status`, `codebase_map`, and three others). An
+  empty property set means "this tool takes no arguments", not "anything goes".
+
+### Scope: top-level arguments
+
+This validates the **top-level** argument object. An argument that is itself a structured object is
+validated by its own model, which this layer does not descend into. No srclight tool currently takes
+an object argument, so the distinction is not reachable here today — but the guarantee is
+"top-level", and a future tool taking a typed nested model would need `extra="forbid"` on that model
+to get the same protection.
+
+### If this breaks your caller
+
+The error names exactly what it received and what the tool accepts:
+
+```
+unknown argument(s): projects. Tool 'search_symbols' accepts: kind, limit, project, query.
+Nothing was executed and no result was computed.
+```
+
+Fix the argument name. If you believe the argument *should* exist, the server may be running older
+code than you expect — check its reported revision and reconnect.
+
+**If you cannot update your caller right now**, pin the previous behaviour and update when you can:
+
+```
+pip install "srclight<0.20.2"
+```
+
+That is a deliberate escape hatch, not an endorsement — the older versions still return wrong
+answers for mistyped filters, silently. Prefer fixing the argument name.
+
+### For contributors
+
+The policy lives in `src/srclight/_mcpkit.py`, a **generated single-file build** of
+[mcpkit](https://github.com/srclight/mcpkit), shared across this estate's MCP servers so one policy
+is not reimplemented per repo. **Do not hand-edit it** — it carries a `sha256` of its own body and
+a verifier will reject a modified copy.
+
+```bash
+python -m mcpkit.vendor --out src/srclight/_mcpkit.py    # regenerate from upstream
+python -m mcpkit.vendor --check src/srclight/_mcpkit.py  # verify it is unmodified
+```
+
+It adds **no runtime dependency** — the file is vendored, not installed, so `pip install srclight`
+is unaffected. mcpkit is only needed to regenerate it.
+
+`tests/test_strict_args.py` is a smoke test asserting that `srclight.server.mcp` *itself* enforces
+the policy — not a freshly constructed lookalike. If `server.py` were reverted to a bare `FastMCP`
+while `_mcpkit.py` sat unused in the tree, that test is the only one that would fail.
 
 ## Deployment Guide
 
