@@ -36,3 +36,4 @@ CLAUDE.md
 # Plans and roadmaps stay in Vault; do not commit
 PLAN.md
 .claude/
+.venv-ironmcp/

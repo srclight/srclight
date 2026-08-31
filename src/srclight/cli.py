@@ -284,16 +284,14 @@ def serve(db_path: str | None, workspace_name: str | None, transport: str, port:
         from .web import add_web_routes
         app = make_sse_and_streamable_http_app(mount_path="/")
         add_web_routes(app)
-        server_mod.mcp.settings.host = "127.0.0.1"
-        server_mod.mcp.settings.port = port
         import uvicorn
         log_level = getattr(server_mod.mcp.settings, "log_level", "info")
         if isinstance(log_level, str):
             log_level = log_level.lower()
         config = uvicorn.Config(
             app,
-            host=server_mod.mcp.settings.host,
-            port=server_mod.mcp.settings.port,
+            host="127.0.0.1",
+            port=port,
             log_level=log_level,
         )
 
