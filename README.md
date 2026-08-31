@@ -50,6 +50,21 @@ reconnect`, the running server predates the argument you sent (a long-lived daem
 it launched with). Nothing ran — check the reported revision and reconnect the MCP; don't retry the
 same call.
 
+## Index freshness
+
+Every symbol/graph result carries `index_freshness`: the short string
+`"verified-fresh"` when the files behind the answer are byte-identical to what
+was indexed, or a bounded object naming which files are `stale`, missing, or
+not indexed. `check_freshness(paths?)` probes any paths — or the whole index —
+on demand (unchanged files cost one `stat` each; never writes), and
+`index_status` reports whole-index `checked`/`stale_count`.
+
+**AI agents:** a result stamped stale describes the code **as indexed**, not as
+it is now — reindex (`srclight index`) or read the live file before acting on
+line numbers or bodies from it. `"verified-fresh"` is the affirmative signal;
+its absence on a workspace-mode result means freshness was not checkable for
+that result, never that it is fresh.
+
 ## Requirements
 
 - **Python 3.11+**

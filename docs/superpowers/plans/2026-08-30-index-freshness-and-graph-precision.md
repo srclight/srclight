@@ -624,7 +624,7 @@ git commit -m "feat(freshness): graph tools + index_status carry freshness"
 
 **Interfaces:** none (docs only).
 
-- [ ] **Step 1: Write the section**
+- [x] **Step 1: Write the section**
 
 ```markdown
 ## Index freshness
@@ -642,7 +642,7 @@ its absence on a workspace-mode result means freshness was not checkable for
 that result, never that it is fresh.
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 cd ~/repos/srclight/srclight
