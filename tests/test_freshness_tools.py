@@ -49,3 +49,39 @@ def test_check_freshness_reports_the_edited_file(wired_repo):
 def test_check_freshness_specific_paths(wired_repo):
     res = json.loads(_run(server.check_freshness(paths=["main.py", "ghost.py"])))
     assert res["index_freshness"]["not_indexed"] == ["ghost.py"]
+
+
+# --- Task 4: stamps in symbol-reading tools ---
+
+def _index_symbol(db, root):
+    """Give the index one symbol in main.py so symbol tools return it."""
+    from srclight.db import SymbolRecord
+    fid = db.get_file("main.py").id
+    db.insert_symbol(SymbolRecord(
+        file_id=fid, kind="function", name="main",
+        start_line=1, end_line=1, content="def main(): pass",
+        line_count=1,
+    ), "main.py")
+    db.commit()
+
+
+def test_get_symbol_carries_freshness(wired_repo):
+    db, root = wired_repo
+    _index_symbol(db, root)
+    res = json.loads(_run(server.get_symbol(name="main")))
+    assert res["index_freshness"] == "verified-fresh"
+
+
+def test_get_symbol_flags_stale_source_file(wired_repo):
+    db, root = wired_repo
+    _index_symbol(db, root)
+    (root / "main.py").write_text("def main(): pass  # drifted\n")
+    res = json.loads(_run(server.get_symbol(name="main")))
+    assert res["index_freshness"]["stale"] == ["main.py"]
+
+
+def test_search_symbols_carries_freshness(wired_repo):
+    db, root = wired_repo
+    _index_symbol(db, root)
+    res = json.loads(_run(server.search_symbols(query="main")))
+    assert "index_freshness" in res

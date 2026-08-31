@@ -494,7 +494,7 @@ git commit -m "feat(freshness): check_freshness probe tool — whole-index or pe
 
 (The variable naming differs per tool — `matches`, `symbols`, `results`; the implementer reads each tool body and collects whatever key holds the repo-relative path. Where a tool renders a single symbol (`get_symbol`, `get_signature`), the set is that one file.)
 
-- [ ] **Step 1: Write the failing tests (append to tests/test_freshness_tools.py)**
+- [x] **Step 1: Write the failing tests (append to tests/test_freshness_tools.py)**
 
 ```python
 def _index_symbol(db, root):
@@ -531,21 +531,21 @@ def test_search_symbols_carries_freshness(wired_repo):
     assert "index_freshness" in res
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest tests/test_freshness_tools.py -q`
 Expected: new tests FAIL with `KeyError: 'index_freshness'` (existing 3 still pass)
 
-- [ ] **Step 3: Implement the stamp in the five tools**
+- [x] **Step 3: Implement the stamp in the five tools**
 
 Read each tool body in `server.py` (`get_symbol`, `get_signature`, `symbols_in_file`, `search_symbols`, `hybrid_search`), locate its final result-dict construction, collect the repo-relative file paths its rows carry, and apply the pattern above. `symbols_in_file` takes the file path as its own argument — stamp with exactly that path.
 
-- [ ] **Step 4: Run the full suite**
+- [x] **Step 4: Run the full suite**
 
 Run: `~/repos/srclight/srclight/.venv/bin/python -m pytest -q`
 Expected: all pass, 0 failed. If an existing tool test fails on an unexpected `index_freshness` key, that test asserted full-dict equality — extend the expected dict, do not weaken the stamp.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/repos/srclight/srclight
