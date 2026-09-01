@@ -1741,7 +1741,8 @@ def embedding_health(project: str | None = None) -> str:
     """Check if the configured embedding provider is reachable.
 
     Uses embedding_stats() to find the active model, then performs a
-    lightweight provider-specific health check (e.g. Ollama /api/tags).
+    lightweight provider-specific health check (e.g. Ollama /api/tags), and
+    for Ollama also reports whether the model is resident in memory (/api/ps).
     Returns a JSON blob with status, model, and any error message so
     clients can surface problems instead of silently degrading.
     """
@@ -1779,6 +1780,26 @@ def embedding_health(project: str | None = None) -> str:
             result["reachable"] = ok
             if ok:
                 result["status"] = "ok"
+                # Pulled != resident. With OLLAMA_MAX_LOADED_MODELS=1 another
+                # client's model evicts ours; the next embed pays a cold load
+                # (9 GB qwen3-embedding: 16-18 s from disk) that can exceed
+                # the request timeout — and the timeout aborts the load, so
+                # back-to-back queries thrash. Surface it so agents don't
+                # read "ok" as "warm". (Incident 2026-08-31.)
+                is_loaded = getattr(provider, "is_loaded", None)
+                if callable(is_loaded):
+                    resident = is_loaded()
+                    result["resident"] = resident
+                    if resident is False:
+                        from .embeddings import _embed_request_timeout
+                        result["warning"] = (
+                            "Model is pulled but not resident in Ollama memory; "
+                            "the next embed pays a cold load that may exceed "
+                            f"SRCLIGHT_EMBED_REQUEST_TIMEOUT={_embed_request_timeout()}s "
+                            "(hybrid_search then falls back to keyword-only). "
+                            "Check for OLLAMA_MAX_LOADED_MODELS=1 with other clients "
+                            "using different models."
+                        )
             else:
                 result["status"] = "error"
                 result["error"] = "Embedding provider reported is_available() == False"

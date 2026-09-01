@@ -171,6 +171,27 @@ class OllamaProvider(EmbeddingProvider):
         except Exception:
             return False
 
+    def is_loaded(self) -> bool | None:
+        """Is the model currently resident in Ollama's memory (/api/ps)?
+
+        Distinct from is_available(): a model can be pulled (/api/tags) but
+        evicted from VRAM — e.g. Ollama runs OLLAMA_MAX_LOADED_MODELS=1 and
+        another client just used a different model. The next embed then pays
+        a cold load that can exceed SRCLIGHT_EMBED_REQUEST_TIMEOUT, and the
+        timeout aborts the load, so back-to-back queries thrash. Returns None
+        if Ollama cannot be reached.
+        """
+        try:
+            url = f"{self._base_url}/api/ps"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+        except Exception:
+            return None
+        loaded = {m.get("name", "") for m in data.get("models", [])}
+        want = self._model if ":" in self._model else f"{self._model}:latest"
+        return want in loaded
+
     def list_models(self) -> list[str]:
         """List available Ollama models."""
         try:
