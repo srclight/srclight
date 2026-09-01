@@ -411,3 +411,48 @@ def test_db_embeddings_incremental(tmp_path):
     assert needing[0]["id"] == sym_id
 
     db.close()
+
+
+# --- Ollama residency (is the model actually loaded, not just pulled?) ---
+#
+# Ollama with OLLAMA_MAX_LOADED_MODELS=1 evicts our model whenever another
+# client uses a different one; the next embed then pays a cold load that can
+# exceed SRCLIGHT_EMBED_REQUEST_TIMEOUT. /api/tags (is_available) cannot see
+# this — only /api/ps can.
+
+
+def _fake_urlopen(payload: dict):
+    import io
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _open(req, timeout=None):
+        yield io.BytesIO(__import__("json").dumps(payload).encode())
+
+    return _open
+
+
+def test_ollama_is_loaded_true_when_model_in_ps():
+    provider = OllamaProvider("qwen3-embedding")
+    with patch("urllib.request.urlopen", _fake_urlopen({"models": [{"name": "qwen3-embedding:latest"}]})):
+        assert provider.is_loaded() is True
+
+
+def test_ollama_is_loaded_false_when_other_model_resident():
+    provider = OllamaProvider("qwen3-embedding")
+    with patch("urllib.request.urlopen", _fake_urlopen({"models": [{"name": "qwen3-embedding:0.6b"}]})):
+        assert provider.is_loaded() is False
+
+
+def test_ollama_is_loaded_tagged_model_exact_match():
+    provider = OllamaProvider("qwen3-embedding:0.6b")
+    with patch("urllib.request.urlopen", _fake_urlopen({"models": [{"name": "qwen3-embedding:0.6b"}]})):
+        assert provider.is_loaded() is True
+
+
+def test_ollama_is_loaded_none_when_unreachable():
+    provider = OllamaProvider("qwen3-embedding")
+    def _boom(req, timeout=None):
+        raise OSError("connection refused")
+    with patch("urllib.request.urlopen", _boom):
+        assert provider.is_loaded() is None

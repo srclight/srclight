@@ -478,6 +478,16 @@ If you need a longer embed timeout (e.g. for slow Ollama on first load), set:
 export SRCLIGHT_EMBED_REQUEST_TIMEOUT=45
 ```
 
+**Pulled is not resident.** `embedding_health` reports `resident: false` when the
+model is installed but not currently loaded in Ollama's memory. That happens when
+Ollama runs with `OLLAMA_MAX_LOADED_MODELS=1` (its default on some installs) and
+another client uses a different model — Ollama evicts yours, and the next embed pays
+a cold load (a 9 GB `qwen3-embedding` takes 16–18 s from disk) that can exceed the
+timeout. Worse, the timeout closes the connection and Ollama aborts the load, so
+back-to-back queries never get warm. Fixes, in order of effectiveness: raise
+`OLLAMA_MAX_LOADED_MODELS` so both models fit; raise `SRCLIGHT_EMBED_REQUEST_TIMEOUT`
+(60 s covers a disk-cold load); or have all local clients share one embedding model.
+
 Then start Cursor (or start srclight with that env in its process).
 
 ### Semantic search returning stale results
