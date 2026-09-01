@@ -486,7 +486,14 @@ a cold load (a 9 GB `qwen3-embedding` takes 16–18 s from disk) that can exceed
 timeout. Worse, the timeout closes the connection and Ollama aborts the load, so
 back-to-back queries never get warm. Fixes, in order of effectiveness: raise
 `OLLAMA_MAX_LOADED_MODELS` so both models fit; raise `SRCLIGHT_EMBED_REQUEST_TIMEOUT`
-(60 s covers a disk-cold load); or have all local clients share one embedding model.
+(60 s covers a disk-cold load; 120 s if a large generative model can be evicted first); or
+have all local clients share one embedding model. Batch jobs on the same GPU should yield to
+interactive callers on their own (watch Ollama's request log, pass a short `keep_alive`).
+
+**The Ollama desktop app's context length overrides `OLLAMA_CONTEXT_LENGTH`.** On Ollama 0.32 the
+app's Settings → Context length (stored in its own database) is what the server applies to any API
+call that omits `num_ctx`. A 256K setting makes a 27B model predict ~100 GiB of KV cache, evict every
+resident model, and spill to CPU. Keep the app setting modest (64K) and pass `num_ctx` per request.
 
 Then start Cursor (or start srclight with that env in its process).
 
