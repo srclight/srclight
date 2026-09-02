@@ -51,6 +51,16 @@ def _dashboard_html() -> str:
       --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Roboto, Helvetica, Arial, sans-serif;
     }
 
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f7f7f5; --bg-card: #ffffff; --bg-card-hover: #f3f3ee;
+        --text: #1c1917; --text-dim: #57534e; --text-faint: #78716c; --border: #e7e5e4;
+        --green: #237a36; --green-dim: rgba(35,122,54,0.12); --red: #c42b2b; --red-dim: rgba(196,43,43,0.10);
+        --amber-dim: rgba(245,158,11,0.18);
+      }
+      .wordmark .light { color: #1c1917; }
+      .section-title { color: #57534e; }
+    }
     html { font-size: 15px; }
     body {
       font-family: var(--sans);
@@ -264,6 +274,25 @@ def _dashboard_html() -> str:
     body.is-down .stat-value, body.is-down .info-value, body.is-down .stats-sub { opacity: 0.4; }
     .dim { color: var(--text-dim); }
 
+    /* -- Activity feed -- */
+    .activity { font-family: var(--mono); font-size: 0.78rem; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-card); overflow: hidden; }
+    .act-row { display: grid; grid-template-columns: 5.5em 9em minmax(90px, 1fr) minmax(120px, 2fr); gap: 12px; padding: 6px 14px; border-bottom: 1px solid var(--border); align-items: baseline; }
+    .act-row:last-child { border-bottom: none; }
+    .act-time { color: var(--text-faint); }
+    .act-tool { color: var(--amber); }
+    .act-proj { color: var(--text-dim); cursor: pointer; }
+    .act-proj:hover { color: var(--text); text-decoration: underline; }
+    .act-q { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .act-empty { padding: 12px 14px; color: var(--text-dim); font-family: var(--sans); font-size: 0.82rem; }
+    .proj-row.selected { box-shadow: inset 3px 0 0 var(--amber); }
+
+    @media print {
+      #searchSection, #connectSection, #alertBox, .proj-toolbar, .server-actions, footer, #workspaceSelect { display: none !important; }
+      body { background: #fff; color: #111; }
+      .proj-row.problem { break-inside: avoid; }
+      .proj-row.problem .proj-detail { display: block; }
+    }
+
     /* -- Responsive -- */
     @media (max-width: 900px) {
       .proj-row, .proj-head { grid-template-columns: minmax(120px, 2fr) repeat(2, minmax(60px, 1fr)) minmax(100px, 1fr) minmax(90px, 1fr); }
@@ -323,7 +352,7 @@ def _dashboard_html() -> str:
         <div>
           <div class="stat-value is-loading" id="statFiles">—</div>
           <div class="stat-label">Files</div>
-          <div class="stat-sub"></div>
+          <div class="stat-sub" id="statFilesSub"></div>
         </div>
         <div>
           <div class="stat-value is-loading" id="statSymbols">—</div>
@@ -333,7 +362,7 @@ def _dashboard_html() -> str:
         <div>
           <div class="stat-value is-loading" id="statEdges">—</div>
           <div class="stat-label">Edges</div>
-          <div class="stat-sub"></div>
+          <div class="stat-sub" id="statEdgesSub"></div>
         </div>
         <div>
           <div class="stat-value is-loading" id="statEmbedded">—</div>
@@ -342,6 +371,7 @@ def _dashboard_html() -> str:
         </div>
       </div>
       <div class="stats-sub" id="statsSub"></div>
+      <div class="stats-sub" id="statsDegraded" style="color: var(--amber); margin-top: 4px;"></div>
     </div>
   </section>
 
@@ -351,11 +381,11 @@ def _dashboard_html() -> str:
     <section class="section" id="searchSection">
       <div class="section-head">
         <div class="section-title">Search</div>
-        <div class="section-note">One hit here is proof the index answers.</div>
+        <div class="section-note">Same index your AI uses.</div>
       </div>
       <div class="search-box">
         <input type="text" class="search-input" id="searchInput" aria-label="Search symbols"
-               placeholder="Symbol name, code fragment, or a concept in plain words" autocomplete="off">
+               placeholder="Symbol, path, or a concept" autocomplete="off">
         <select id="searchMode" aria-label="Search mode" title="Search mode">
           <option value="hybrid">Hybrid</option>
           <option value="keyword">Keyword</option>
@@ -363,11 +393,20 @@ def _dashboard_html() -> str:
         <button class="btn btn-primary" id="btnSearch" type="button">Search</button>
       </div>
       <div class="search-help">
-        <b>Hybrid</b> = full-text + embeddings (needs the embedding provider). <b>Keyword</b> = full-text only, works even if it is down.
-        Press <kbd>/</kbd> to focus. Click a file:line to copy it.
+        <b>Hybrid</b> is full-text plus embeddings. <b>Keyword</b> is full-text only; use it if Hybrid stalls right after a restart.
+        <kbd>/</kbd> focuses. Click a path to copy it.
       </div>
       <div class="search-meta hidden" id="searchMeta"></div>
       <div class="search-results" id="searchResults"></div>
+    </section>
+
+    <!-- Recent agent activity -->
+    <section class="section" id="activitySection">
+      <div class="section-head">
+        <div class="section-title">Recent agent activity</div>
+        <div class="section-note" id="activityNote"></div>
+      </div>
+      <div class="activity" id="activityList"><div class="act-empty">Loading…</div></div>
     </section>
 
     <!-- Projects -->
@@ -379,7 +418,7 @@ def _dashboard_html() -> str:
       <div class="proj-toolbar" id="projToolbar">
         <input type="search" id="projectFilter" aria-label="Filter projects" placeholder="Filter by name or path" autocomplete="off">
         <select id="projectSort" aria-label="Sort projects" title="Sort">
-          <option value="attention">Needs attention first</option>
+          <option value="attention">Needs attention</option>
           <option value="symbols">Most symbols</option>
           <option value="files">Most files</option>
           <option value="edges">Most edges</option>
@@ -412,8 +451,8 @@ def _dashboard_html() -> str:
         </div>
       </summary>
       <p class="section-note" style="margin-top: 10px;">
-        Add srclight to your AI tool so it can search this index, trace call graphs, and read git history.
-        Pick your tool, copy the snippet into the config file shown, restart the tool.
+        Pick your tool, copy the snippet into the file shown, restart the tool.
+        It will then search this index, follow call graphs, and read git history.
       </p>
       <div class="connect-tabs" id="connectTabs">
         <button class="btn btn-secondary btn-sm connect-tab" data-client="claude_code" type="button" aria-pressed="false" disabled>Claude Code</button>
@@ -438,7 +477,6 @@ def _dashboard_html() -> str:
     <section class="section" id="serverSection">
       <div class="section-head">
         <div class="section-title">Server</div>
-        <div class="section-note" id="serverNote"></div>
       </div>
       <div class="info-grid">
         <div class="info-card">
@@ -446,16 +484,8 @@ def _dashboard_html() -> str:
           <div class="info-value" id="infoMcpUrl">—</div>
         </div>
         <div class="info-card">
-          <div class="info-label">Embedding model</div>
-          <div class="info-value" id="infoEmbedModel">—</div>
-        </div>
-        <div class="info-card">
-          <div class="info-label">Embedding health</div>
+          <div class="info-label">Embeddings</div>
           <div class="info-value" id="infoEmbedHealth">—</div>
-        </div>
-        <div class="info-card">
-          <div class="info-label">Index freshness</div>
-          <div class="info-value" id="infoFreshness">—</div>
         </div>
         <div class="info-card">
           <div class="info-label">Build</div>
@@ -463,7 +493,7 @@ def _dashboard_html() -> str:
         </div>
       </div>
       <div class="server-actions">
-        <button class="btn-text" id="btnRestart" type="button">Restart server</button>
+        <button class="btn btn-secondary btn-sm" id="btnRestart" type="button">Restart server</button>
         <span id="restartMsg"></span>
       </div>
     </section>
@@ -480,7 +510,7 @@ def _dashboard_html() -> str:
         <a href="https://srclight.dev">srclight.dev</a>
         <a href="/healthz">/healthz</a>
       </div>
-      <p class="footer-copy">Local only. Server listens on 127.0.0.1.</p>
+      <p class="footer-copy">Listening on 127.0.0.1 only.</p>
     </div>
   </footer>
 
@@ -520,7 +550,7 @@ def _dashboard_html() -> str:
     }
     function classify(rawMsg, status) {
       const m = (rawMsg || '').toLowerCase();
-      if (/misuse|database is locked|busy|too many attached/.test(m)) return { text: 'Index is busy.', transient: true };
+      if (/misuse|database is locked|busy|too many attached/.test(m)) return { text: 'Index is busy. Retrying…', transient: true };
       if (status === 0) return { text: 'Server unreachable.', transient: true };
       if (status >= 500) return { text: 'Server error.', transient: false };
       if (status === 404) return { text: 'Not found.', transient: false };
@@ -598,8 +628,18 @@ def _dashboard_html() -> str:
       // header shows the first so human and machine agree (STUBBY).
       const d = Array.isArray(h.degraded) ? h.degraded : [];
       if (d.length) return { level: 'warn', text: 'degraded · ' + d[0] + (d.length > 1 ? ' (+' + (d.length - 1) + ')' : '') };
+      if (h.warming) return { level: 'warn', text: 'loading ' + h.warming };
       return { level: 'ok', text: 'healthy' };
     }
+    // Ticks every second between polls so "last query" moves the instant the
+    // poll lands and uptime never sits still (Gemini round 2).
+    function paintClock() {
+      const c = state.clock; if (!c) return;
+      const drift = (Date.now() - c.at) / 1000;
+      const lastQ = c.lastAgo != null ? '<b>' + esc(humanSecs(c.lastAgo + drift)) + ' ago</b>' : '<b>never</b>';
+      $('headerMeta').innerHTML = 'up ' + esc(humanSecs((c.uptime || 0) + drift)) + ' · last MCP call ' + lastQ + ' · ' + fmt(c.count) + ' calls';
+    }
+    setInterval(() => { if (!state.down) paintClock(); }, 1000);
     function paintHealth(h) {
       const c = composeHealth(h);
       $('statusDot').className = 'status-dot ' + c.level;
@@ -609,50 +649,92 @@ def _dashboard_html() -> str:
       document.body.classList.toggle('is-down', !h);
       if (!h) { $('headerMeta').innerHTML = '<span class="dim">showing last known values</span>'; return; }
       const q = h.queries || {};
-      const lastQ = q.last_ago_seconds != null ? '<b>' + esc(humanSecs(q.last_ago_seconds)) + ' ago</b>' : '<b>never</b>';
-      $('headerMeta').innerHTML = 'up ' + esc(humanSecs(h.uptime_seconds)) + ' · last query ' + lastQ + ' · ' + fmt(q.count || 0) + ' queries';
+      state.clock = { at: Date.now(), uptime: h.uptime_seconds, lastAgo: q.last_ago_seconds, count: q.count || 0 };
+      paintClock();
       if (h.version) { $('versionBadge').textContent = 'v' + h.version; }
       document.title = 'srclight' + (h.workspace ? ' · ' + h.workspace : '');
 
-      // Embedded stat + server cards come from the same payload.
+      // Every number comes from this one payload: no split brain between endpoints.
+      $('statProjects').textContent = fmt(h.projects);
+      $('statFiles').textContent = fmt(h.files);
+      $('statSymbols').textContent = fmt(h.symbols);
+      $('statEdges').textContent = fmt(h.edges);
+      $('statEdgesSub').textContent = h.symbols ? (h.edges / h.symbols).toFixed(2) + ' per symbol' : '';
+      $('statProjectsSub').textContent = h.projects_errored ? h.projects_errored + ' unreadable' : '';
+      ['statProjects','statFiles','statSymbols','statEdges'].forEach(id => setLoading(id, false));
+
       const e = h.embeddings || {};
       const embOk = e.status === 'ok';
       const cov = pct(h.embedded || 0, h.symbols || 0);
       const stat = $('statEmbedded');
       setLoading('statEmbedded', false);
-      if (!embOk && !(h.embedded > 0)) {
-        stat.textContent = 'Keyword only'; stat.className = 'stat-value err';
-        $('statEmbeddedSub').textContent = e.error ? 'provider ' + (e.status || 'error') : 'no embeddings';
+      stat.textContent = fmt(h.embedded || 0);
+      if (!(h.embedded > 0)) {
+        stat.className = 'stat-value err';
+        $('statEmbeddedSub').textContent = 'keyword only' + (embOk ? '' : ' · provider ' + (e.status || 'down'));
       } else {
-        stat.textContent = fmt(h.embedded);
-        stat.className = 'stat-value ' + (cov >= 95 ? 'ok' : 'warn');
+        stat.className = 'stat-value ' + (cov >= 95 && embOk ? 'ok' : 'warn');
         $('statEmbeddedSub').textContent = cov + '% of symbols' + (embOk ? '' : ' · provider ' + (e.status || 'down'));
       }
       const model = e.model || e.provider || null;
-      $('infoEmbedModel').textContent = model || 'none configured';
       const healthEl = $('infoEmbedHealth');
       if (embOk) {
-        healthEl.textContent = e.resident === false ? 'reachable · model not loaded' : 'healthy' + (e.dimensions ? ' · ' + e.dimensions + 'd' : '');
+        healthEl.textContent = (model || 'model') + (e.resident === false ? ' · not in memory' : ' · live' + (e.dimensions ? ' · ' + e.dimensions + 'd' : ''));
         healthEl.className = 'info-value ' + (e.resident === false ? 'warn' : 'ok');
       } else {
-        healthEl.textContent = (e.status || 'unknown') + (e.error ? ' · ' + e.error : '') + (e.hint ? ' — ' + e.hint : '');
+        healthEl.textContent = (model || 'none') + ' · ' + (e.status || 'unknown') + (e.error ? ' · ' + e.error : '') + (e.hint ? ' — ' + e.hint : '');
         healthEl.className = 'info-value err';
       }
-      const fresh = relTime(h.last_indexed);
-      $('infoFreshness').textContent = fresh ? 'indexed ' + fresh : 'no index yet';
       $('infoBuild').textContent = 'v' + (h.version || '?') + (h.code_sha && h.code_sha !== 'unknown' ? ' @ ' + h.code_sha : '') + (h.mcp_sdk ? ' · mcp ' + h.mcp_sdk : '');
       $('infoMcpUrl').textContent = location.origin + (h.mcp || '/mcp');
-      $('statsSub').innerHTML = [
-        model ? '<b>' + esc(model) + '</b>' : 'no embedding model',
-        fresh ? 'indexed <b>' + esc(fresh) + '</b>' : 'no index yet',
-        h.workspace ? 'workspace <b>' + esc(h.workspace) + '</b>' : 'single repo',
-      ].join(' · ');
+      paintFreshness(h);
+      const dg = Array.isArray(h.degraded) ? h.degraded.slice() : [];
+      if (e.hint && !embOk) dg.push(e.hint);
+      $('statsDegraded').textContent = dg.join(' · ');
+      renderActivity(q.recent || [], q.count || 0);
 
-      // Connect: expand for the person who has never been queried.
+      // Connect: expand for the person whose AI has never called in.
       const hasQueries = (q.count || 0) > 0;
-      $('connectNote').textContent = hasQueries ? 'connected · ' + fmt(q.count) + ' queries served' : 'no queries yet — paste the snippet into your tool';
+      $('connectNote').textContent = hasQueries ? fmt(q.count) + ' MCP calls this process' : 'No AI connected yet. Paste the snippet below.';
       if (!state._connectDecided) { $('connectSection').open = !hasQueries; state._connectDecided = true; }
     }
+    // "Indexed" is a pair, newest and oldest, so 38 fresh repos cannot hide one old one.
+    function paintFreshness(h) {
+      const e = (h && h.embeddings) || {};
+      const model = e.model || e.provider || null;
+      const stamps = state.projects.map(p => p.last_indexed).filter(Boolean).sort();
+      const newest = stamps.length ? relTime(stamps[stamps.length - 1]) : relTime(h && h.last_indexed);
+      const oldest = stamps.length ? relTime(stamps[0]) : null;
+      $('statsSub').innerHTML = [
+        model ? '<b>' + esc(model) + '</b>' : 'no embedding model',
+        newest ? 'newest index <b>' + esc(newest) + '</b>' : 'no index yet',
+        oldest && oldest !== newest ? 'oldest <b>' + esc(oldest) + '</b>' : '',
+      ].filter(Boolean).join(' · ');
+    }
+    function renderActivity(items, count) {
+      const list = $('activityList');
+      $('activityNote').textContent = count ? fmt(count) + ' calls this process' : '';
+      if (!items.length) {
+        list.innerHTML = '<div class="act-empty">' + (count
+          ? 'No calls in the ledger yet.'
+          : 'No AI has called this process yet. Paste the snippet under Connect your AI; the first tool call lands here.') + '</div>';
+        return;
+      }
+      list.innerHTML = items.map(i => {
+        const t = i.ts ? new Date(i.ts).toLocaleTimeString([], { hour12: false }) : '';
+        return '<div class="act-row">' +
+          '<span class="act-time">' + esc(t) + '</span>' +
+          '<span class="act-tool">' + esc(i.tool || '?') + '</span>' +
+          '<span class="act-proj" data-project="' + esc(i.project || '') + '">' + esc(i.project || 'all projects') + '</span>' +
+          '<span class="act-q" title="' + esc(i.query || '') + '">' + (i.query ? '“' + esc(i.query) + '”' : '') + '</span>' +
+        '</div>';
+      }).join('');
+    }
+    $('activityList').addEventListener('click', ev => {
+      const el = ev.target.closest('.act-proj'); if (!el || !el.dataset.project) return;
+      $('projectFilter').value = el.dataset.project; state.filter = el.dataset.project; state.open.add(el.dataset.project);
+      renderProjects(); $('projectsSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
     async function loadHealth() {
       const wasDown = state.down === true;
       try {
@@ -660,10 +742,10 @@ def _dashboard_html() -> str:
         state.health = h; state.down = false; paintHealth(h);
         if (h.index_error) { showAlert('The index could not be read.', { raw: h.index_error, retry: reloadAll, priority: 2 }); return; }
         // Back after an outage or restart: clear the red state and rebuild every pane.
-        if (wasDown) { hideAlert(); loadStats(); loadProjects(); loadWorkspaces(); loadConnectionInfo(); }
+        if (wasDown) { hideAlert(); loadProjects(); loadWorkspaces(); loadConnectionInfo(); }
       } catch (e) {
         state.health = null; state.down = true; paintHealth(null);
-        showAlert('Cannot reach the srclight server. Retrying every few seconds… ' + rescueLine(), { raw: e.raw || e.message, retry: reloadAll, priority: 3 });
+        showAlert('Cannot reach srclight at 127.0.0.1. Retrying… ' + rescueLine(), { raw: e.raw || e.message, retry: reloadAll, priority: 3 });
       }
     }
 
@@ -707,39 +789,27 @@ def _dashboard_html() -> str:
     });
 
     /* ================= stats ================= */
-    async function loadStats() {
-      const gen = state.gen;
-      try {
-        const d = await withRetry(() => api('/api/codebase_map', { timeout: 30000 }));
-        if (gen !== state.gen) return;
-        state.cmap = d;
-        let projects, files, symbols, edges;
-        if (d.totals) {            // workspace mode: trust the server's totals
-          projects = d.projects_attached; files = d.totals.files; symbols = d.totals.symbols; edges = d.totals.edges;
-        } else if (d.index) {      // single-repo mode
-          projects = 1; files = d.index.files; symbols = d.index.symbols; edges = d.index.edges;
-        }
-        $('statProjects').textContent = fmt(projects);
-        $('statFiles').textContent = fmt(files);
-        $('statSymbols').textContent = fmt(symbols);
-        $('statEdges').textContent = fmt(edges);
-        ['statProjects','statFiles','statSymbols','statEdges'].forEach(id => setLoading(id, false));
-      } catch (e) {
-        if (gen !== state.gen) return;
-        ['statProjects','statFiles','statSymbols','statEdges'].forEach(id => { $(id).textContent = '—'; setLoading(id, false); });
-        showAlert('Could not read index totals. ' + e.message, { raw: e.raw, retry: reloadAll });
-      }
-    }
+    // The stat row is painted from /healthz (one payload, one truth); kept as a
+    // name so recovery paths can call it.
+    async function loadStats() { return loadHealth(); }
 
     /* ================= projects ================= */
     const CODE_LANGS = new Set(['c','cpp','csharp','python','dart','javascript','typescript','java','kotlin','swift','go','rust','php','ruby','bash','cmake','sql','groovy','objc','scala','lua','r','perl']);
+    // A pill names a defect the server can prove and the owner can act on.
+    // Age is never one: an old project is not a broken one.
+    function codeShare(p) {
+      const langs = p.languages || {}; let code = 0, all = 0;
+      for (const [l, n] of Object.entries(langs)) { all += n; if (CODE_LANGS.has(l)) code += n; }
+      return all ? code / all : 0;
+    }
     function projectStatus(p, wsHasEmbeddings) {
       if (p.error) return { level: 'err', text: 'read failed', rank: 0 };
-      if (p.indexed === false) return { level: 'dim', text: 'not indexed', rank: 1 };
-      if ((p.files || 0) > 0 && (p.symbols || 0) === 0) return { level: 'warn', text: 'no symbols', rank: 2 };
-      if ((p.symbols || 0) > 0 && (p.edges || 0) === 0) return { level: 'warn', text: 'no edges', rank: 3 };
-      if (wsHasEmbeddings && (p.symbols || 0) > 0 && (p.embedding_coverage || 0) < 0.95) return { level: 'warn', text: 'partial embed', rank: 4 };
-      return { level: 'ok', text: 'ok', rank: 9 };
+      if (p.indexed === false) return { level: 'warn', text: 'not indexed', rank: 1 };
+      if ((p.files || 0) === 0) return { level: 'warn', text: 'empty', rank: 2 };
+      if ((p.files || 0) > 0 && (p.symbols || 0) === 0 && codeShare(p) >= 0.2) return { level: 'warn', text: 'no symbols', rank: 2 };
+      if ((p.symbols || 0) > 0 && (p.edges || 0) === 0 && codeShare(p) >= 0.2) return { level: 'warn', text: 'no call graph', rank: 3 };
+      if (wsHasEmbeddings && (p.symbols || 0) > 0 && (p.embedding_coverage || 0) < 0.95) return { level: 'warn', text: Math.round((p.embedding_coverage || 0) * 100) + '% embedded', rank: 4 };
+      return { level: 'ok', text: '', rank: 9 };
     }
     function renderProjects() {
       const list = $('projectList');
@@ -764,7 +834,7 @@ def _dashboard_html() -> str:
       });
       const attention = items.filter(p => { const r = projectStatus(p, wsHasEmb).rank; return r < 9; }).length;
       $('projectsNote').innerHTML = '<b>' + fmt(items.length) + '</b> projects' + (q ? ' · <b>' + rows.length + '</b> shown' : '') +
-        (attention ? ' · <span class="warn">' + attention + ' need attention</span>' : ' · all healthy');
+        (attention ? ' · <span class="warn">' + attention + (attention === 1 ? ' needs' : ' need') + ' attention</span>' : ' · no defects found');
       const html = rows.map(({ p, st }) => {
         const name = p.project || p.name || '?';
         const cov = p.embedding_coverage != null ? Math.round(p.embedding_coverage * 100) : null;
@@ -784,7 +854,7 @@ def _dashboard_html() -> str:
           '<div class="proj-name" title="' + esc(p.path || '') + '">' + esc(name) + '</div>' +
           numCell(p.files, 'col-files') + numCell(p.symbols) + numCell(p.edges, 'col-edges') + embed +
           '<div class="col-indexed rel">' + esc(rel || '—') + '</div>' +
-          '<div><span class="pill ' + st.level + '">' + esc(st.text) + '</span></div>' +
+          '<div>' + (st.text ? '<span class="pill ' + st.level + '">' + esc(st.text) + '</span>' : '') + '</div>' +
           '<div class="proj-detail">' +
             '<div class="path">' + esc(p.path || '') + '</div>' +
             '<div style="margin-top:4px;">' + (p.db_size_mb != null ? 'DB ' + p.db_size_mb.toFixed(1) + ' MB · ' : '') +
@@ -796,6 +866,7 @@ def _dashboard_html() -> str:
         '</div>';
       }).join('');
       list.innerHTML = html || '<div class="proj-empty dim">No project matches “' + esc(state.filter) + '”.</div>';
+      if (state.health) paintFreshness(state.health);
     }
     async function loadProjects() {
       const gen = state.gen;
@@ -818,6 +889,21 @@ def _dashboard_html() -> str:
       row.classList.toggle('open'); row.setAttribute('aria-expanded', row.classList.contains('open'));
     });
     $('projectList').addEventListener('keydown', ev => { if ((ev.key === 'Enter' || ev.key === ' ') && ev.target.classList.contains('proj-row')) { ev.preventDefault(); ev.target.click(); } });
+    // j / k walk the list, Enter or o expands, Esc clears the filter.
+    document.addEventListener('keydown', ev => {
+      const tag = (document.activeElement && document.activeElement.tagName) || '';
+      if (/input|select|textarea/i.test(tag)) { if (ev.key === 'Escape') { document.activeElement.blur(); } return; }
+      const rows = Array.from(document.querySelectorAll('.proj-row'));
+      if (!rows.length) return;
+      let idx = rows.findIndex(r => r.classList.contains('selected'));
+      if (ev.key === 'j' || ev.key === 'ArrowDown') { idx = Math.min(rows.length - 1, idx + 1); }
+      else if (ev.key === 'k' || ev.key === 'ArrowUp') { idx = Math.max(0, idx - 1); }
+      else if ((ev.key === 'Enter' || ev.key === 'o') && idx >= 0) { rows[idx].click(); return; }
+      else return;
+      ev.preventDefault();
+      rows.forEach(r => r.classList.remove('selected'));
+      rows[idx].classList.add('selected'); rows[idx].focus({ preventScroll: true }); rows[idx].scrollIntoView({ block: 'nearest' });
+    });
     $('projectFilter').addEventListener('input', ev => { state.filter = ev.target.value; renderProjects(); });
     $('projectSort').addEventListener('change', ev => { state.sort = ev.target.value; renderProjects(); });
 
@@ -830,13 +916,23 @@ def _dashboard_html() -> str:
       results.innerHTML = '<div class="dim">Searching…</div>';
       meta.classList.add('hidden');
       $('btnSearch').disabled = true;
+      const t0 = Date.now();
+      const warm = state.health && (state.health.warming || (state.health.uptime_seconds != null && state.health.uptime_seconds < 120));
+      const tick = setInterval(() => {
+        const secs = Math.round((Date.now() - t0) / 1000);
+        let text = 'Searching… ' + secs + 's';
+        if (mode === 'hybrid' && (warm || secs >= 5)) text += ' · first hybrid search after a restart loads per-project vectors';
+        results.innerHTML = '<div class="dim">' + esc(text) + (secs >= 15 && mode === 'hybrid' ? ' <button class="btn btn-secondary btn-sm" id="btnRetryKeyword" type="button">Retry as keyword</button>' : '') + '</div>';
+        const b = $('btnRetryKeyword'); if (b) b.onclick = () => { $('searchMode').value = 'keyword'; doSearch(); };
+      }, 500);
       try {
-        const d = await api('/api/search?mode=' + encodeURIComponent(mode) + '&q=' + encodeURIComponent(q), { timeout: 45000, strict: false });
+        const d = await api('/api/search?mode=' + encodeURIComponent(mode) + '&q=' + encodeURIComponent(q), { timeout: 120000, strict: false });
         if (d && d.error && !d.results) throw new ApiError(classify(d.error, 200).text, { raw: d.error });
         const items = d.results || [];
         const count = d.result_count ?? items.length;
         const served = d.mode || mode;
-        meta.textContent = count + ' result' + (count !== 1 ? 's' : '') + ' via ' + served + (served !== mode ? ' (fell back from ' + mode + ')' : '');
+        const fellBack = !String(served).toLowerCase().startsWith(mode);
+        meta.textContent = count + ' result' + (count !== 1 ? 's' : '') + ' via ' + served + (fellBack ? ' (fell back from ' + mode + ')' : '') + ' · ' + Math.round((Date.now() - t0) / 100) / 10 + 's';
         meta.classList.remove('hidden');
         if (!items.length) { results.innerHTML = '<div class="dim" style="padding: 8px 0;">No results.' + (d.hint ? ' ' + esc(d.hint) : '') + '</div>'; return; }
         results.innerHTML = items.map(r => {
@@ -858,11 +954,12 @@ def _dashboard_html() -> str:
         meta.classList.add('hidden');
         results.innerHTML = '<div style="color: var(--red);">' + esc(e.message) + (e.raw ? ' <span class="dim">(' + esc(e.raw).slice(0, 160) + ')</span>' : '') + '</div>';
       } finally {
+        clearInterval(tick);
         $('btnSearch').disabled = false;
       }
     }
     $('btnSearch').onclick = doSearch;
-    $('searchInput').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
+    $('searchInput').addEventListener('keydown', e => { if (e.key === 'Enter' && !$('btnSearch').disabled) doSearch(); });
     document.addEventListener('keydown', e => {
       if (e.key === '/' && !/input|select|textarea/i.test(document.activeElement.tagName)) { e.preventDefault(); $('searchInput').focus(); }
     });
@@ -898,7 +995,7 @@ def _dashboard_html() -> str:
       $('connectSnippet').textContent = JSON.stringify(info.snippet, null, 2);
       $('connectDetail').classList.remove('hidden');
       $('copyMsg').textContent = '';
-      $('connectAfter').textContent = 'Then restart ' + info.name + '. When it connects, the header shows a last-query time.';
+      $('connectAfter').textContent = 'Restart ' + info.name + '. Its first tool call appears under Recent agent activity.';
       document.querySelectorAll('.connect-tab').forEach(b => b.setAttribute('aria-pressed', b.dataset.client === client ? 'true' : 'false'));
     }
     async function loadConnectionInfo() {
@@ -923,7 +1020,7 @@ def _dashboard_html() -> str:
 
     /* ================= restart ================= */
     $('btnRestart').onclick = async () => {
-      if (!confirm('Restart the srclight server? Connected AI tools will reconnect.')) return;
+      if (!confirm('Restart srclight? Connected tools will drop and reconnect.')) return;
       const btn = $('btnRestart'), msg = $('restartMsg');
       btn.disabled = true; msg.style.color = ''; msg.textContent = 'Requesting restart…';
       try {
@@ -948,15 +1045,17 @@ def _dashboard_html() -> str:
     /* ================= init + polling ================= */
     async function reloadAll() {
       hideAlert();
-      await Promise.all([loadHealth(), loadStats(), loadProjects()]);
+      await Promise.all([loadHealth(), loadProjects()]);
       renderProjects();
     }
     loadWorkspaces();
     loadConnectionInfo();
     reloadAll();
-    setInterval(loadHealth, 10000);
-    setInterval(() => { if (state.down) loadHealth(); }, 3000);
-    setInterval(() => { if (!document.hidden) { loadStats(); loadProjects(); } }, 30000);
+    let _healthInFlight = false;
+    async function pollHealth() { if (_healthInFlight) return; _healthInFlight = true; try { await loadHealth(); } finally { _healthInFlight = false; } }
+    setInterval(pollHealth, 10000);
+    setInterval(() => { if (state.down) pollHealth(); }, 3000);
+    setInterval(() => { if (!document.hidden) loadProjects(); }, 30000);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) loadHealth(); });
   </script>
 </body>
@@ -1399,13 +1498,19 @@ def add_web_routes(app: "Starlette") -> None:
         r.app = _local_only_app(r)
         app.router.routes.append(r)
 
-    async def _warm_stats() -> None:
+    def _warm_stats() -> None:
         """Prime the per-project stats cache off the request path so the first
-        /healthz after a restart answers in milliseconds, not 15 s (TOTO)."""
+        /healthz after a restart answers in milliseconds, not 15 s (TOTO).
+
+        Started as a daemon thread here rather than via on_startup: the MCP
+        app carries its own lifespan, and Starlette ignores on_startup
+        handlers when a lifespan is present.
+        """
         import threading
         from . import server as server_mod
 
         def run() -> None:
+            time.sleep(1.0)  # let uvicorn bind first
             try:
                 if not server_mod._is_workspace_mode():
                     return
@@ -1422,6 +1527,8 @@ def add_web_routes(app: "Starlette") -> None:
                         wdb._get_project_cache(name)
                     except Exception as e:  # noqa: BLE001
                         logger.warning("vector cache warm-up failed for %s: %s", name, e)
+            except FileNotFoundError as e:
+                logger.debug("warm-up skipped: %s", e)  # workspace gone (tests, switch)
             except Exception as e:  # noqa: BLE001
                 logger.warning("warm-up failed: %s", e)
             finally:
@@ -1429,7 +1536,7 @@ def add_web_routes(app: "Starlette") -> None:
 
         threading.Thread(target=run, name="srclight-stats-warm", daemon=True).start()
 
-    app.router.on_startup.append(_warm_stats)
+    _warm_stats()
 
 
 def _local_only_app(route):
