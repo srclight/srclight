@@ -253,6 +253,27 @@ def status(db_path: str | None):
     db.close()
 
 
+# uvicorn's Server.shutdown() drains open connections BEFORE running the ASGI
+# lifespan that closes the MCP session manager, so an open `GET /mcp` or `/sse`
+# stream is a circular wait. Left unset, timeout_graceful_shutdown is None and
+# asyncio.wait_for() waits forever: 9 of srclight.service's last 18 stops hung
+# for the full 90s TimeoutStopSec and ended in SIGKILL (2026-09-02).
+GRACEFUL_SHUTDOWN_SECONDS = 10
+
+
+def _uvicorn_config(app, port: int, log_level: str):
+    """Build the uvicorn config for `serve --web`, with a bounded shutdown."""
+    import uvicorn
+
+    return uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=port,
+        log_level=log_level,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
+    )
+
+
 @main.command()
 @click.option("--db", "db_path", type=click.Path(), help="Database path")
 @click.option("--workspace", "-w", "workspace_name", help="Workspace name (multi-repo mode)")
@@ -288,12 +309,7 @@ def serve(db_path: str | None, workspace_name: str | None, transport: str, port:
         log_level = getattr(server_mod.mcp.settings, "log_level", "info")
         if isinstance(log_level, str):
             log_level = log_level.lower()
-        config = uvicorn.Config(
-            app,
-            host="127.0.0.1",
-            port=port,
-            log_level=log_level,
-        )
+        config = _uvicorn_config(app, port=port, log_level=log_level)
 
         async def _run():
             srv = uvicorn.Server(config)

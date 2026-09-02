@@ -248,3 +248,45 @@ def test_find_imports_works_in_workspace_mode(client):
     # The fixture writes rows, not files: reaching the file read is the proof.
     assert "AttributeError" not in _json.dumps(out)
     assert "imports" in out or "Cannot read file" in out.get("error", "")
+
+
+def test_stale_sidecar_reaches_healthz_degraded(tmp_path, ws_dir):
+    """A sidecar serving only part of its index must reach the header.
+
+    intuition-2019 (found live 2026-09-02): index.db held 20,648 embeddings and
+    the sidecar 15,611. /api/embedding_status reads the DB and reported 100%
+    coverage while semantic search reads the sidecar and saw 76% of the repo.
+    Two surfaces, one of them silently wrong, and `degraded` was empty.
+    """
+    from srclight import server as server_mod
+    from srclight.db import Database
+    from srclight.embeddings import vector_to_bytes
+    from srclight.vector_cache import VectorCache
+    from srclight.web import add_web_routes
+
+    config = WorkspaceConfig(name="stale-test")
+    proj = _create_indexed_project(tmp_path, "alpha", [("Dictionary", "class")])
+    config.add_project("alpha", str(proj))
+    config.save()
+
+    db = Database(proj / ".srclight" / "index.db")
+    db.open()
+    for i, row in enumerate(db.conn.execute("SELECT id FROM symbols ORDER BY id")):
+        db.upsert_embedding(row["id"], "mock:test", 8,
+                            vector_to_bytes([0.1 * (i + 1)] * 8), f"h{i}")
+    db.commit()
+    VectorCache(proj / ".srclight").build_from_db(db.conn)
+    db.conn.execute("INSERT OR REPLACE INTO schema_info (key, value) "
+                    "VALUES ('embedding_cache_version', '9999')")
+    db.commit()
+    db.close()
+
+    server_mod.configure_workspace("stale-test")
+    server_mod._server_start_time = time.time()
+    app = server_mod.make_sse_and_streamable_http_app(mount_path="/")
+    add_web_routes(app)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        server_mod._get_workspace_db()._get_project_cache("alpha")  # as startup does
+        h = c.get("/healthz").json()
+        assert h["status"] == "ok"                      # liveness is unaffected
+        assert any("sidecar" in d for d in h["degraded"]), h["degraded"]
