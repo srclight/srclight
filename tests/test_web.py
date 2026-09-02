@@ -102,3 +102,17 @@ def test_server_stats_uptime_human_is_readable(client):
     d = client.get("/api/server_stats").json()
     assert not d["uptime_human"].endswith("00s") or "m" in d["uptime_human"]
     assert d["uptime_human"] in ("0s",) or any(u in d["uptime_human"] for u in "smhd")
+
+
+def test_healthz_carries_query_activity_and_embedded_total(client):
+    h = client.get("/healthz").json()
+    assert h["queries"]["count"] >= 0
+    assert "last_ago_seconds" in h["queries"]
+    assert h["embedded"] == 0  # fixtures carry no embeddings
+
+
+@pytest.mark.parametrize("path", ["/dashboard", "/web"])
+def test_dashboard_aliases_redirect_to_root(client, path):
+    r = client.get(path, follow_redirects=False)
+    assert r.status_code in (301, 302, 307, 308)
+    assert r.headers["location"] == "/"
