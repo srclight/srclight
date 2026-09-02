@@ -2278,6 +2278,7 @@ async def restart_server() -> str:
         }, indent=2)
 
     def _exit():
+        _close_databases()   # os._exit skips atexit, SQLite close and the WAL checkpoint
         os._exit(0)
 
     asyncio.get_running_loop().call_later(0, _exit)
@@ -2897,6 +2898,28 @@ def make_sse_and_streamable_http_app(mount_path: str | None = "/"):
     sse_routes = [r for r in sse_app.routes if getattr(r, "path", None) in ("/sse", "/messages")]
     streamable_app.router.routes.extend(sse_routes)
     return streamable_app
+
+
+def _close_databases() -> None:
+    """Close every database handle, checkpointing each WAL on the way out.
+
+    Call before any deliberate process exit. `os._exit()` skips atexit and
+    SQLite's own cleanup, so without this the index is left sitting entirely in
+    index.db-wal while the main file keeps a bare 4096-byte header — and an
+    index.db copied without its sidecar is an empty database (issue #16).
+    """
+    global _db, _workspace_db, _learnings_db
+    for handle, label in ((_db, "index"), (_workspace_db, "workspace"),
+                          (_learnings_db, "learnings")):
+        if handle is None:
+            continue
+        try:
+            handle.close()
+        except Exception:  # noqa: BLE001 -- cleanup must never block an exit
+            logger.warning("Failed to close the %s database cleanly", label, exc_info=True)
+    _db = None
+    _workspace_db = None
+    _learnings_db = None
 
 
 def configure(db_path: Path | None = None, repo_root: Path | None = None) -> None:

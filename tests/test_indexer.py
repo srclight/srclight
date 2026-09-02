@@ -506,3 +506,37 @@ def test_index_php(db, php_project):
 
     # Enum
     assert "Status" in names
+
+
+def test_index_run_leaves_the_main_db_self_contained(tmp_path, sample_project):
+    """After indexing, index.db alone must carry the data (issue #16).
+
+    While the MCP server holds the index open, the indexer's own close is not
+    the last connection, so SQLite never checkpoints and every row stays in
+    index.db-wal. The user then sees a 4096-byte index.db and reasonably
+    concludes the reindex destroyed it.
+    """
+    import shutil
+    import sqlite3
+
+    db_path = tmp_path / "index.db"
+    server = Database(db_path)          # long-running MCP server holds it open
+    server.open()
+    server.initialize()
+    server.conn.execute("SELECT COUNT(*) FROM symbols").fetchone()
+
+    idx_db = Database(db_path)
+    idx_db.open()
+    Indexer(idx_db, IndexConfig(root=sample_project)).index(sample_project)
+
+    main_only = tmp_path / "main_only.db"
+    shutil.copyfile(db_path, main_only)   # no -wal, as a backup would capture
+    conn = sqlite3.connect(main_only)
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+    finally:
+        conn.close()
+
+    idx_db.close()
+    server.close()
+    assert count > 0, "index.db is empty on its own — the WAL was never checkpointed"
