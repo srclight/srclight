@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from srclight.db import Database, FileRecord, SymbolRecord
-from srclight.workspace import WorkspaceConfig, WorkspaceDB, _sanitize_schema_name
+from srclight.workspace import (
+    _FTS_WARN_INTERVAL_SECONDS,
+    WorkspaceConfig,
+    WorkspaceDB,
+    _sanitize_schema_name,
+)
 
 
 @pytest.fixture
@@ -539,6 +544,11 @@ def test_semantic_enrichment_does_not_write_to_the_project_index(tmp_path, ws_di
     config = WorkspaceConfig(name="ro-enrich-test")
     config.add_project("alpha", str(proj))
     with WorkspaceDB(config) as wdb:
+        # ARM IT. SQLite checkpoints only on LAST-connection close, so while the
+        # workspace holds its own attachment the enrichment connection can be
+        # read-write and still change nothing. Without this detach the test
+        # passes with the fix reverted.
+        wdb._detach_all()
         wdb._enrich_workspace_results([("alpha", 0, 0.9, 1)])
 
     after = (db_path.stat().st_size, wal.stat().st_size if wal.exists() else 0)
@@ -618,3 +628,203 @@ def test_a_missing_project_index_is_an_error_not_a_silently_created_empty_db(tmp
         assert "alpha" in wdb._attach_errors, (
             f"missing index was not reported; errors={wdb._attach_errors}"
         )
+
+
+def _project_with_all_three(tmp_path: Path, name: str) -> Path:
+    """A symbol whose NAME, BODY and DOC each carry a distinct unique token."""
+    from srclight.db import Database, FileRecord, SymbolRecord
+    project_dir = tmp_path / name
+    project_dir.mkdir()
+    db_dir = project_dir / ".srclight"
+    db_dir.mkdir()
+    db = Database(db_dir / "index.db")
+    db.open()
+    db.initialize()
+    fid = db.upsert_file(FileRecord(path=f"src/{name}.py", content_hash="h", mtime=1.0,
+                                    language="python", size=80, line_count=4))
+    db.insert_symbol(SymbolRecord(
+        file_id=fid, kind="function", name="NAMETOKENXQ",
+        qualified_name=f"{name}.NAMETOKENXQ", start_line=1, end_line=4,
+        content="def NAMETOKENXQ():\n    return BODYTOKENXQ\n",
+        doc_comment="explains DOCTOKENXQ behaviour", body_hash="bh",
+    ), f"src/{name}.py")
+    db.commit()
+    db.close()
+    return project_dir
+
+
+@pytest.mark.parametrize("token,expected_source", [
+    ("NAMETOKENXQ", "name"),
+    ("BODYTOKENXQ", "content"),
+    ("DOCTOKENXQ", "docs"),
+])
+def test_every_fts_leg_is_reachable(tmp_path, ws_dir, token, expected_source):
+    """All three legs carried the same qualifier bug; only content had a test.
+
+    TOTO's mutation review (2026-09-02): reverting the name-leg or docs-leg
+    qualifier left the suite green at 321 passed. The name leg is Tier 1, which
+    every plain symbol-name query hits, and the docs leg is the one that carries
+    the SQLITE_MAX_ATTACHED hit cited as proof the bug was real.
+    """
+    proj = _project_with_all_three(tmp_path, "alpha")
+    config = WorkspaceConfig(name=f"legs-{expected_source}")
+    config.add_project("alpha", str(proj))
+
+    with WorkspaceDB(config) as wdb:
+        hits = wdb.search_symbols(token)
+
+    sources = [h["source"] for h in hits]
+    assert expected_source in sources, (
+        f"{expected_source} leg never ran for {token!r}; sources were {sources}"
+    )
+
+
+def test_verify_attachment_rejects_an_attachment_that_landed_elsewhere(tmp_path, ws_dir):
+    """The guard must catch an ATTACH that opened a different file.
+
+    Two ways mode=ro is dropped without raising: a metacharacter truncating the
+    URI, and a SQLite built without SQLITE_USE_URI taking the whole string as a
+    literal filename. The Windows frozen engine's sqlite3.dll (3.49.1) has no
+    USE_URI, so this is the live path there, not a hypothetical. Its docstring
+    says a guard nobody tests is furniture; this is the test.
+    """
+    import sqlite3
+
+    proj = _project_with_content(
+        tmp_path, "alpha", "handler", "def handler():\n    return ZORBLAXSENTINEL\n"
+    )
+    decoy = _project_with_content(
+        tmp_path, "decoy", "other", "def other():\n    return NOTHING\n"
+    )
+
+    config = WorkspaceConfig(name="verify-test")
+    config.add_project("alpha", str(proj))
+
+    with WorkspaceDB(config) as wdb:
+        entry = next(e for e in wdb._all_indexable if e.name == "alpha")
+        wdb._detach_all()
+        # Attach the DECOY under alpha's schema, as a dropped mode=ro would.
+        schema = _sanitize_schema_name("alpha")
+        wdb.conn.execute(
+            f"ATTACH DATABASE ? AS [{schema}]", (str(decoy / ".srclight" / "index.db"),)
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="resolved to"):
+            wdb._verify_attachment(schema, entry)
+        # and it must not leave the wrong database attached
+        attached = {r[1] for r in wdb.conn.execute("PRAGMA database_list")}
+        assert schema not in attached, "a rejected attachment was left in place"
+
+
+def test_a_dead_fts_leg_keeps_reporting_while_it_stays_dead(tmp_path, ws_dir, caplog):
+    """The health signal must not go quiet while the fault persists.
+
+    warning_ring windows by the hour (web.py: warning_ring.since(3600)). Warning
+    once per (schema, leg) forever meant a permanently dead leg showed on
+    /healthz for 60 minutes and the dashboard went green afterwards while the
+    leg was still dead — STUBBY's ring defeated one layer up (SAM, 2026-09-02).
+    """
+    import logging
+
+    from srclight.db import Database
+
+    proj = _project_with_content(
+        tmp_path, "alpha", "handler", "def handler():\n    return ZORBLAXSENTINEL\n"
+    )
+    db = Database(proj / ".srclight" / "index.db")
+    db.open()
+    db.conn.execute("DROP TABLE symbol_content_fts")
+    db.commit()
+    db.close()
+
+    config = WorkspaceConfig(name="fts-repeat-test")
+    config.add_project("alpha", str(proj))
+
+    with WorkspaceDB(config) as wdb:
+        with caplog.at_level(logging.WARNING, logger="srclight.workspace"):
+            wdb.search_symbols("ZORBLAXSENTINEL")
+            first = len([r for r in caplog.records if "fts" in r.getMessage().lower()])
+            # a second search inside the same window must NOT re-warn
+            wdb.search_symbols("ZORBLAXSENTINEL")
+            second = len([r for r in caplog.records if "fts" in r.getMessage().lower()])
+            assert second == first, "warned once per query instead of once per window"
+            # but once the window lapses it must speak again
+            wdb._fts_warned[("alpha", "content")] -= _FTS_WARN_INTERVAL_SECONDS + 1
+            wdb.search_symbols("ZORBLAXSENTINEL")
+            third = len([r for r in caplog.records if "fts" in r.getMessage().lower()])
+    assert third > second, "went permanently quiet while the leg was still dead"
+
+
+def test_attach_batch_actually_calls_the_verifier(tmp_path, ws_dir, monkeypatch):
+    """The guard must be WIRED, not merely present.
+
+    A test that calls _verify_attachment directly still passes when the call
+    site is deleted from _attach_batch — the function is covered and its wiring
+    is not (TOTO/K9 mutation review). Drive it through the real path instead.
+    """
+    proj = _project_with_content(
+        tmp_path, "alpha", "handler", "def handler():\n    return ZORBLAXSENTINEL\n"
+    )
+    decoy = _project_with_content(
+        tmp_path, "decoy", "other", "def other():\n    return NOTHING\n"
+    )
+
+    config = WorkspaceConfig(name="wiring-test")
+    config.add_project("alpha", str(proj))
+
+    with WorkspaceDB(config) as wdb:
+        entry = next(e for e in wdb._all_indexable if e.name == "alpha")
+        wdb._detach_all()
+        # Simulate a dropped mode=ro: the URI resolves to a different file.
+        import srclight.workspace as ws_mod
+        monkeypatch.setattr(
+            ws_mod, "_read_only_uri",
+            lambda p: str(decoy / ".srclight" / "index.db"),
+        )
+        wdb._attach_batch([entry])
+        assert "alpha" in wdb._attach_errors, (
+            "an attachment that landed on the wrong file was accepted"
+        )
+
+
+def test_sidecar_freshness_check_survives_a_metacharacter_path(tmp_path):
+    """_sidecar_matches_db must not build its URI by f-string either.
+
+    It was written with `f"file:{db_file}?mode=ro"` — the exact form the helper
+    forbids. On a path containing '#' or '?' the URI truncates, mode=ro is
+    dropped, and SQLite CREATES a stray database beside the project; is_valid()
+    then raises into a bare `except Exception: return True`, reporting the
+    sidecar fresh. The silent wrong answer the function exists to prevent.
+    """
+    from srclight.embeddings import vector_to_bytes
+    from srclight.vector_cache import VectorCache
+
+    proj = tmp_path / "issue#42"
+    srclight_dir = proj / ".srclight"
+    srclight_dir.mkdir(parents=True)
+    db = Database(srclight_dir / "index.db")
+    db.open()
+    db.initialize()
+    fid = db.upsert_file(FileRecord(path="a.py", content_hash="h", mtime=1.0,
+                                    language="python", size=10, line_count=2))
+    sid = db.insert_symbol(SymbolRecord(file_id=fid, kind="function", name="f",
+                                        start_line=1, end_line=2, content="x",
+                                        body_hash="b"), "a.py")
+    db.upsert_embedding(sid, "mock:test", 8, vector_to_bytes([0.1] * 8), "b")
+    db.commit()
+    cache = VectorCache(srclight_dir)
+    cache.build_from_db(db.conn)
+    # Move the DB ahead of the sidecar: the check must notice.
+    db.conn.execute(
+        "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('embedding_cache_version', '9999')"
+    )
+    db.commit()
+    db.close()
+
+    fresh = WorkspaceDB._sidecar_matches_db(srclight_dir, cache)
+
+    # The truncated URI resolves to a SIBLING of the project ("<tmp>/issue"),
+    # not to anything inside it, so look in the parent. Checking proj/ only made
+    # this test pass under the very f-string it exists to forbid.
+    strays = [q.name for q in tmp_path.iterdir() if q.name != "issue#42"]
+    assert not strays, f"created stray databases beside the project: {strays}"
+    assert fresh is False, "reported a stale sidecar as fresh"

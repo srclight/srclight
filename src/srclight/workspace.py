@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -154,6 +155,13 @@ def _sanitize_schema_name(name: str) -> str:
     return s
 
 
+# Re-warn about a dead search leg on this interval. It MUST stay below the
+# window /healthz reads (web.py: warning_ring.since(3600)) — warning once and
+# never again meant a permanently dead leg showed for an hour and the dashboard
+# went green afterwards while the leg was still dead.
+_FTS_WARN_INTERVAL_SECONDS = 900
+
+
 def _read_only_uri(path) -> str:
     """A `file:` URI that ATTACH and connect() honour as read-only.
 
@@ -163,7 +171,17 @@ def _read_only_uri(path) -> str:
     exception raised: ATTACH succeeds against an empty schema and nothing goes
     red. `Path.as_uri()` percent-encodes both, plus spaces and non-ASCII.
     """
-    return Path(path).resolve().as_uri() + "?mode=ro"
+    uri = Path(path).resolve().as_uri()
+    if uri.startswith("file://") and not uri.startswith("file:///"):
+        # A Windows UNC path (\\server\share, \\wsl$\...) renders with a
+        # non-empty authority, which SQLite refuses: "invalid uri authority".
+        # Returning the plain path keeps such a project working read-write
+        # rather than turning it into an error row on a platform we cannot test.
+        logger.warning(
+            "Cannot build a read-only URI for %s (UNC path); attaching read-write", path
+        )
+        return str(path)
+    return uri + "?mode=ro"
 
 
 MAX_ATTACH = 10  # SQLite default SQLITE_MAX_ATTACHED
@@ -204,7 +222,7 @@ class WorkspaceDB:
         self._all_indexable: list[ProjectEntry] = []  # all entries with an index
         self._caches: dict[str, Any] = {}  # project_name -> VectorCache
         self._stale_sidecars: set[str] = set()  # project_name, sidecar older than index.db
-        self._fts_warned: set[tuple[str, str]] = set()  # (schema, leg) already reported
+        self._fts_warned: dict[tuple[str, str], float] = {}  # (schema, leg) -> last warned at
         # project_name -> (index-file version key, per-project stats). See _collect_stats.
         self._stats_cache: dict[str, tuple[tuple, dict[str, Any]]] = {}
         self._attach_errors: dict[str, str] = {}  # project_name -> why ATTACH failed
@@ -212,6 +230,12 @@ class WorkspaceDB:
         self._lock = threading.RLock()
 
     def open(self) -> None:
+        # uri=True is NOT decoration: srclight ships a frozen Windows engine whose
+        # sqlite3.dll (3.49.1) is built WITHOUT SQLITE_USE_URI (verified with
+        # `strings` on engine-windows/_internal/sqlite3.dll; the Linux and macOS
+        # builds do carry it). Without this flag SQLite takes the whole
+        # "file:...?mode=ro" string as a literal filename and CREATES it,
+        # read-write. Do not tidy this argument away.
         self.conn = sqlite3.connect(
             ":memory:", check_same_thread=False, uri=True
         )
@@ -265,13 +289,17 @@ class WorkspaceDB:
         `PRAGMA database_list`'s file column is the honest tell and writes
         nothing. Detach before raising so a bad attachment cannot linger.
         """
-        want = os.path.realpath(str(Path(entry.index_db)))
+        want = str(Path(entry.index_db).resolve())
         got = None
         for row in self.conn.execute("PRAGMA database_list"):
             if row[1] == schema:
                 got = row[2]
                 break
-        if got is None or os.path.realpath(got) != want:
+        # realpath() costs ~21us on ext4 but ~1ms on drvfs, and several projects
+        # live under /mnt/c — so only pay for it when the cheap comparison fails.
+        if got != want and (
+            got is None or os.path.realpath(got) != os.path.realpath(want)
+        ):
             try:
                 self.conn.execute(f"DETACH DATABASE [{schema}]")
             except sqlite3.DatabaseError:
@@ -858,13 +886,15 @@ class WorkspaceDB:
         second is what happened: every leg qualified its table inside WHERE and
         snippet(), which SQLite reads as table.column, so keyword search silently
         fell through to a LIKE on symbols.name for an unknown span of releases.
-        Warn once per pair so a permanently dead leg reaches /healthz via
-        warning_ring without one line per query.
+        Re-warn each pair on an interval below the ring's window, so a
+        permanently dead leg stays visible on /healthz without one line per query.
         """
         key = (schema, leg)
-        if key in self._fts_warned:
+        now = time.time()
+        last = self._fts_warned.get(key)
+        if last is not None and now - last < _FTS_WARN_INTERVAL_SECONDS:
             return
-        self._fts_warned.add(key)
+        self._fts_warned[key] = now
         logger.warning(
             "FTS %s search unavailable for [%s]: %s — falling back to LIKE on symbol names",
             leg, schema, exc,
@@ -885,7 +915,7 @@ class WorkspaceDB:
         if not db_file.exists():
             return True
         try:
-            conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+            conn = sqlite3.connect(_read_only_uri(db_file), uri=True)
             conn.row_factory = sqlite3.Row
             try:
                 return cache.is_valid(conn)
