@@ -58,8 +58,6 @@ def _dashboard_html() -> str:
         --green: #237a36; --green-dim: rgba(35,122,54,0.12); --red: #c42b2b; --red-dim: rgba(196,43,43,0.10);
         --amber-dim: rgba(245,158,11,0.18);
       }
-      .wordmark .light { color: #1c1917; }
-      .section-title { color: #57534e; }
     }
     html { font-size: 15px; }
     body {
@@ -291,6 +289,12 @@ def _dashboard_html() -> str:
       body { background: #fff; color: #111; }
       .proj-row.problem { break-inside: avoid; }
       .proj-row.problem .proj-detail { display: block; }
+    }
+
+    /* Light-theme overrides for rules with literal colours; after them so the cascade wins. */
+    @media (prefers-color-scheme: light) {
+      .wordmark .light { color: #1c1917; }
+      .btn-primary { color: #fff; }
     }
 
     /* -- Responsive -- */
