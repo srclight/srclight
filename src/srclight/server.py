@@ -9,6 +9,9 @@ from __future__ import annotations
 import asyncio
 import difflib
 import json
+import collections
+import contextvars
+import threading
 import logging
 import os
 import re
@@ -200,6 +203,7 @@ _repo_root: Path | None = None
 # Workspace mode state
 _workspace_name: str | None = None
 _workspace_db = None  # WorkspaceDB instance (lazy import to avoid circular)
+_workspace_db_lock = threading.Lock()  # guards (re)creation across web worker threads
 _workspace_config_mtime: float = 0.0  # mtime of workspace config at last load
 
 # Vector cache (GPU-resident embedding matrix)
@@ -233,6 +237,11 @@ def _get_workspace_db():
     `srclight workspace add`). This means you never need to restart the
     MCP server to pick up new repos.
     """
+    with _workspace_db_lock:
+        return _get_workspace_db_locked()
+
+
+def _get_workspace_db_locked():
     global _workspace_db, _workspace_config_mtime
 
     from .workspace import WorkspaceConfig, WorkspaceDB
@@ -452,7 +461,7 @@ def codebase_map(project: str | None = None) -> str:
     Args:
         project: Optional project filter (workspace mode only)
     """
-    _record_query()
+    _record_query(tool="codebase_map", project=project)
     if _is_workspace_mode():
         wdb = _get_workspace_db()
         result = wdb.codebase_map(project=project)
@@ -502,7 +511,7 @@ def search_symbols(
         project: Optional project filter (workspace mode only, e.g. 'intuition')
         limit: Max results to return (default 20)
     """
-    _record_query()
+    _record_query(tool="search_symbols", query=query, project=project)
     if _is_workspace_mode():
         wdb = _get_workspace_db()
         results = wdb.search_symbols(query, kind=kind, project=project, limit=limit)
@@ -540,7 +549,7 @@ def get_symbol(name: str, project: str | None = None) -> str:
         name: Symbol name (e.g., 'Dictionary', 'lookup', 'main')
         project: Optional project filter (workspace mode only)
     """
-    _record_query()
+    _record_query(tool="get_symbol", query=name, project=project)
     if _is_workspace_mode():
         wdb = _get_workspace_db()
         results = wdb.get_symbol(name, project=project)
@@ -1573,7 +1582,7 @@ def semantic_search(
         project: Project name (workspace mode) or uses current repo
         limit: Max results (default 10)
     """
-    _record_query()
+    _record_query(tool="semantic_search", query=query, project=project)
     from .embeddings import get_provider, vector_to_bytes
 
     # Determine which model was used for embeddings
@@ -1635,7 +1644,7 @@ def hybrid_search(
         project: Project name (workspace mode) or uses current repo
         limit: Max results (default 20)
     """
-    _record_query()
+    _record_query(tool="hybrid_search", query=query, project=project)
     from .embeddings import get_provider, rrf_merge, vector_to_bytes
 
     # Get FTS results
@@ -1879,7 +1888,7 @@ def find_imports(path: str, project: str | None = None) -> str:
         config_entries = [e for e in wdb._all_indexable if e.name == project]
         if not config_entries:
             return _project_not_found_error(project)
-        project_root = Path(config_entries[0].root)
+        project_root = Path(config_entries[0].path)
         file_path = project_root / path
         try:
             content = file_path.read_text(errors="replace")
@@ -2173,13 +2182,66 @@ _query_count: int = 0
 _ui_events: list[dict] = []
 
 
-def _record_query(client: str | None = None) -> None:
-    """Record that a tool was called (timestamp + optional client identifier)."""
+# True while a request originates from the web dashboard's own polling. The
+# watchman does not sign the guest book: dashboard traffic must never count as
+# an agent query, or "last query 3s ago" becomes the page measuring its own pulse.
+_dashboard_request: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "srclight_dashboard_request", default=False
+)
+
+
+# The agent ledger: what agents actually asked, newest last. Bounded; never
+# holds file contents; queries are truncated. Exposed by /api/recent_queries.
+_recent_queries: "collections.deque[dict]" = collections.deque(maxlen=200)
+# Set by the --web startup warm-up while it loads stats and vector caches, so
+# the dashboard can say "loading embeddings into memory" instead of "healthy".
+_warming: str | None = None
+
+
+def _record_query(
+    client: str | None = None,
+    *,
+    tool: str | None = None,
+    query: str | None = None,
+    project: str | None = None,
+) -> None:
+    """Record that a tool was called (timestamp + what was asked)."""
     global _last_query_time, _last_query_client, _query_count
+    if _dashboard_request.get():
+        return
     _last_query_time = time.time()
     _query_count += 1
     if client:
         _last_query_client = client
+    _recent_queries.append({
+        "ts": datetime.fromtimestamp(_last_query_time, tz=timezone.utc).isoformat(),
+        "tool": tool,
+        "query": (query[:80] if isinstance(query, str) else None),
+        "project": project,
+        "client": client or _last_query_client,
+    })
+
+
+def recent_queries(limit: int = 20) -> list[dict]:
+    """Newest first."""
+    items = list(_recent_queries)[-max(1, min(limit, 200)):]
+    items.reverse()
+    return items
+
+
+def _humanize_seconds(seconds: float) -> str:
+    """4m 18s, 2h 14m, 1d 1h -- two units, largest first. Never "7200s"."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h {m}m"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h"
 
 
 @mcp.tool()
@@ -2195,7 +2257,7 @@ async def server_stats() -> str:
         "started_at": started_at.isoformat(),
         "started_at_epoch": _server_start_time,
         "uptime_seconds": round(uptime, 2),
-        "uptime_human": f"{int(uptime)}s",
+        "uptime_human": _humanize_seconds(uptime),
     }, indent=2)
 
 

@@ -10,15 +10,47 @@ Config lives at ~/.srclight/workspaces/{name}.json
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
+import os
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("srclight.workspace")
+
+
+class _WarningRing(logging.Handler):
+    """Keeps the last few hundred WARNING+ records so /healthz can bark.
+
+    STUBBY (pack review 2026-09-01): 410 "Failed to attach" warnings went to a
+    write-only journal while the dashboard stayed green. A ring buffer lets the
+    health payload report `warnings_last_hour` without a log watcher.
+    """
+
+    def __init__(self, maxlen: int = 500):
+        super().__init__(level=logging.WARNING)
+        self.records: collections.deque[tuple[float, str]] = collections.deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.records.append((record.created, record.getMessage()))
+        except Exception:  # noqa: BLE001 -- a logging handler must never raise
+            pass
+
+    def since(self, seconds: float) -> list[str]:
+        import time as _time
+        cutoff = _time.time() - seconds
+        return [msg for t, msg in self.records if t >= cutoff]
+
+
+warning_ring = _WarningRing()
+logger.addHandler(warning_ring)
 
 _LEGACY_DIR = Path.home() / ".codelight"
 _NEW_DIR = Path.home() / ".srclight"
@@ -125,6 +157,24 @@ def _sanitize_schema_name(name: str) -> str:
 MAX_ATTACH = 10  # SQLite default SQLITE_MAX_ATTACHED
 
 
+def _synchronized(method):
+    """Run a WorkspaceDB method while holding the instance's re-entrant lock.
+
+    The single :memory: connection carries mutable ATTACH state that a batch
+    walk rewrites as it goes. Two walks interleaving from different threads
+    (the web dashboard runs every /api/* handler on its own worker thread)
+    drift ``_attached`` away from what SQLite really has attached, after
+    which every ATTACH fails with "too many attached databases" and every
+    project reports 0 files -- for MCP callers too. See
+    test_workspace_db_concurrent_batch_walks_do_not_poison_connection.
+    """
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class WorkspaceDB:
     """Cross-repo search via ATTACH + UNION.
 
@@ -141,6 +191,11 @@ class WorkspaceDB:
         self._attached: dict[str, str] = {}  # schema_name -> project_name
         self._all_indexable: list[ProjectEntry] = []  # all entries with an index
         self._caches: dict[str, Any] = {}  # project_name -> VectorCache
+        # project_name -> (index-file version key, per-project stats). See _collect_stats.
+        self._stats_cache: dict[str, tuple[tuple, dict[str, Any]]] = {}
+        self._attach_errors: dict[str, str] = {}  # project_name -> why ATTACH failed
+        # Re-entrant so a locked method may walk _iter_batches (also locked).
+        self._lock = threading.RLock()
 
     def open(self) -> None:
         self.conn = sqlite3.connect(":memory:", check_same_thread=False)
@@ -152,6 +207,7 @@ class WorkspaceDB:
         # Attach first batch
         self._attach_batch(self._all_indexable[:MAX_ATTACH])
 
+    @_synchronized
     def close(self) -> None:
         if self.conn:
             self.conn.close()
@@ -166,13 +222,20 @@ class WorkspaceDB:
         self.close()
 
     def _detach_all(self) -> None:
-        """Detach all currently attached databases."""
+        """Detach every attached database.
+
+        Trusts ``PRAGMA database_list`` rather than ``_attached`` so the
+        connection can heal itself if bookkeeping and reality ever diverge.
+        """
         assert self.conn is not None
-        for schema in list(self._attached.keys()):
+        for row in self.conn.execute("PRAGMA database_list").fetchall():
+            name = row["name"]
+            if name in ("main", "temp"):
+                continue
             try:
-                self.conn.execute(f"DETACH DATABASE [{schema}]")
-            except sqlite3.OperationalError:
-                pass
+                self.conn.execute(f"DETACH DATABASE [{name}]")
+            except sqlite3.OperationalError as e:
+                logger.warning("Failed to detach %s: %s", name, e)
         self._attached.clear()
 
     def _attach_batch(self, entries: list[ProjectEntry]) -> None:
@@ -186,100 +249,220 @@ class WorkspaceDB:
                     (str(entry.index_db),),
                 )
                 self._attached[schema] = entry.name
+                self._attach_errors.pop(entry.name, None)
                 logger.debug("Attached %s as [%s]", entry.index_db, schema)
-            except sqlite3.OperationalError as e:
+            except sqlite3.DatabaseError as e:
+                # DatabaseError covers OperationalError AND "file is not a
+                # database": one corrupt index must cost one row, never the
+                # whole workspace (BARRY, pack review 2026-09-01).
+                self._attach_errors[entry.name] = str(e)
                 logger.warning("Failed to attach %s: %s", entry.name, e)
 
-    def _iter_batches(self, project_filter: str | None = None):
+    def _iter_batches(self, project_filter: str | None = None, entries: list[ProjectEntry] | None = None):
         """Yield batches of (schema, project_name) tuples.
 
         If all indexable projects fit in one batch (<= MAX_ATTACH), yields once
         with the already-attached schemas. Otherwise, detaches and re-attaches
-        in batches of MAX_ATTACH.
+        in batches of MAX_ATTACH. ``entries`` restricts the walk to a subset
+        (used by the stats cache to visit only projects whose index changed).
         """
-        entries = self._all_indexable
+        if entries is None:
+            entries = self._all_indexable
         if project_filter:
             entries = [e for e in entries if e.name == project_filter]
 
-        if len(entries) <= MAX_ATTACH:
-            # Ensure these specific entries are attached
-            needed = {_sanitize_schema_name(e.name) for e in entries}
-            if not needed.issubset(set(self._attached.keys())):
-                self._detach_all()
-                self._attach_batch(entries)
-            yield list(
-                (s, p) for s, p in self._attached.items()
-                if project_filter is None or p == project_filter
-            )
-        else:
-            # Need to batch
-            for i in range(0, len(entries), MAX_ATTACH):
-                batch = entries[i:i + MAX_ATTACH]
-                self._detach_all()
-                self._attach_batch(batch)
-                yield list(self._attached.items())
+        # Hold the lock across every yield: the consumer's queries run
+        # against the schemas attached here, and another walk rewriting
+        # them mid-loop is exactly the race this guards against. The lock
+        # is released when the generator is exhausted or closed.
+        with self._lock:
+            if len(entries) <= MAX_ATTACH:
+                # Ensure these specific entries are attached
+                needed = {_sanitize_schema_name(e.name) for e in entries}
+                if not needed.issubset(set(self._attached.keys())):
+                    self._detach_all()
+                    self._attach_batch(entries)
+                wanted = {e.name for e in entries}
+                yield list(
+                    (s, p) for s, p in self._attached.items()
+                    if p in wanted
+                )
+            else:
+                # Need to batch
+                for i in range(0, len(entries), MAX_ATTACH):
+                    batch = entries[i:i + MAX_ATTACH]
+                    self._detach_all()
+                    self._attach_batch(batch)
+                    yield list(self._attached.items())
 
     @property
     def project_count(self) -> int:
         return len(self._all_indexable)
 
     @property
+    @_synchronized
     def attached_projects(self) -> dict[str, str]:
         """schema_name -> project_name mapping for currently attached projects."""
         return dict(self._attached)
 
+    # ---- per-project stats cache -------------------------------------------
+
+    @staticmethod
+    def _signal_path(entry: ProjectEntry) -> Path:
+        """The indexer's last-indexed signal file (one JSON line per index run)."""
+        return entry.index_db.parent / "last-indexed"
+
+    @classmethod
+    def _stats_key(cls, entry: ProjectEntry) -> tuple:
+        """Version key for a project's index: (mtime_ns, size) of index.db, its
+        WAL file if present, and the last-indexed signal. Any reindex changes
+        at least one of them."""
+        key: list = []
+        for path in (
+            entry.index_db,
+            entry.index_db.with_name(entry.index_db.name + "-wal"),
+            cls._signal_path(entry),
+        ):
+            try:
+                st = os.stat(path)
+                key.append((st.st_mtime_ns, st.st_size))
+            except OSError:
+                key.append(None)
+        return tuple(key)
+
+    def _read_project_stats(self, schema: str) -> dict[str, Any]:
+        """Read every number the stat views need from one attached schema."""
+        assert self.conn is not None
+        q = self.conn.execute
+        files = q(f"SELECT COUNT(*) as n FROM [{schema}].files").fetchone()["n"]
+        symbols = q(f"SELECT COUNT(*) as n FROM [{schema}].symbols").fetchone()["n"]
+        edges = q(f"SELECT COUNT(*) as n FROM [{schema}].symbol_edges").fetchone()["n"]
+        languages = {
+            (r["language"] or "unknown"): r["n"]
+            for r in q(f"SELECT language, COUNT(*) as n FROM [{schema}].files "
+                       f"GROUP BY language ORDER BY n DESC")
+        }
+        kinds = {
+            r["kind"]: r["n"]
+            for r in q(f"SELECT kind, COUNT(*) as n FROM [{schema}].symbols GROUP BY kind")
+        }
+        last_indexed = q(f"SELECT MAX(indexed_at) as t FROM [{schema}].files").fetchone()["t"]
+        embedded, model, dimensions = 0, None, None
+        if q(f"SELECT name FROM [{schema}].sqlite_master "
+              f"WHERE type='table' AND name='symbol_embeddings'").fetchone():
+            embedded = q(f"SELECT COUNT(*) as n FROM [{schema}].symbol_embeddings").fetchone()["n"]
+            if embedded:
+                row = q(f"SELECT model, dimensions FROM [{schema}].symbol_embeddings LIMIT 1").fetchone()
+                if row:
+                    model, dimensions = row["model"], row["dimensions"]
+        return {
+            "files": files, "symbols": symbols, "edges": edges,
+            "languages": languages, "kinds": kinds, "last_indexed": last_indexed,
+            "embedded": embedded, "model": model, "dimensions": dimensions,
+        }
+
+    def _collect_stats(self, project_filter: str | None = None) -> dict[str, dict[str, Any]]:
+        """project_name -> stats for every indexable project (or one).
+
+        Served from the cache when the index file has not changed, so a poll
+        costs no ATTACH and no COUNT. Only projects whose key moved are
+        re-read, in batches. A read failure is returned as {"error": ...}
+        and not cached, so the next call retries it.
+        """
+        # A project indexed after open() must show up without a restart (the
+        # desktop app's add-then-index flow). Cheap: one stat per entry.
+        known = {e.name for e in self._all_indexable}
+        newly = [e for e in self.workspace.get_entries() if e.name not in known and e.has_index]
+        if newly:
+            with self._lock:
+                known = {e.name for e in self._all_indexable}
+                self._all_indexable.extend(e for e in newly if e.name not in known)
+
+        entries = self._all_indexable
+        if project_filter:
+            entries = [e for e in entries if e.name == project_filter]
+        result: dict[str, dict[str, Any]] = {}
+        stale: list[ProjectEntry] = []
+        keys: dict[str, tuple] = {}
+        for e in entries:
+            key = self._stats_key(e)
+            keys[e.name] = key
+            hit = self._stats_cache.get(e.name)
+            if hit and hit[0] == key:
+                result[e.name] = hit[1]
+            else:
+                stale.append(e)
+        if stale:
+            # Only a miss touches the connection, so only a miss takes the
+            # lock: a warm /healthz never queues behind a search walk (K9).
+            with self._lock:
+                self._walk_stale(stale, keys, result)
+        return result
+
+    def _walk_stale(self, stale: list[ProjectEntry], keys: dict[str, tuple],
+                    result: dict[str, dict[str, Any]]) -> None:
+        by_name = {e.name: e for e in stale}
+        for batch in self._iter_batches(entries=stale):
+            for schema, project_name in batch:
+                try:
+                    stats = self._read_project_stats(schema)
+                except sqlite3.DatabaseError as e:
+                    logger.warning("Error reading stats for %s: %s", project_name, e)
+                    result[project_name] = {"error": str(e)}
+                    continue
+                # "Indexed N ago" means the last index RUN when the signal
+                # file exists; MAX(files.indexed_at) only moves when a file
+                # is re-parsed and would call a project checked this
+                # morning "160d ago" (TOTO, pack review 2026-09-01).
+                run_ts = self._read_signal_timestamp(by_name[project_name])
+                if run_ts:
+                    stats = {**stats, "last_indexed": run_ts, "last_file_change": stats["last_indexed"]}
+                self._stats_cache[project_name] = (keys[project_name], stats)
+                result[project_name] = stats
+        for e in stale:
+            if e.name not in result:  # ATTACH itself failed
+                result[e.name] = {"error": self._attach_errors.get(e.name, "could not attach index")}
+
+    @classmethod
+    def _read_signal_timestamp(cls, entry: ProjectEntry) -> str | None:
+        try:
+            with open(cls._signal_path(entry), encoding="utf-8") as fh:
+                ts = json.load(fh).get("timestamp")
+            return str(ts) if ts else None
+        except (OSError, ValueError, AttributeError):
+            return None
+
     def list_projects(self) -> list[dict[str, Any]]:
         """List all projects in the workspace with their stats."""
         assert self.conn is not None
+        stats = self._collect_stats()
+        entries_by_name = {e.name: e for e in self.workspace.get_entries()}
         results = []
-        seen_projects: set[str] = set()
-
-        for batch in self._iter_batches():
-            for schema, project_name in sorted(batch, key=lambda x: x[1]):
-                if project_name in seen_projects:
-                    continue
-                seen_projects.add(project_name)
-                try:
-                    files = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].files"
-                    ).fetchone()["n"]
-                    symbols = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].symbols"
-                    ).fetchone()["n"]
-                    edges = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].symbol_edges"
-                    ).fetchone()["n"]
-
-                    lang_rows = self.conn.execute(
-                        f"SELECT language, COUNT(*) as n FROM [{schema}].files "
-                        f"GROUP BY language ORDER BY n DESC"
-                    ).fetchall()
-                    languages = {r["language"] or "unknown": r["n"] for r in lang_rows}
-
-                    entry = next(
-                        e for e in self.workspace.get_entries() if e.name == project_name
-                    )
-                    db_size = entry.index_db.stat().st_size if entry.index_db.exists() else 0
-
-                    results.append({
-                        "project": project_name,
-                        "path": entry.path,
-                        "files": files,
-                        "symbols": symbols,
-                        "edges": edges,
-                        "languages": languages,
-                        "db_size_mb": round(db_size / (1024 * 1024), 2),
-                    })
-                except sqlite3.OperationalError as e:
-                    logger.warning("Error reading stats for %s: %s", project_name, e)
-                    results.append({
-                        "project": project_name,
-                        "error": str(e),
-                    })
+        for project_name in sorted(stats):
+            st = stats[project_name]
+            if "error" in st:
+                results.append({"project": project_name, "error": st["error"]})
+                continue
+            entry = entries_by_name[project_name]
+            db_size = entry.index_db.stat().st_size if entry.index_db.exists() else 0
+            results.append({
+                "project": project_name,
+                "path": entry.path,
+                "files": st["files"],
+                "symbols": st["symbols"],
+                "edges": st["edges"],
+                "languages": st["languages"],
+                "db_size_mb": round(db_size / (1024 * 1024), 2),
+                "indexed": True,
+                "last_indexed": st["last_indexed"],
+                "last_file_change": st.get("last_file_change", st["last_indexed"]),
+                "embedded_symbols": st["embedded"],
+                "embedding_coverage": round(st["embedded"] / st["symbols"], 4) if st["symbols"] else 0.0,
+            })
 
         # Also list unindexed projects
         for entry in self.workspace.get_entries():
-            if entry.name not in seen_projects:
+            if entry.name not in stats:
                 results.append({
                     "project": entry.name,
                     "path": entry.path,
@@ -290,6 +473,7 @@ class WorkspaceDB:
 
         return results
 
+    @_synchronized
     def search_symbols(
         self, query: str, kind: str | None = None,
         project: str | None = None, limit: int = 20,
@@ -480,50 +664,38 @@ class WorkspaceDB:
     def codebase_map(self, project: str | None = None) -> dict[str, Any]:
         """Get aggregated stats across all projects (or a single one)."""
         assert self.conn is not None
+        stats = self._collect_stats(project_filter=project)
 
-        total_files = 0
-        total_symbols = 0
-        total_edges = 0
+        total_files = total_symbols = total_edges = total_embedded = 0
         all_languages: dict[str, int] = {}
         all_kinds: dict[str, int] = {}
         project_summaries: list[dict] = []
+        newest_index: str | None = None
+        errors: dict[str, str] = {}
 
-        for batch in self._iter_batches(project_filter=project):
-            for schema, project_name in batch:
-                try:
-                    files = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].files"
-                    ).fetchone()["n"]
-                    symbols = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].symbols"
-                    ).fetchone()["n"]
-                    edges = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].symbol_edges"
-                    ).fetchone()["n"]
-
-                    total_files += files
-                    total_symbols += symbols
-                    total_edges += edges
-
-                    for row in self.conn.execute(
-                        f"SELECT language, COUNT(*) as n FROM [{schema}].files GROUP BY language"
-                    ):
-                        lang = row["language"] or "unknown"
-                        all_languages[lang] = all_languages.get(lang, 0) + row["n"]
-
-                    for row in self.conn.execute(
-                        f"SELECT kind, COUNT(*) as n FROM [{schema}].symbols GROUP BY kind"
-                    ):
-                        all_kinds[row["kind"]] = all_kinds.get(row["kind"], 0) + row["n"]
-
-                    project_summaries.append({
-                        "project": project_name,
-                        "files": files,
-                        "symbols": symbols,
-                        "edges": edges,
-                    })
-                except sqlite3.OperationalError as e:
-                    logger.warning("Error reading %s: %s", project_name, e)
+        for project_name in sorted(stats):
+            st = stats[project_name]
+            if "error" in st:
+                errors[project_name] = st["error"]
+                continue
+            total_files += st["files"]
+            total_symbols += st["symbols"]
+            total_edges += st["edges"]
+            total_embedded += st["embedded"]
+            for lang, n in st["languages"].items():
+                all_languages[lang] = all_languages.get(lang, 0) + n
+            for kind, n in st["kinds"].items():
+                all_kinds[kind] = all_kinds.get(kind, 0) + n
+            li = st["last_indexed"]
+            if li and (newest_index is None or li > newest_index):
+                newest_index = li
+            project_summaries.append({
+                "project": project_name,
+                "files": st["files"],
+                "symbols": st["symbols"],
+                "edges": st["edges"],
+                "last_indexed": li,
+            })
 
         return {
             "workspace": self.workspace.name,
@@ -532,12 +704,17 @@ class WorkspaceDB:
                 "files": total_files,
                 "symbols": total_symbols,
                 "edges": total_edges,
+                "embedded": total_embedded,
             },
+            "last_indexed": newest_index,
+            "projects_errored": len(errors),
+            "errors": errors,
             "languages": dict(sorted(all_languages.items(), key=lambda x: -x[1])),
             "symbol_kinds": dict(sorted(all_kinds.items(), key=lambda x: -x[1])),
             "projects": project_summaries,
         }
 
+    @_synchronized
     def get_symbol(self, name: str, project: str | None = None) -> list[dict[str, Any]]:
         """Get full symbol details by name across projects."""
         assert self.conn is not None
@@ -585,6 +762,7 @@ class WorkspaceDB:
 
         return results
 
+    @_synchronized
     def _get_project_cache(self, project_name: str):
         """Get or create a VectorCache for a project.
 
@@ -618,6 +796,7 @@ class WorkspaceDB:
         # Next call will re-check sidecar existence (fast filesystem stat).
         return None
 
+    @_synchronized
     def vector_search(
         self, query_embedding: bytes, dimensions: int,
         project: str | None = None, kind: str | None = None, limit: int = 10,
@@ -800,42 +979,17 @@ class WorkspaceDB:
     def embedding_stats(self, project: str | None = None) -> dict[str, Any]:
         """Get embedding statistics across workspace projects."""
         assert self.conn is not None
-        total_symbols = 0
-        total_embedded = 0
-        model = None
-        dimensions = None
-
-        for batch in self._iter_batches(project_filter=project):
-            for schema, project_name in batch:
-                try:
-                    n_sym = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].symbols"
-                    ).fetchone()["n"]
-                    total_symbols += n_sym
-
-                    # Check if embeddings table exists
-                    table_check = self.conn.execute(
-                        f"SELECT name FROM [{schema}].sqlite_master "
-                        f"WHERE type='table' AND name='symbol_embeddings'"
-                    ).fetchone()
-                    if not table_check:
-                        continue
-
-                    n_emb = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].symbol_embeddings"
-                    ).fetchone()["n"]
-                    total_embedded += n_emb
-
-                    if model is None and n_emb > 0:
-                        row = self.conn.execute(
-                            f"SELECT model, dimensions FROM [{schema}].symbol_embeddings LIMIT 1"
-                        ).fetchone()
-                        if row:
-                            model = row["model"]
-                            dimensions = row["dimensions"]
-                except sqlite3.OperationalError:
-                    pass
-
+        stats = self._collect_stats(project_filter=project)
+        total_symbols = total_embedded = 0
+        model = dimensions = None
+        for project_name in sorted(stats):
+            st = stats[project_name]
+            if "error" in st:
+                continue
+            total_symbols += st["symbols"]
+            total_embedded += st["embedded"]
+            if model is None and st["embedded"]:
+                model, dimensions = st["model"], st["dimensions"]
         return {
             "total_symbols": total_symbols,
             "embedded_symbols": total_embedded,
