@@ -10,6 +10,7 @@ Config lives at ~/.srclight/workspaces/{name}.json
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -22,6 +23,34 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("srclight.workspace")
+
+
+class _WarningRing(logging.Handler):
+    """Keeps the last few hundred WARNING+ records so /healthz can bark.
+
+    STUBBY (pack review 2026-09-01): 410 "Failed to attach" warnings went to a
+    write-only journal while the dashboard stayed green. A ring buffer lets the
+    health payload report `warnings_last_hour` without a log watcher.
+    """
+
+    def __init__(self, maxlen: int = 500):
+        super().__init__(level=logging.WARNING)
+        self.records: collections.deque[tuple[float, str]] = collections.deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.records.append((record.created, record.getMessage()))
+        except Exception:  # noqa: BLE001 -- a logging handler must never raise
+            pass
+
+    def since(self, seconds: float) -> list[str]:
+        import time as _time
+        cutoff = _time.time() - seconds
+        return [msg for t, msg in self.records if t >= cutoff]
+
+
+warning_ring = _WarningRing()
+logger.addHandler(warning_ring)
 
 _LEGACY_DIR = Path.home() / ".codelight"
 _NEW_DIR = Path.home() / ".srclight"
@@ -164,6 +193,7 @@ class WorkspaceDB:
         self._caches: dict[str, Any] = {}  # project_name -> VectorCache
         # project_name -> (index-file version key, per-project stats). See _collect_stats.
         self._stats_cache: dict[str, tuple[tuple, dict[str, Any]]] = {}
+        self._attach_errors: dict[str, str] = {}  # project_name -> why ATTACH failed
         # Re-entrant so a locked method may walk _iter_batches (also locked).
         self._lock = threading.RLock()
 
@@ -219,8 +249,13 @@ class WorkspaceDB:
                     (str(entry.index_db),),
                 )
                 self._attached[schema] = entry.name
+                self._attach_errors.pop(entry.name, None)
                 logger.debug("Attached %s as [%s]", entry.index_db, schema)
-            except sqlite3.OperationalError as e:
+            except sqlite3.DatabaseError as e:
+                # DatabaseError covers OperationalError AND "file is not a
+                # database": one corrupt index must cost one row, never the
+                # whole workspace (BARRY, pack review 2026-09-01).
+                self._attach_errors[entry.name] = str(e)
                 logger.warning("Failed to attach %s: %s", entry.name, e)
 
     def _iter_batches(self, project_filter: str | None = None, entries: list[ProjectEntry] | None = None):
@@ -273,11 +308,21 @@ class WorkspaceDB:
     # ---- per-project stats cache -------------------------------------------
 
     @staticmethod
-    def _stats_key(entry: ProjectEntry) -> tuple:
-        """Version key for a project's index: (mtime_ns, size) of index.db and
-        its WAL file if present. Any reindex changes at least one of them."""
+    def _signal_path(entry: ProjectEntry) -> Path:
+        """The indexer's last-indexed signal file (one JSON line per index run)."""
+        return entry.index_db.parent / "last-indexed"
+
+    @classmethod
+    def _stats_key(cls, entry: ProjectEntry) -> tuple:
+        """Version key for a project's index: (mtime_ns, size) of index.db, its
+        WAL file if present, and the last-indexed signal. Any reindex changes
+        at least one of them."""
         key: list = []
-        for path in (entry.index_db, entry.index_db.with_name(entry.index_db.name + "-wal")):
+        for path in (
+            entry.index_db,
+            entry.index_db.with_name(entry.index_db.name + "-wal"),
+            cls._signal_path(entry),
+        ):
             try:
                 st = os.stat(path)
                 key.append((st.st_mtime_ns, st.st_size))
@@ -324,6 +369,15 @@ class WorkspaceDB:
         re-read, in batches. A read failure is returned as {"error": ...}
         and not cached, so the next call retries it.
         """
+        # A project indexed after open() must show up without a restart (the
+        # desktop app's add-then-index flow). Cheap: one stat per entry.
+        known = {e.name for e in self._all_indexable}
+        newly = [e for e in self.workspace.get_entries() if e.name not in known and e.has_index]
+        if newly:
+            with self._lock:
+                known = {e.name for e in self._all_indexable}
+                self._all_indexable.extend(e for e in newly if e.name not in known)
+
         entries = self._all_indexable
         if project_filter:
             entries = [e for e in entries if e.name == project_filter]
@@ -339,19 +393,45 @@ class WorkspaceDB:
             else:
                 stale.append(e)
         if stale:
-            for batch in self._iter_batches(entries=stale):
-                for schema, project_name in batch:
-                    try:
-                        stats = self._read_project_stats(schema)
-                    except sqlite3.OperationalError as e:
-                        logger.warning("Error reading stats for %s: %s", project_name, e)
-                        result[project_name] = {"error": str(e)}
-                        continue
-                    self._stats_cache[project_name] = (keys[project_name], stats)
-                    result[project_name] = stats
+            # Only a miss touches the connection, so only a miss takes the
+            # lock: a warm /healthz never queues behind a search walk (K9).
+            with self._lock:
+                self._walk_stale(stale, keys, result)
         return result
 
-    @_synchronized
+    def _walk_stale(self, stale: list[ProjectEntry], keys: dict[str, tuple],
+                    result: dict[str, dict[str, Any]]) -> None:
+        by_name = {e.name: e for e in stale}
+        for batch in self._iter_batches(entries=stale):
+            for schema, project_name in batch:
+                try:
+                    stats = self._read_project_stats(schema)
+                except sqlite3.DatabaseError as e:
+                    logger.warning("Error reading stats for %s: %s", project_name, e)
+                    result[project_name] = {"error": str(e)}
+                    continue
+                # "Indexed N ago" means the last index RUN when the signal
+                # file exists; MAX(files.indexed_at) only moves when a file
+                # is re-parsed and would call a project checked this
+                # morning "160d ago" (TOTO, pack review 2026-09-01).
+                run_ts = self._read_signal_timestamp(by_name[project_name])
+                if run_ts:
+                    stats = {**stats, "last_indexed": run_ts, "last_file_change": stats["last_indexed"]}
+                self._stats_cache[project_name] = (keys[project_name], stats)
+                result[project_name] = stats
+        for e in stale:
+            if e.name not in result:  # ATTACH itself failed
+                result[e.name] = {"error": self._attach_errors.get(e.name, "could not attach index")}
+
+    @classmethod
+    def _read_signal_timestamp(cls, entry: ProjectEntry) -> str | None:
+        try:
+            with open(cls._signal_path(entry), encoding="utf-8") as fh:
+                ts = json.load(fh).get("timestamp")
+            return str(ts) if ts else None
+        except (OSError, ValueError, AttributeError):
+            return None
+
     def list_projects(self) -> list[dict[str, Any]]:
         """List all projects in the workspace with their stats."""
         assert self.conn is not None
@@ -375,6 +455,7 @@ class WorkspaceDB:
                 "db_size_mb": round(db_size / (1024 * 1024), 2),
                 "indexed": True,
                 "last_indexed": st["last_indexed"],
+                "last_file_change": st.get("last_file_change", st["last_indexed"]),
                 "embedded_symbols": st["embedded"],
                 "embedding_coverage": round(st["embedded"] / st["symbols"], 4) if st["symbols"] else 0.0,
             })
@@ -580,7 +661,6 @@ class WorkspaceDB:
         results.sort(key=lambda r: (r.get("vendored", False), r.get("rank", 0)))
         return results[:limit]
 
-    @_synchronized
     def codebase_map(self, project: str | None = None) -> dict[str, Any]:
         """Get aggregated stats across all projects (or a single one)."""
         assert self.conn is not None
@@ -591,10 +671,12 @@ class WorkspaceDB:
         all_kinds: dict[str, int] = {}
         project_summaries: list[dict] = []
         newest_index: str | None = None
+        errors: dict[str, str] = {}
 
         for project_name in sorted(stats):
             st = stats[project_name]
             if "error" in st:
+                errors[project_name] = st["error"]
                 continue
             total_files += st["files"]
             total_symbols += st["symbols"]
@@ -625,6 +707,8 @@ class WorkspaceDB:
                 "embedded": total_embedded,
             },
             "last_indexed": newest_index,
+            "projects_errored": len(errors),
+            "errors": errors,
             "languages": dict(sorted(all_languages.items(), key=lambda x: -x[1])),
             "symbol_kinds": dict(sorted(all_kinds.items(), key=lambda x: -x[1])),
             "projects": project_summaries,
@@ -892,7 +976,6 @@ class WorkspaceDB:
             })
         return results
 
-    @_synchronized
     def embedding_stats(self, project: str | None = None) -> dict[str, Any]:
         """Get embedding statistics across workspace projects."""
         assert self.conn is not None

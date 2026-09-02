@@ -321,7 +321,7 @@ def test_workspace_db_concurrent_batch_walks_do_not_poison_connection(tmp_path, 
 def test_workspace_stats_are_cached_until_the_index_file_changes(tmp_path, ws_dir):
     """Repeated stat calls must not re-walk (ATTACH + COUNT) 39 databases.
 
-    The dashboard polls /healthz every 10s; on the loqu8 workspace a walk
+    The dashboard polls /healthz every 10s; on a 39-project workspace a walk
     cost ~4s and held the lock the whole time. Stats are cached per project,
     keyed on the index file's (mtime, size), so a poll is free and a reindex
     is still picked up on the next call.

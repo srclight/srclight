@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,8 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 
 if TYPE_CHECKING:
     from starlette.applications import Starlette
+
+logger = logging.getLogger("srclight.web")
 
 
 def _dashboard_html() -> str:
@@ -258,6 +261,7 @@ def _dashboard_html() -> str:
     .footer-copy { font-size: 0.72rem; color: var(--text-faint); }
 
     .hidden { display: none !important; }
+    body.is-down .stat-value, body.is-down .info-value, body.is-down .stats-sub { opacity: 0.4; }
     .dim { color: var(--text-dim); }
 
     /* -- Responsive -- */
@@ -557,9 +561,19 @@ def _dashboard_html() -> str:
     }
 
     /* ================= alert (single error surface) ================= */
-    let _retryFn = null;
-    function showAlert(msg, { raw = '', level = 'err', retry = null } = {}) {
+    // What to type when the process is gone (BARRY): the page cannot start it.
+    function rescueLine() {
+      const wsName = (state.health && state.health.workspace) || (ws && ws.value) || '<workspace>';
+      return 'If nothing supervises it, start it with: srclight serve --workspace ' + wsName + ' --web  (or: systemctl --user start srclight)';
+    }
+    let _retryFn = null, _alertPriority = 0;
+    // priority: 3 = server unreachable, 2 = workspace/index, 1 = a single pane. A lower
+    // priority never overwrites a higher one, so "create it with srclight workspace init"
+    // is not clobbered by the next poll's generic index error.
+    function showAlert(msg, { raw = '', level = 'err', retry = null, priority = 1 } = {}) {
       const a = $('alertBox');
+      if (a.classList.contains('show') && priority < _alertPriority) return;
+      _alertPriority = priority;
       $('alertText').textContent = msg;
       $('alertRaw').textContent = raw || '';
       $('alertDetails').classList.toggle('hidden', !raw);
@@ -568,7 +582,7 @@ def _dashboard_html() -> str:
       _retryFn = retry;
       $('alertRetry').classList.toggle('hidden', !retry);
     }
-    function hideAlert() { $('alertBox').classList.remove('show'); _retryFn = null; }
+    function hideAlert() { $('alertBox').classList.remove('show'); _retryFn = null; _alertPriority = 0; }
     $('alertRetry').onclick = () => { if (_retryFn) { hideAlert(); _retryFn(); } };
 
     /* ================= state ================= */
@@ -580,11 +594,10 @@ def _dashboard_html() -> str:
     function composeHealth(h) {
       if (!h) return { level: 'err', text: 'unreachable' };
       if (h.status === 'error' || h.index_error) return { level: 'err', text: 'index error' };
-      const e = h.embeddings || {};
-      if (e.status !== 'ok') return { level: 'warn', text: 'degraded · embeddings ' + (e.status || 'unknown') };
-      if (e.reachable === false) return { level: 'warn', text: 'degraded · embedding provider unreachable' };
-      if (e.resident === false) return { level: 'warn', text: 'embedding model not loaded' };
-      if (h.embedded === 0 && h.symbols > 0) return { level: 'warn', text: 'keyword only · no embeddings' };
+      // The server spells out every reason a monitor would alert on; the
+      // header shows the first so human and machine agree (STUBBY).
+      const d = Array.isArray(h.degraded) ? h.degraded : [];
+      if (d.length) return { level: 'warn', text: 'degraded · ' + d[0] + (d.length > 1 ? ' (+' + (d.length - 1) + ')' : '') };
       return { level: 'ok', text: 'healthy' };
     }
     function paintHealth(h) {
@@ -592,7 +605,9 @@ def _dashboard_html() -> str:
       $('statusDot').className = 'status-dot ' + c.level;
       $('healthPill').className = 'health ' + c.level;
       $('healthText').textContent = c.text;
-      if (!h) { $('headerMeta').innerHTML = ''; return; }
+      $('healthPill').title = h && h.degraded && h.degraded.length ? h.degraded.join('\n') : '';
+      document.body.classList.toggle('is-down', !h);
+      if (!h) { $('headerMeta').innerHTML = '<span class="dim">showing last known values</span>'; return; }
       const q = h.queries || {};
       const lastQ = q.last_ago_seconds != null ? '<b>' + esc(humanSecs(q.last_ago_seconds)) + ' ago</b>' : '<b>never</b>';
       $('headerMeta').innerHTML = 'up ' + esc(humanSecs(h.uptime_seconds)) + ' · last query ' + lastQ + ' · ' + fmt(q.count || 0) + ' queries';
@@ -620,7 +635,7 @@ def _dashboard_html() -> str:
         healthEl.textContent = e.resident === false ? 'reachable · model not loaded' : 'healthy' + (e.dimensions ? ' · ' + e.dimensions + 'd' : '');
         healthEl.className = 'info-value ' + (e.resident === false ? 'warn' : 'ok');
       } else {
-        healthEl.textContent = (e.status || 'unknown') + (e.error ? ' · ' + e.error : '');
+        healthEl.textContent = (e.status || 'unknown') + (e.error ? ' · ' + e.error : '') + (e.hint ? ' — ' + e.hint : '');
         healthEl.className = 'info-value err';
       }
       const fresh = relTime(h.last_indexed);
@@ -641,14 +656,14 @@ def _dashboard_html() -> str:
     async function loadHealth() {
       const wasDown = state.down === true;
       try {
-        const h = await api('/healthz', { timeout: 15000 });
+        const h = await api('/healthz', { timeout: 30000 });
         state.health = h; state.down = false; paintHealth(h);
-        if (h.index_error) { showAlert('The index could not be read.', { raw: h.index_error, retry: reloadAll }); return; }
+        if (h.index_error) { showAlert('The index could not be read.', { raw: h.index_error, retry: reloadAll, priority: 2 }); return; }
         // Back after an outage or restart: clear the red state and rebuild every pane.
         if (wasDown) { hideAlert(); loadStats(); loadProjects(); loadWorkspaces(); loadConnectionInfo(); }
       } catch (e) {
         state.health = null; state.down = true; paintHealth(null);
-        showAlert('Cannot reach the srclight server. Retrying every few seconds…', { raw: e.raw || e.message, retry: reloadAll });
+        showAlert('Cannot reach the srclight server. Retrying every few seconds… ' + rescueLine(), { raw: e.raw || e.message, retry: reloadAll, priority: 3 });
       }
     }
 
@@ -664,7 +679,7 @@ def _dashboard_html() -> str:
         avail.forEach(n => { const o = document.createElement('option'); o.value = n; o.textContent = n; if (n === cur) o.selected = true; ws.appendChild(o); });
         if (cur && !avail.includes(cur)) {
           const o = document.createElement('option'); o.value = cur; o.textContent = cur + ' (not found)'; o.selected = true; ws.prepend(o);
-          showAlert("Workspace '" + cur + "' has no config. Pick another, or create it with: srclight workspace init " + cur);
+          showAlert("Workspace '" + cur + "' has no config. Pick another, or create it with: srclight workspace init " + cur, { priority: 2 });
         }
         state.lastGoodWs = ws.value;
       } catch (e) {
@@ -674,6 +689,7 @@ def _dashboard_html() -> str:
     ws.addEventListener('change', async () => {
       const name = ws.value;
       if (!name || name === state.lastGoodWs) return;
+      if (!confirm('Switch the server to workspace "' + name + '"? Every connected AI tool will see the new workspace.')) { ws.value = state.lastGoodWs; return; }
       const gen = ++state.gen;
       ['statProjects','statFiles','statSymbols','statEdges','statEmbedded'].forEach(id => { $(id).textContent = '—'; setLoading(id, true); });
       $('projectList').innerHTML = '<div class="proj-empty dim">Switching to ' + esc(name) + '…</div>';
@@ -685,7 +701,7 @@ def _dashboard_html() -> str:
         await reloadAll();
       } catch (e) {
         ws.value = state.lastGoodWs;
-        showAlert('Could not switch workspace: ' + e.message, { raw: e.raw });
+        showAlert('Could not switch workspace: ' + e.message, { raw: e.raw, priority: 2 });
         reloadAll();
       }
     });
@@ -752,8 +768,10 @@ def _dashboard_html() -> str:
       const html = rows.map(({ p, st }) => {
         const name = p.project || p.name || '?';
         const cov = p.embedding_coverage != null ? Math.round(p.embedding_coverage * 100) : null;
-        const numCell = (v, cls = '') => '<div class="num ' + cls + (v ? '' : ' zero') + '">' + fmt(v ?? 0) + '</div>';
-        const embed = cov == null ? '<div class="col-embed rel">—</div>' :
+        const numCell = (v, cls = '') => p.error
+          ? '<div class="num ' + cls + ' zero">—</div>'
+          : '<div class="num ' + cls + (v ? '' : ' zero') + '">' + fmt(v ?? 0) + '</div>';
+        const embed = (cov == null || p.error) ? '<div class="col-embed rel">—</div>' :
           '<div class="col-embed embed-cell"><div class="embed-bar-track"><div class="embed-bar-fill' + (cov < 95 ? ' warn' : '') + '" style="width:' + cov + '%"></div></div><span class="embed-pct">' + cov + '%</span></div>';
         const rel = relTime(p.last_indexed);
         const langs = Object.entries(p.languages || {}).sort((a, b) => b[1] - a[1]);
@@ -910,6 +928,7 @@ def _dashboard_html() -> str:
       btn.disabled = true; msg.style.color = ''; msg.textContent = 'Requesting restart…';
       try {
         const d = await api('/api/restart_server', { method: 'POST', timeout: 8000 });
+        if (d && d.ok === false) { msg.style.color = 'var(--amber)'; msg.textContent = d.message || 'Restart is disabled on this server.'; return; }
         msg.textContent = (d && d.message) || 'Restarting…';
         // Burst-poll until the process answers again, then rebuild the page.
         const started = state.health && state.health.uptime_seconds;
@@ -920,7 +939,7 @@ def _dashboard_html() -> str:
           msg.textContent = 'Waiting for the server… ' + (i + 1) + 's';
         }
         if (back) { msg.style.color = 'var(--green)'; msg.textContent = 'Back up.'; hideAlert(); await reloadAll(); }
-        else { msg.style.color = 'var(--red)'; msg.textContent = 'Server did not come back within 30s. Check the process.'; }
+        else { msg.style.color = 'var(--red)'; msg.textContent = 'srclight exited but nothing restarted it within 30s. ' + rescueLine(); }
       } catch (e) {
         msg.style.color = 'var(--red)'; msg.textContent = e.message + (e.raw ? ' (' + e.raw + ')' : '');
       } finally { btn.disabled = false; }
@@ -946,7 +965,54 @@ def _dashboard_html() -> str:
 
 
 async def _run_sync(fn, *args, **kwargs):
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    """Run a sync tool function on a worker thread, flagged as dashboard traffic.
+
+    The context var is copied into the thread by asyncio.to_thread, so
+    _record_query skips it: the page's polls never count as agent queries.
+    """
+    from . import server as server_mod
+    token = server_mod._dashboard_request.set(True)
+    try:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    finally:
+        server_mod._dashboard_request.reset(token)
+
+
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+def _host_of(value: str) -> str:
+    """Hostname part of a Host/Origin value: strips scheme and port, keeps [::1]."""
+    v = value.strip().lower()
+    if "://" in v:
+        v = v.split("://", 1)[1]
+    v = v.split("/", 1)[0]
+    if v.startswith("["):
+        return v.split("]", 1)[0] + "]"
+    return v.rsplit(":", 1)[0] if ":" in v else v
+
+
+def _local_only(endpoint):
+    """Draw the same line for the dashboard that the MCP SDK draws for /mcp.
+
+    SAM (pack review 2026-09-01): mcp>=2 rejects foreign Host headers on /sse
+    and /mcp (DNS-rebinding guard) but routes appended by add_web_routes sat
+    outside it, so a rebinding page could read /api/list_projects and POST to
+    /api/restart_server. A foreign Host gets 421; a POST with a foreign Origin
+    (form / no-cors fetch) gets 403. No Origin at all (curl, same-origin GET)
+    is allowed.
+    """
+    async def guarded(request: Request) -> Response:
+        host = request.headers.get("host", "")
+        if _host_of(host) not in _LOCAL_HOSTS:
+            return JSONResponse({"error": "Invalid Host header"}, status_code=421)
+        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+            origin = request.headers.get("origin")
+            if origin and _host_of(origin) not in _LOCAL_HOSTS:
+                return JSONResponse({"error": "Cross-origin request refused"}, status_code=403)
+        return await endpoint(request)
+    guarded.__name__ = getattr(endpoint, "__name__", "guarded")
+    return guarded
 
 
 async def _api_list_projects(_request: Request) -> Response:
@@ -1057,7 +1123,9 @@ async def _api_switch_workspace(request: Request) -> Response:
         return JSONResponse({"error": str(e)}, status_code=404)
     try:
         from . import server as server_mod
-        server_mod.configure_workspace(name)
+        # configure_workspace closes the current WorkspaceDB under its lock;
+        # off the event loop so an in-flight walk cannot freeze MCP sessions (K9).
+        await _run_sync(server_mod.configure_workspace, name)
         return JSONResponse({"ok": True, "workspace": name})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1222,13 +1290,15 @@ def _healthz_payload() -> dict:
     payload["workspace"] = server_mod._workspace_name
     payload.update({
         "projects": None, "files": None, "symbols": None, "edges": None,
-        "embedded": None, "last_indexed": None,
+        "embedded": None, "last_indexed": None, "projects_errored": 0, "errors": {},
     })
     last_q = getattr(server_mod, "_last_query_time", None)
     payload["queries"] = {
         "count": getattr(server_mod, "_query_count", 0),
         "last_ago_seconds": round(time.time() - last_q, 1) if last_q else None,
+        "recent": server_mod.recent_queries(10),
     }
+    payload["warming"] = server_mod._warming
 
     try:
         cmap = json.loads(server_mod.codebase_map())
@@ -1236,6 +1306,8 @@ def _healthz_payload() -> dict:
             payload["projects"] = cmap.get("projects_attached")
             payload.update({k: cmap["totals"].get(k) for k in ("files", "symbols", "edges", "embedded")})
             payload["last_indexed"] = cmap.get("last_indexed")
+            payload["projects_errored"] = cmap.get("projects_errored", 0)
+            payload["errors"] = cmap.get("errors", {})
         elif "index" in cmap:  # single-repo mode
             payload["projects"] = 1
             payload.update({k: cmap["index"].get(k) for k in ("files", "symbols", "edges")})
@@ -1249,7 +1321,39 @@ def _healthz_payload() -> dict:
         payload["embeddings"] = {"status": "error", "error": str(e)}
     if not payload["embeddings"].get("status"):
         payload["embeddings"]["status"] = "unknown"
+
+    # `status` stays "ok" while the process can answer (liveness). Anything a
+    # monitor or the header should alert on is spelled out in `degraded`, so
+    # human and machine disagree about nothing (STUBBY).
+    from .workspace import warning_ring
+    warnings = warning_ring.since(3600)
+    payload["warnings_last_hour"] = len(warnings)
+    degraded: list[str] = []
+    emb = payload["embeddings"]
+    if emb.get("status") != "ok":
+        degraded.append(f"embeddings {emb.get('status')}" + (f": {emb['error']}" if emb.get("error") else ""))
+    elif emb.get("reachable") is False:
+        degraded.append("embedding provider unreachable")
+    elif emb.get("resident") is False:
+        degraded.append("embedding model not loaded")
+    if payload.get("embedded") == 0 and (payload.get("symbols") or 0) > 0:
+        degraded.append("no embeddings: keyword search only")
+    if payload["projects_errored"]:
+        degraded.append(f"{payload['projects_errored']} project(s) unreadable")
+    if warnings:
+        degraded.append(f"{len(warnings)} workspace warning(s) in the last hour")
+    payload["degraded"] = degraded
     return payload
+
+
+async def _api_recent_queries(request: Request) -> Response:
+    """The agent ledger: what tools were called, with what, newest first."""
+    from . import server as server_mod
+    try:
+        limit = int(request.query_params.get("limit", 20))
+    except (TypeError, ValueError):
+        limit = 20
+    return JSONResponse({"items": server_mod.recent_queries(limit)})
 
 
 async def _redirect_root(_request: Request) -> Response:
@@ -1288,6 +1392,47 @@ def add_web_routes(app: "Starlette") -> None:
         Route("/api/search", _api_search, methods=["GET"]),
         Route("/api/connection_info", _api_connection_info, methods=["GET"]),
         Route("/api/stats", _api_stats, methods=["GET"]),
+        Route("/api/recent_queries", _api_recent_queries, methods=["GET"]),
     ]
     for r in routes:
+        r.endpoint = _local_only(r.endpoint)
+        r.app = _local_only_app(r)
         app.router.routes.append(r)
+
+    async def _warm_stats() -> None:
+        """Prime the per-project stats cache off the request path so the first
+        /healthz after a restart answers in milliseconds, not 15 s (TOTO)."""
+        import threading
+        from . import server as server_mod
+
+        def run() -> None:
+            try:
+                if not server_mod._is_workspace_mode():
+                    return
+                server_mod._warming = "index stats"
+                wdb = server_mod._get_workspace_db()
+                wdb.codebase_map()
+                # First hybrid search after a restart otherwise pays for every
+                # sidecar load (a minute on a 39-project workspace). Load them
+                # now, one project at a time so the lock is never held long.
+                names = [e.name for e in wdb._all_indexable]
+                for i, name in enumerate(names, 1):
+                    server_mod._warming = f"vector caches ({i}/{len(names)})"
+                    try:
+                        wdb._get_project_cache(name)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("vector cache warm-up failed for %s: %s", name, e)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("warm-up failed: %s", e)
+            finally:
+                server_mod._warming = None
+
+        threading.Thread(target=run, name="srclight-stats-warm", daemon=True).start()
+
+    app.router.on_startup.append(_warm_stats)
+
+
+def _local_only_app(route):
+    """Starlette caches `route.app` at construction; rebuild it from the guarded endpoint."""
+    from starlette.routing import request_response
+    return request_response(route.endpoint)
