@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -161,6 +162,8 @@ class WorkspaceDB:
         self._attached: dict[str, str] = {}  # schema_name -> project_name
         self._all_indexable: list[ProjectEntry] = []  # all entries with an index
         self._caches: dict[str, Any] = {}  # project_name -> VectorCache
+        # project_name -> (index-file version key, per-project stats). See _collect_stats.
+        self._stats_cache: dict[str, tuple[tuple, dict[str, Any]]] = {}
         # Re-entrant so a locked method may walk _iter_batches (also locked).
         self._lock = threading.RLock()
 
@@ -220,14 +223,16 @@ class WorkspaceDB:
             except sqlite3.OperationalError as e:
                 logger.warning("Failed to attach %s: %s", entry.name, e)
 
-    def _iter_batches(self, project_filter: str | None = None):
+    def _iter_batches(self, project_filter: str | None = None, entries: list[ProjectEntry] | None = None):
         """Yield batches of (schema, project_name) tuples.
 
         If all indexable projects fit in one batch (<= MAX_ATTACH), yields once
         with the already-attached schemas. Otherwise, detaches and re-attaches
-        in batches of MAX_ATTACH.
+        in batches of MAX_ATTACH. ``entries`` restricts the walk to a subset
+        (used by the stats cache to visit only projects whose index changed).
         """
-        entries = self._all_indexable
+        if entries is None:
+            entries = self._all_indexable
         if project_filter:
             entries = [e for e in entries if e.name == project_filter]
 
@@ -242,9 +247,10 @@ class WorkspaceDB:
                 if not needed.issubset(set(self._attached.keys())):
                     self._detach_all()
                     self._attach_batch(entries)
+                wanted = {e.name for e in entries}
                 yield list(
                     (s, p) for s, p in self._attached.items()
-                    if project_filter is None or p == project_filter
+                    if p in wanted
                 )
             else:
                 # Need to batch
@@ -264,79 +270,118 @@ class WorkspaceDB:
         """schema_name -> project_name mapping for currently attached projects."""
         return dict(self._attached)
 
+    # ---- per-project stats cache -------------------------------------------
+
+    @staticmethod
+    def _stats_key(entry: ProjectEntry) -> tuple:
+        """Version key for a project's index: (mtime_ns, size) of index.db and
+        its WAL file if present. Any reindex changes at least one of them."""
+        key: list = []
+        for path in (entry.index_db, entry.index_db.with_name(entry.index_db.name + "-wal")):
+            try:
+                st = os.stat(path)
+                key.append((st.st_mtime_ns, st.st_size))
+            except OSError:
+                key.append(None)
+        return tuple(key)
+
+    def _read_project_stats(self, schema: str) -> dict[str, Any]:
+        """Read every number the stat views need from one attached schema."""
+        assert self.conn is not None
+        q = self.conn.execute
+        files = q(f"SELECT COUNT(*) as n FROM [{schema}].files").fetchone()["n"]
+        symbols = q(f"SELECT COUNT(*) as n FROM [{schema}].symbols").fetchone()["n"]
+        edges = q(f"SELECT COUNT(*) as n FROM [{schema}].symbol_edges").fetchone()["n"]
+        languages = {
+            (r["language"] or "unknown"): r["n"]
+            for r in q(f"SELECT language, COUNT(*) as n FROM [{schema}].files "
+                       f"GROUP BY language ORDER BY n DESC")
+        }
+        kinds = {
+            r["kind"]: r["n"]
+            for r in q(f"SELECT kind, COUNT(*) as n FROM [{schema}].symbols GROUP BY kind")
+        }
+        last_indexed = q(f"SELECT MAX(indexed_at) as t FROM [{schema}].files").fetchone()["t"]
+        embedded, model, dimensions = 0, None, None
+        if q(f"SELECT name FROM [{schema}].sqlite_master "
+              f"WHERE type='table' AND name='symbol_embeddings'").fetchone():
+            embedded = q(f"SELECT COUNT(*) as n FROM [{schema}].symbol_embeddings").fetchone()["n"]
+            if embedded:
+                row = q(f"SELECT model, dimensions FROM [{schema}].symbol_embeddings LIMIT 1").fetchone()
+                if row:
+                    model, dimensions = row["model"], row["dimensions"]
+        return {
+            "files": files, "symbols": symbols, "edges": edges,
+            "languages": languages, "kinds": kinds, "last_indexed": last_indexed,
+            "embedded": embedded, "model": model, "dimensions": dimensions,
+        }
+
+    def _collect_stats(self, project_filter: str | None = None) -> dict[str, dict[str, Any]]:
+        """project_name -> stats for every indexable project (or one).
+
+        Served from the cache when the index file has not changed, so a poll
+        costs no ATTACH and no COUNT. Only projects whose key moved are
+        re-read, in batches. A read failure is returned as {"error": ...}
+        and not cached, so the next call retries it.
+        """
+        entries = self._all_indexable
+        if project_filter:
+            entries = [e for e in entries if e.name == project_filter]
+        result: dict[str, dict[str, Any]] = {}
+        stale: list[ProjectEntry] = []
+        keys: dict[str, tuple] = {}
+        for e in entries:
+            key = self._stats_key(e)
+            keys[e.name] = key
+            hit = self._stats_cache.get(e.name)
+            if hit and hit[0] == key:
+                result[e.name] = hit[1]
+            else:
+                stale.append(e)
+        if stale:
+            for batch in self._iter_batches(entries=stale):
+                for schema, project_name in batch:
+                    try:
+                        stats = self._read_project_stats(schema)
+                    except sqlite3.OperationalError as e:
+                        logger.warning("Error reading stats for %s: %s", project_name, e)
+                        result[project_name] = {"error": str(e)}
+                        continue
+                    self._stats_cache[project_name] = (keys[project_name], stats)
+                    result[project_name] = stats
+        return result
+
     @_synchronized
     def list_projects(self) -> list[dict[str, Any]]:
         """List all projects in the workspace with their stats."""
         assert self.conn is not None
+        stats = self._collect_stats()
+        entries_by_name = {e.name: e for e in self.workspace.get_entries()}
         results = []
-        seen_projects: set[str] = set()
-
-        for batch in self._iter_batches():
-            for schema, project_name in sorted(batch, key=lambda x: x[1]):
-                if project_name in seen_projects:
-                    continue
-                seen_projects.add(project_name)
-                try:
-                    files = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].files"
-                    ).fetchone()["n"]
-                    symbols = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].symbols"
-                    ).fetchone()["n"]
-                    edges = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].symbol_edges"
-                    ).fetchone()["n"]
-
-                    lang_rows = self.conn.execute(
-                        f"SELECT language, COUNT(*) as n FROM [{schema}].files "
-                        f"GROUP BY language ORDER BY n DESC"
-                    ).fetchall()
-                    languages = {r["language"] or "unknown": r["n"] for r in lang_rows}
-
-                    # Freshness: newest indexed_at across the project's files.
-                    last_indexed = self.conn.execute(
-                        f"SELECT MAX(indexed_at) as t FROM [{schema}].files"
-                    ).fetchone()["t"]
-
-                    # Semantic-search coverage: embedded symbols / symbols.
-                    embedded = 0
-                    has_emb = self.conn.execute(
-                        f"SELECT name FROM [{schema}].sqlite_master "
-                        f"WHERE type='table' AND name='symbol_embeddings'"
-                    ).fetchone()
-                    if has_emb:
-                        embedded = self.conn.execute(
-                            f"SELECT COUNT(*) as n FROM [{schema}].symbol_embeddings"
-                        ).fetchone()["n"]
-
-                    entry = next(
-                        e for e in self.workspace.get_entries() if e.name == project_name
-                    )
-                    db_size = entry.index_db.stat().st_size if entry.index_db.exists() else 0
-
-                    results.append({
-                        "project": project_name,
-                        "path": entry.path,
-                        "files": files,
-                        "symbols": symbols,
-                        "edges": edges,
-                        "languages": languages,
-                        "db_size_mb": round(db_size / (1024 * 1024), 2),
-                        "indexed": True,
-                        "last_indexed": last_indexed,
-                        "embedded_symbols": embedded,
-                        "embedding_coverage": round(embedded / symbols, 4) if symbols else 0.0,
-                    })
-                except sqlite3.OperationalError as e:
-                    logger.warning("Error reading stats for %s: %s", project_name, e)
-                    results.append({
-                        "project": project_name,
-                        "error": str(e),
-                    })
+        for project_name in sorted(stats):
+            st = stats[project_name]
+            if "error" in st:
+                results.append({"project": project_name, "error": st["error"]})
+                continue
+            entry = entries_by_name[project_name]
+            db_size = entry.index_db.stat().st_size if entry.index_db.exists() else 0
+            results.append({
+                "project": project_name,
+                "path": entry.path,
+                "files": st["files"],
+                "symbols": st["symbols"],
+                "edges": st["edges"],
+                "languages": st["languages"],
+                "db_size_mb": round(db_size / (1024 * 1024), 2),
+                "indexed": True,
+                "last_indexed": st["last_indexed"],
+                "embedded_symbols": st["embedded"],
+                "embedding_coverage": round(st["embedded"] / st["symbols"], 4) if st["symbols"] else 0.0,
+            })
 
         # Also list unindexed projects
         for entry in self.workspace.get_entries():
-            if entry.name not in seen_projects:
+            if entry.name not in stats:
                 results.append({
                     "project": entry.name,
                     "path": entry.path,
@@ -539,58 +584,36 @@ class WorkspaceDB:
     def codebase_map(self, project: str | None = None) -> dict[str, Any]:
         """Get aggregated stats across all projects (or a single one)."""
         assert self.conn is not None
+        stats = self._collect_stats(project_filter=project)
 
-        total_files = 0
-        total_symbols = 0
-        total_edges = 0
+        total_files = total_symbols = total_edges = total_embedded = 0
         all_languages: dict[str, int] = {}
         all_kinds: dict[str, int] = {}
         project_summaries: list[dict] = []
         newest_index: str | None = None
 
-        for batch in self._iter_batches(project_filter=project):
-            for schema, project_name in batch:
-                try:
-                    files = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].files"
-                    ).fetchone()["n"]
-                    symbols = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].symbols"
-                    ).fetchone()["n"]
-                    edges = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].symbol_edges"
-                    ).fetchone()["n"]
-
-                    total_files += files
-                    total_symbols += symbols
-                    total_edges += edges
-
-                    for row in self.conn.execute(
-                        f"SELECT language, COUNT(*) as n FROM [{schema}].files GROUP BY language"
-                    ):
-                        lang = row["language"] or "unknown"
-                        all_languages[lang] = all_languages.get(lang, 0) + row["n"]
-
-                    for row in self.conn.execute(
-                        f"SELECT kind, COUNT(*) as n FROM [{schema}].symbols GROUP BY kind"
-                    ):
-                        all_kinds[row["kind"]] = all_kinds.get(row["kind"], 0) + row["n"]
-
-                    last_indexed = self.conn.execute(
-                        f"SELECT MAX(indexed_at) as t FROM [{schema}].files"
-                    ).fetchone()["t"]
-                    if last_indexed and (newest_index is None or last_indexed > newest_index):
-                        newest_index = last_indexed
-
-                    project_summaries.append({
-                        "project": project_name,
-                        "files": files,
-                        "symbols": symbols,
-                        "edges": edges,
-                        "last_indexed": last_indexed,
-                    })
-                except sqlite3.OperationalError as e:
-                    logger.warning("Error reading %s: %s", project_name, e)
+        for project_name in sorted(stats):
+            st = stats[project_name]
+            if "error" in st:
+                continue
+            total_files += st["files"]
+            total_symbols += st["symbols"]
+            total_edges += st["edges"]
+            total_embedded += st["embedded"]
+            for lang, n in st["languages"].items():
+                all_languages[lang] = all_languages.get(lang, 0) + n
+            for kind, n in st["kinds"].items():
+                all_kinds[kind] = all_kinds.get(kind, 0) + n
+            li = st["last_indexed"]
+            if li and (newest_index is None or li > newest_index):
+                newest_index = li
+            project_summaries.append({
+                "project": project_name,
+                "files": st["files"],
+                "symbols": st["symbols"],
+                "edges": st["edges"],
+                "last_indexed": li,
+            })
 
         return {
             "workspace": self.workspace.name,
@@ -599,6 +622,7 @@ class WorkspaceDB:
                 "files": total_files,
                 "symbols": total_symbols,
                 "edges": total_edges,
+                "embedded": total_embedded,
             },
             "last_indexed": newest_index,
             "languages": dict(sorted(all_languages.items(), key=lambda x: -x[1])),
@@ -872,42 +896,17 @@ class WorkspaceDB:
     def embedding_stats(self, project: str | None = None) -> dict[str, Any]:
         """Get embedding statistics across workspace projects."""
         assert self.conn is not None
-        total_symbols = 0
-        total_embedded = 0
-        model = None
-        dimensions = None
-
-        for batch in self._iter_batches(project_filter=project):
-            for schema, project_name in batch:
-                try:
-                    n_sym = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].symbols"
-                    ).fetchone()["n"]
-                    total_symbols += n_sym
-
-                    # Check if embeddings table exists
-                    table_check = self.conn.execute(
-                        f"SELECT name FROM [{schema}].sqlite_master "
-                        f"WHERE type='table' AND name='symbol_embeddings'"
-                    ).fetchone()
-                    if not table_check:
-                        continue
-
-                    n_emb = self.conn.execute(
-                        f"SELECT COUNT(*) as n FROM [{schema}].symbol_embeddings"
-                    ).fetchone()["n"]
-                    total_embedded += n_emb
-
-                    if model is None and n_emb > 0:
-                        row = self.conn.execute(
-                            f"SELECT model, dimensions FROM [{schema}].symbol_embeddings LIMIT 1"
-                        ).fetchone()
-                        if row:
-                            model = row["model"]
-                            dimensions = row["dimensions"]
-                except sqlite3.OperationalError:
-                    pass
-
+        stats = self._collect_stats(project_filter=project)
+        total_symbols = total_embedded = 0
+        model = dimensions = None
+        for project_name in sorted(stats):
+            st = stats[project_name]
+            if "error" in st:
+                continue
+            total_symbols += st["symbols"]
+            total_embedded += st["embedded"]
+            if model is None and st["embedded"]:
+                model, dimensions = st["model"], st["dimensions"]
         return {
             "total_symbols": total_symbols,
             "embedded_symbols": total_embedded,

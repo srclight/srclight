@@ -316,3 +316,49 @@ def test_workspace_db_concurrent_batch_walks_do_not_poison_connection(tmp_path, 
             assert wdb.codebase_map()["totals"]["symbols"] == 16
     finally:
         ws_mod.MAX_ATTACH = orig_limit
+
+
+def test_workspace_stats_are_cached_until_the_index_file_changes(tmp_path, ws_dir):
+    """Repeated stat calls must not re-walk (ATTACH + COUNT) 39 databases.
+
+    The dashboard polls /healthz every 10s; on the loqu8 workspace a walk
+    cost ~4s and held the lock the whole time. Stats are cached per project,
+    keyed on the index file's (mtime, size), so a poll is free and a reindex
+    is still picked up on the next call.
+    """
+    import os
+    from srclight.db import Database, FileRecord, SymbolRecord
+
+    config = WorkspaceConfig(name="cache-test")
+    proj = _create_indexed_project(tmp_path, "cached", [("Alpha", "class")])
+    config.add_project("cached", str(proj))
+
+    with WorkspaceDB(config) as wdb:
+        assert wdb.list_projects()[0]["symbols"] == 1
+        assert wdb.codebase_map()["totals"]["symbols"] == 1
+
+        attaches = []
+        real_attach = wdb._attach_batch
+        def spy(entries):
+            attaches.extend(e.name for e in entries)
+            return real_attach(entries)
+        wdb._attach_batch = spy
+
+        # Warm cache: no ATTACH, no walk.
+        wdb.list_projects(); wdb.codebase_map(); wdb.embedding_stats()
+        assert attaches == []
+
+        # Reindex the project: a new symbol lands and the file changes.
+        db_path = proj / ".srclight" / "index.db"
+        db = Database(db_path); db.open()
+        file_id = db.upsert_file(FileRecord(path="src/new.cs", content_hash="zz", mtime=2.0,
+                                            language="csharp", size=1, line_count=1))
+        db.insert_symbol(SymbolRecord(file_id=file_id, kind="class", name="Beta", qualified_name="cached.Beta",
+                                      signature="Beta", start_line=1, end_line=2, content="class Beta {}", line_count=2),
+                         "src/new.cs")
+        db.commit(); db.close()
+        st = db_path.stat()
+        os.utime(db_path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+
+        assert wdb.list_projects()[0]["symbols"] == 2
+        assert wdb.codebase_map()["totals"]["files"] == 2
