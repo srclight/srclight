@@ -293,6 +293,22 @@ class WorkspaceDB:
                     ).fetchall()
                     languages = {r["language"] or "unknown": r["n"] for r in lang_rows}
 
+                    # Freshness: newest indexed_at across the project's files.
+                    last_indexed = self.conn.execute(
+                        f"SELECT MAX(indexed_at) as t FROM [{schema}].files"
+                    ).fetchone()["t"]
+
+                    # Semantic-search coverage: embedded symbols / symbols.
+                    embedded = 0
+                    has_emb = self.conn.execute(
+                        f"SELECT name FROM [{schema}].sqlite_master "
+                        f"WHERE type='table' AND name='symbol_embeddings'"
+                    ).fetchone()
+                    if has_emb:
+                        embedded = self.conn.execute(
+                            f"SELECT COUNT(*) as n FROM [{schema}].symbol_embeddings"
+                        ).fetchone()["n"]
+
                     entry = next(
                         e for e in self.workspace.get_entries() if e.name == project_name
                     )
@@ -306,6 +322,10 @@ class WorkspaceDB:
                         "edges": edges,
                         "languages": languages,
                         "db_size_mb": round(db_size / (1024 * 1024), 2),
+                        "indexed": True,
+                        "last_indexed": last_indexed,
+                        "embedded_symbols": embedded,
+                        "embedding_coverage": round(embedded / symbols, 4) if symbols else 0.0,
                     })
                 except sqlite3.OperationalError as e:
                     logger.warning("Error reading stats for %s: %s", project_name, e)

@@ -1099,11 +1099,77 @@ async def _dashboard(_request: Request) -> Response:
     return HTMLResponse(_dashboard_html())
 
 
+# Bulb + code brackets, amber on transparent -- the srclight mark.
+_FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+<circle cx="16" cy="13" r="8" fill="#f59e0b"/>
+<rect x="12" y="21" width="8" height="3" rx="1" fill="#fbbf24"/>
+<rect x="13" y="25" width="6" height="2" rx="1" fill="#9ca3af"/>
+<path d="M7 8l-4 5 4 5M25 8l4 5-4 5" fill="none" stroke="#e4e4e7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"""
+
+
+async def _favicon(_request: Request) -> Response:
+    return Response(
+        _FAVICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+def _healthz_payload() -> dict:
+    """Liveness + the numbers an operator (or agent) needs to trust the index.
+
+    Runs on a worker thread: it walks the workspace for totals and asks the
+    embedding provider whether it is reachable. Every section is present
+    even when degraded, so a missing key can never be mistaken for "fine".
+    """
+    from ironmcp.health import health_payload
+
+    from . import __version__
+    from . import server as server_mod
+
+    payload = health_payload("srclight", __version__)
+    started = server_mod._server_start_time
+    payload["uptime_seconds"] = round(time.time() - started, 1) if started else None
+    payload["mcp"] = "/mcp"
+    payload["workspace"] = server_mod._workspace_name
+    payload.update({"projects": None, "files": None, "symbols": None, "edges": None})
+
+    try:
+        cmap = json.loads(server_mod.codebase_map())
+        if "totals" in cmap:  # workspace mode
+            payload["projects"] = cmap.get("projects_attached")
+            payload.update({k: cmap["totals"].get(k) for k in ("files", "symbols", "edges")})
+        elif "index" in cmap:  # single-repo mode
+            payload["projects"] = 1
+            payload.update({k: cmap["index"].get(k) for k in ("files", "symbols", "edges")})
+    except Exception as e:  # noqa: BLE001 -- health must answer, not raise
+        payload["status"] = "error"
+        payload["index_error"] = str(e)
+
+    try:
+        payload["embeddings"] = json.loads(server_mod.embedding_health())
+    except Exception as e:  # noqa: BLE001
+        payload["embeddings"] = {"status": "error", "error": str(e)}
+    if not payload["embeddings"].get("status"):
+        payload["embeddings"]["status"] = "unknown"
+    return payload
+
+
+async def _healthz(_request: Request) -> Response:
+    try:
+        return JSONResponse(await _run_sync(_healthz_payload))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"status": "error", "name": "srclight", "error": str(e)}, status_code=500)
+
+
 def add_web_routes(app: "Starlette") -> None:
     """Add dashboard and REST API routes to a Starlette app (e.g. from make_sse_and_streamable_http_app)."""
     from starlette.routing import Route
     routes = [
         Route("/", _dashboard, methods=["GET"]),
+        Route("/healthz", _healthz, methods=["GET"]),
+        Route("/favicon.ico", _favicon, methods=["GET"]),
         Route("/api/workspaces", _api_workspaces, methods=["GET"]),
         Route("/api/current_workspace", _api_current_workspace, methods=["GET"]),
         Route("/api/switch_workspace", _api_switch_workspace, methods=["POST"]),
