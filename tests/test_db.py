@@ -190,3 +190,93 @@ def test_stats(db):
     assert stats["languages"]["python"] == 1
     assert stats["symbol_kinds"]["function"] == 1
     assert stats["symbol_kinds"]["class"] == 1
+
+
+def _symbols_from_main_file_only(src: Path, dest_dir: Path) -> int:
+    """Copy ONLY index.db (no -wal/-shm) and count symbols readable from it.
+
+    This is what a backup tool, an rsync of '*.db', or a user tidying up the
+    odd-looking sidecars actually captures.
+    """
+    import shutil
+    import sqlite3
+    dest = dest_dir / "index.db"
+    shutil.copyfile(src, dest)
+    conn = sqlite3.connect(dest)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_checkpoint_makes_the_db_self_contained(tmp_path):
+    """After checkpoint, index.db alone must carry the data.
+
+    In WAL mode the main file holds only a 4096-byte header while a connection
+    is open — every row lives in index.db-wal. srclight never checkpointed, so
+    an index.db separated from its sidecar is an empty database with 0 tables
+    (issue #16: "I keep finding 0-length index.db files").
+    """
+    db_path = tmp_path / "index.db"
+    db = Database(db_path)
+    db.open()
+    db.initialize()
+    fid = db.upsert_file(FileRecord(path="a.py", content_hash="h", mtime=1.0,
+                                    language="python", size=10, line_count=2))
+    db.insert_symbol(SymbolRecord(file_id=fid, kind="function", name="f",
+                                  start_line=1, end_line=2, content="def f(): pass",
+                                  body_hash="b"), "a.py")
+    db.commit()
+
+    db.checkpoint()
+
+    copied = tmp_path / "copied"
+    copied.mkdir()
+    assert _symbols_from_main_file_only(db_path, copied) == 1
+    db.close()
+
+
+def test_checkpoint_works_while_another_connection_holds_the_db(tmp_path):
+    """The issue-#16 scenario: indexing while the MCP server holds the index open.
+
+    A clean close already checkpoints, but the indexer's close is NOT the last
+    connection when the server is running — so nothing moved the WAL into the
+    main file, and the user saw a 4096-byte index.db beside a large -wal and
+    read it as corruption. The checkpoint must succeed with a reader attached.
+    """
+    db_path = tmp_path / "index.db"
+    server = Database(db_path)          # the long-running MCP server
+    server.open()
+    server.initialize()
+    server.conn.execute("SELECT COUNT(*) FROM symbols").fetchone()
+
+    indexer = Database(db_path)         # the CLI indexer, second connection
+    indexer.open()
+    fid = indexer.upsert_file(FileRecord(path="a.py", content_hash="h", mtime=1.0,
+                                         language="python", size=10, line_count=2))
+    indexer.insert_symbol(SymbolRecord(file_id=fid, kind="function", name="f",
+                                       start_line=1, end_line=2, content="x",
+                                       body_hash="b"), "a.py")
+    indexer.commit()
+    indexer.checkpoint()
+
+    copied = tmp_path / "copied"
+    copied.mkdir()
+    assert _symbols_from_main_file_only(db_path, copied) == 1
+    indexer.close()
+    server.close()
+
+
+def test_checkpoint_failure_is_not_fatal(tmp_path):
+    """A checkpoint that cannot run must not take the caller down with it.
+
+    checkpoint() runs inside close(), so an exception here would turn an
+    ordinary shutdown into a crash — and its own handler must not be the thing
+    that raises.
+    """
+    db = Database(tmp_path / "index.db")
+    db.open()
+    db.initialize()
+    db.conn.close()          # pull the connection out from under it
+
+    assert db.checkpoint() is None

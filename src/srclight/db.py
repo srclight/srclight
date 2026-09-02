@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -291,6 +292,9 @@ class EdgeRecord:
     resolution: str | None = None
 
 
+logger = logging.getLogger("srclight.db")
+
+
 class Database:
     """SQLite database for Srclight index."""
 
@@ -304,8 +308,32 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
 
+    def checkpoint(self) -> tuple[int, int, int] | None:
+        """Fold the write-ahead log back into the main database file.
+
+        In WAL mode every committed row lives in `index.db-wal` until a
+        checkpoint; the main file holds a 4096-byte header and nothing else.
+        SQLite checkpoints when the LAST connection closes, but a long-running
+        MCP server means the indexer's close is never the last one — so the
+        index sat entirely in the sidecar, and an `index.db` copied or backed up
+        without it is an empty database with zero tables (issue #16).
+
+        TRUNCATE also zeroes the -wal, so a reader that finds the main file
+        alone gets a complete index rather than a header. Best-effort: a
+        checkpoint that cannot run is not a reason to fail the caller's work.
+        """
+        if self.conn is None:
+            return None
+        try:
+            row = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            return tuple(row) if row else None
+        except Exception as e:  # noqa: BLE001 -- durability nicety, never fatal
+            logger.warning("WAL checkpoint failed for %s: %s", self.path, e)
+            return None
+
     def close(self) -> None:
         if self.conn:
+            self.checkpoint()
             self.conn.close()
             self.conn = None
 
