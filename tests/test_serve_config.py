@@ -50,3 +50,61 @@ def test_close_databases_releases_every_handle(tmp_path):
     assert server_mod._db is None, "server still holds a database handle"
     assert db.conn is None, "the connection was never closed"
     server_mod.configure(db_path=None, repo_root=None)
+
+
+def test_get_db_initializes_a_genuinely_new_database(tmp_path):
+    """`_get_db()` must create the schema for a new index.
+
+    The guard read `if not path.exists() or path.stat().st_size == 0:
+    initialize()`, placed AFTER `Database.open()`. open() runs
+    `PRAGMA journal_mode=WAL`, which writes a 4096-byte header — so both arms
+    were false by the time the check ran and initialize() could never fire. The
+    artifact on this machine: ~/.srclight/index.db, 4096 bytes, zero tables,
+    created 2026-03-03 and never noticed.
+    """
+    from srclight import server as server_mod
+
+    db_path = tmp_path / "index.db"
+    assert not db_path.exists()
+
+    server_mod.configure(db_path=db_path, repo_root=tmp_path)
+    try:
+        db = server_mod._get_db()
+        tables = {
+            r[0] for r in db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {"files", "symbols"} <= tables, f"schema never created; tables={tables}"
+    finally:
+        server_mod._close_databases()
+        server_mod.configure(db_path=None, repo_root=None)
+
+
+def test_get_db_heals_an_empty_database_left_by_the_old_guard(tmp_path):
+    """A 4096-byte index.db with no tables must be repaired, not trusted."""
+    import sqlite3
+
+    from srclight import server as server_mod
+
+    db_path = tmp_path / "index.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")   # exactly what open() did
+    conn.close()
+    assert db_path.stat().st_size > 0
+    assert not sqlite3.connect(db_path).execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='table'"
+    ).fetchone()[0]
+
+    server_mod.configure(db_path=db_path, repo_root=tmp_path)
+    try:
+        db = server_mod._get_db()
+        tables = {
+            r[0] for r in db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {"files", "symbols"} <= tables, f"empty db not healed; tables={tables}"
+    finally:
+        server_mod._close_databases()
+        server_mod.configure(db_path=None, repo_root=None)

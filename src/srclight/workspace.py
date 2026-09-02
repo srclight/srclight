@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -154,6 +155,35 @@ def _sanitize_schema_name(name: str) -> str:
     return s
 
 
+# Re-warn about a dead search leg on this interval. It MUST stay below the
+# window /healthz reads (web.py: warning_ring.since(3600)) — warning once and
+# never again meant a permanently dead leg showed for an hour and the dashboard
+# went green afterwards while the leg was still dead.
+_FTS_WARN_INTERVAL_SECONDS = 900
+
+
+def _read_only_uri(path) -> str:
+    """A `file:` URI that ATTACH and connect() honour as read-only.
+
+    NEVER build this with an f-string. In a raw path, '#' truncates as a URI
+    fragment and '?' steals the query string, so `mode=ro` is silently dropped
+    and SQLite opens — or CREATES — a *different* file, read-write, with no
+    exception raised: ATTACH succeeds against an empty schema and nothing goes
+    red. `Path.as_uri()` percent-encodes both, plus spaces and non-ASCII.
+    """
+    uri = Path(path).resolve().as_uri()
+    if uri.startswith("file://") and not uri.startswith("file:///"):
+        # A Windows UNC path (\\server\share, \\wsl$\...) renders with a
+        # non-empty authority, which SQLite refuses: "invalid uri authority".
+        # Returning the plain path keeps such a project working read-write
+        # rather than turning it into an error row on a platform we cannot test.
+        logger.warning(
+            "Cannot build a read-only URI for %s (UNC path); attaching read-write", path
+        )
+        return str(path)
+    return uri + "?mode=ro"
+
+
 MAX_ATTACH = 10  # SQLite default SQLITE_MAX_ATTACHED
 
 
@@ -192,6 +222,7 @@ class WorkspaceDB:
         self._all_indexable: list[ProjectEntry] = []  # all entries with an index
         self._caches: dict[str, Any] = {}  # project_name -> VectorCache
         self._stale_sidecars: set[str] = set()  # project_name, sidecar older than index.db
+        self._fts_warned: dict[tuple[str, str], float] = {}  # (schema, leg) -> last warned at
         # project_name -> (index-file version key, per-project stats). See _collect_stats.
         self._stats_cache: dict[str, tuple[tuple, dict[str, Any]]] = {}
         self._attach_errors: dict[str, str] = {}  # project_name -> why ATTACH failed
@@ -199,7 +230,15 @@ class WorkspaceDB:
         self._lock = threading.RLock()
 
     def open(self) -> None:
-        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+        # uri=True is NOT decoration: srclight ships a frozen Windows engine whose
+        # sqlite3.dll (3.49.1) is built WITHOUT SQLITE_USE_URI (verified with
+        # `strings` on engine-windows/_internal/sqlite3.dll; the Linux and macOS
+        # builds do carry it). Without this flag SQLite takes the whole
+        # "file:...?mode=ro" string as a literal filename and CREATES it,
+        # read-write. Do not tidy this argument away.
+        self.conn = sqlite3.connect(
+            ":memory:", check_same_thread=False, uri=True
+        )
         self.conn.row_factory = sqlite3.Row
         # Discover all indexable projects
         self._all_indexable = [
@@ -239,6 +278,36 @@ class WorkspaceDB:
                 logger.warning("Failed to detach %s: %s", name, e)
         self._attached.clear()
 
+    def _verify_attachment(self, schema: str, entry: ProjectEntry) -> None:
+        """Confirm the attachment landed on the file we named.
+
+        A guard nobody tests is furniture. Two ways `mode=ro` can be dropped
+        without raising: a metacharacter in the path truncating the URI, and a
+        SQLite built without SQLITE_USE_URI taking the whole string as a literal
+        filename. Both attach a DIFFERENT file, read-write, and report success —
+        the project then serves zero symbols behind a green dashboard.
+        `PRAGMA database_list`'s file column is the honest tell and writes
+        nothing. Detach before raising so a bad attachment cannot linger.
+        """
+        want = str(Path(entry.index_db).resolve())
+        got = None
+        for row in self.conn.execute("PRAGMA database_list"):
+            if row[1] == schema:
+                got = row[2]
+                break
+        # realpath() costs ~21us on ext4 but ~1ms on drvfs, and several projects
+        # live under /mnt/c — so only pay for it when the cheap comparison fails.
+        if got != want and (
+            got is None or os.path.realpath(got) != os.path.realpath(want)
+        ):
+            try:
+                self.conn.execute(f"DETACH DATABASE [{schema}]")
+            except sqlite3.DatabaseError:
+                pass
+            raise sqlite3.DatabaseError(
+                f"attachment for [{schema}] resolved to {got!r}, expected {want!r}"
+            )
+
     def _attach_batch(self, entries: list[ProjectEntry]) -> None:
         """ATTACH a batch of project databases."""
         assert self.conn is not None
@@ -247,8 +316,9 @@ class WorkspaceDB:
             try:
                 self.conn.execute(
                     f"ATTACH DATABASE ? AS [{schema}]",
-                    (str(entry.index_db),),
+                    (_read_only_uri(entry.index_db),),
                 )
+                self._verify_attachment(schema, entry)
                 self._attached[schema] = entry.name
                 self._attach_errors.pop(entry.name, None)
                 logger.debug("Attached %s as [%s]", entry.index_db, schema)
@@ -521,9 +591,9 @@ class WorkspaceDB:
                 try:
                     rows = self.conn.execute(
                         f"""SELECT symbol_id, name, file_path, kind, rank,
-                               snippet([{schema}].symbol_names_fts, 1, '>>>', '<<<', '...', 20) as snippet
+                               snippet(symbol_names_fts, 1, '>>>', '<<<', '...', 20) as snippet
                            FROM [{schema}].symbol_names_fts
-                           WHERE [{schema}].symbol_names_fts MATCH ?
+                           WHERE symbol_names_fts MATCH ?
                            ORDER BY rank LIMIT ?""",
                         (fts_query, limit * 3),
                     ).fetchall()
@@ -547,8 +617,8 @@ class WorkspaceDB:
                         d["rank"] = _rank_result(d)
                         results.append(d)
                         seen_ids.add(key)
-                except sqlite3.OperationalError:
-                    pass
+                except sqlite3.OperationalError as e:
+                    self._fts_leg_failed(schema, "name", e)
 
             # LIKE fallback
             try:
@@ -596,9 +666,9 @@ class WorkspaceDB:
             try:
                 rows = self.conn.execute(
                     f"""SELECT symbol_id, name, file_path, kind, rank,
-                           snippet([{schema}].symbol_content_fts, 0, '>>>', '<<<', '...', 30) as snippet
+                           snippet(symbol_content_fts, 0, '>>>', '<<<', '...', 30) as snippet
                        FROM [{schema}].symbol_content_fts
-                       WHERE [{schema}].symbol_content_fts MATCH ?
+                       WHERE symbol_content_fts MATCH ?
                        ORDER BY rank LIMIT ?""",
                     (query, limit * 2),
                 ).fetchall()
@@ -622,16 +692,16 @@ class WorkspaceDB:
                     d["rank"] = _rank_result(d)
                     results.append(d)
                     seen_ids.add(key)
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as e:
+                self._fts_leg_failed(schema, "content", e)
 
             # Tier 4: FTS5 on docs
             try:
                 rows = self.conn.execute(
                     f"""SELECT symbol_id, name, file_path, kind, rank,
-                           snippet([{schema}].symbol_docs_fts, 0, '>>>', '<<<', '...', 30) as snippet
+                           snippet(symbol_docs_fts, 0, '>>>', '<<<', '...', 30) as snippet
                        FROM [{schema}].symbol_docs_fts
-                       WHERE [{schema}].symbol_docs_fts MATCH ?
+                       WHERE symbol_docs_fts MATCH ?
                        ORDER BY rank LIMIT ?""",
                     (query, limit * 2),
                 ).fetchall()
@@ -655,8 +725,8 @@ class WorkspaceDB:
                     d["rank"] = _rank_result(d)
                     results.append(d)
                     seen_ids.add(key)
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as e:
+                self._fts_leg_failed(schema, "docs", e)
 
         # Sort by rank (lower = better), project code > vendored
         results.sort(key=lambda r: (r.get("vendored", False), r.get("rank", 0)))
@@ -807,6 +877,29 @@ class WorkspaceDB:
         # Next call will re-check sidecar existence (fast filesystem stat).
         return None
 
+    def _fts_leg_failed(self, schema: str, leg: str, exc: Exception) -> None:
+        """Report a search leg that could not run, once per schema and leg.
+
+        These three legs sat behind a bare `except sqlite3.OperationalError:
+        pass`. That cannot distinguish "this project predates the FTS tables"
+        from "the SQL is malformed against every project forever" — and the
+        second is what happened: every leg qualified its table inside WHERE and
+        snippet(), which SQLite reads as table.column, so keyword search silently
+        fell through to a LIKE on symbols.name for an unknown span of releases.
+        Re-warn each pair on an interval below the ring's window, so a
+        permanently dead leg stays visible on /healthz without one line per query.
+        """
+        key = (schema, leg)
+        now = time.time()
+        last = self._fts_warned.get(key)
+        if last is not None and now - last < _FTS_WARN_INTERVAL_SECONDS:
+            return
+        self._fts_warned[key] = now
+        logger.warning(
+            "FTS %s search unavailable for [%s]: %s — falling back to LIKE on symbol names",
+            leg, schema, exc,
+        )
+
     @staticmethod
     def _sidecar_matches_db(srclight_dir: Path, cache) -> bool:
         """Whether a just-loaded sidecar's version matches the project's index.db.
@@ -822,7 +915,7 @@ class WorkspaceDB:
         if not db_file.exists():
             return True
         try:
-            conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+            conn = sqlite3.connect(_read_only_uri(db_file), uri=True)
             conn.row_factory = sqlite3.Row
             try:
                 return cache.is_valid(conn)
@@ -907,7 +1000,10 @@ class WorkspaceDB:
             if entry is None:
                 continue
             try:
-                proj_conn = sqlite3.connect(str(entry.index_db))
+                # Read-only: this runs on the long-lived server in the
+                # semantic-search hot path, and a read-write connection
+                # checkpoints another process's WAL when it closes.
+                proj_conn = sqlite3.connect(_read_only_uri(entry.index_db), uri=True)
                 proj_conn.row_factory = sqlite3.Row
                 for _row_idx, sim, sym_id in items:
                     row = proj_conn.execute(
