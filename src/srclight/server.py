@@ -341,8 +341,16 @@ def _get_db() -> Database:
     _db = Database(_db_path)
     _db.open()
 
-    # Initialize schema if this is a new database
-    if not _db_path.exists() or _db_path.stat().st_size == 0:
+    # Initialize if this database carries no schema. Do NOT test file size:
+    # Database.open() runs `PRAGMA journal_mode=WAL`, which writes a 4096-byte
+    # header, so `st_size == 0` is already false here and initialize() could
+    # never fire for a new index — leaving a 4096-byte file with zero tables and
+    # a `no such table: files` on the next statement. Asking the schema also
+    # repairs a database left empty by the old guard.
+    has_schema = _db.conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='files'"
+    ).fetchone()[0]
+    if not has_schema:
         _db.initialize()
 
     return _db
