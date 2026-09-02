@@ -2189,7 +2189,6 @@ def _record_query(client: str | None = None) -> None:
         _last_query_client = client
 
 
-@mcp.tool()
 def _humanize_seconds(seconds: float) -> str:
     """4m 18s, 2h 14m, 1d 1h -- two units, largest first. Never "7200s"."""
     s = int(seconds)
@@ -2205,6 +2204,7 @@ def _humanize_seconds(seconds: float) -> str:
     return f"{d}d {h}h"
 
 
+@mcp.tool()
 async def server_stats() -> str:
     """Return when this server process started and how long it has been running."""
     global _server_start_time
