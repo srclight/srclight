@@ -78,3 +78,27 @@ def test_list_projects_reports_freshness_and_coverage(client):
         # No embeddings in these fixtures -> coverage is 0.0, but the key is always present.
         assert p["embedding_coverage"] == 0.0
         assert p["embedded_symbols"] == 0
+
+
+def test_healthz_and_codebase_map_report_last_indexed(client):
+    d = client.get("/api/codebase_map").json()
+    assert d["last_indexed"] and d["last_indexed"].startswith("20")
+    for p in d["projects"]:
+        assert p["last_indexed"] and p["last_indexed"].startswith("20")
+    h = client.get("/healthz").json()
+    assert h["last_indexed"] == d["last_indexed"]
+
+
+@pytest.mark.parametrize("seconds,expected", [
+    (0, "0s"), (42, "42s"), (258.4, "4m 18s"), (3600, "1h 0m"),
+    (8040, "2h 14m"), (90000, "1d 1h"), (10 * 86400 + 3600 * 5, "10d 5h"),
+])
+def test_humanize_uptime(seconds, expected):
+    from srclight.server import _humanize_seconds
+    assert _humanize_seconds(seconds) == expected
+
+
+def test_server_stats_uptime_human_is_readable(client):
+    d = client.get("/api/server_stats").json()
+    assert not d["uptime_human"].endswith("00s") or "m" in d["uptime_human"]
+    assert d["uptime_human"] in ("0s",) or any(u in d["uptime_human"] for u in "smhd")

@@ -2190,6 +2190,21 @@ def _record_query(client: str | None = None) -> None:
 
 
 @mcp.tool()
+def _humanize_seconds(seconds: float) -> str:
+    """4m 18s, 2h 14m, 1d 1h -- two units, largest first. Never "7200s"."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h {m}m"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h"
+
+
 async def server_stats() -> str:
     """Return when this server process started and how long it has been running."""
     global _server_start_time
@@ -2202,7 +2217,7 @@ async def server_stats() -> str:
         "started_at": started_at.isoformat(),
         "started_at_epoch": _server_start_time,
         "uptime_seconds": round(uptime, 2),
-        "uptime_human": f"{int(uptime)}s",
+        "uptime_human": _humanize_seconds(uptime),
     }, indent=2)
 
 

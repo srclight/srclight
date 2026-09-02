@@ -546,6 +546,7 @@ class WorkspaceDB:
         all_languages: dict[str, int] = {}
         all_kinds: dict[str, int] = {}
         project_summaries: list[dict] = []
+        newest_index: str | None = None
 
         for batch in self._iter_batches(project_filter=project):
             for schema, project_name in batch:
@@ -575,11 +576,18 @@ class WorkspaceDB:
                     ):
                         all_kinds[row["kind"]] = all_kinds.get(row["kind"], 0) + row["n"]
 
+                    last_indexed = self.conn.execute(
+                        f"SELECT MAX(indexed_at) as t FROM [{schema}].files"
+                    ).fetchone()["t"]
+                    if last_indexed and (newest_index is None or last_indexed > newest_index):
+                        newest_index = last_indexed
+
                     project_summaries.append({
                         "project": project_name,
                         "files": files,
                         "symbols": symbols,
                         "edges": edges,
+                        "last_indexed": last_indexed,
                     })
                 except sqlite3.OperationalError as e:
                     logger.warning("Error reading %s: %s", project_name, e)
@@ -592,6 +600,7 @@ class WorkspaceDB:
                 "symbols": total_symbols,
                 "edges": total_edges,
             },
+            "last_indexed": newest_index,
             "languages": dict(sorted(all_languages.items(), key=lambda x: -x[1])),
             "symbol_kinds": dict(sorted(all_kinds.items(), key=lambda x: -x[1])),
             "projects": project_summaries,

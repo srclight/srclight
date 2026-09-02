@@ -1133,13 +1133,14 @@ def _healthz_payload() -> dict:
     payload["uptime_seconds"] = round(time.time() - started, 1) if started else None
     payload["mcp"] = "/mcp"
     payload["workspace"] = server_mod._workspace_name
-    payload.update({"projects": None, "files": None, "symbols": None, "edges": None})
+    payload.update({"projects": None, "files": None, "symbols": None, "edges": None, "last_indexed": None})
 
     try:
         cmap = json.loads(server_mod.codebase_map())
         if "totals" in cmap:  # workspace mode
             payload["projects"] = cmap.get("projects_attached")
             payload.update({k: cmap["totals"].get(k) for k in ("files", "symbols", "edges")})
+            payload["last_indexed"] = cmap.get("last_indexed")
         elif "index" in cmap:  # single-repo mode
             payload["projects"] = 1
             payload.update({k: cmap["index"].get(k) for k in ("files", "symbols", "edges")})
