@@ -362,3 +362,63 @@ def test_workspace_stats_are_cached_until_the_index_file_changes(tmp_path, ws_di
 
         assert wdb.list_projects()[0]["symbols"] == 2
         assert wdb.codebase_map()["totals"]["files"] == 2
+
+
+def test_stale_sidecar_is_reported_not_silently_trusted(tmp_path, ws_dir):
+    """A sidecar older than its DB must be surfaced, never trusted in silence.
+
+    workspace.vector_search skips is_valid() to save a SQLite connect per query,
+    so a sidecar left behind by an interrupted re-embed serves a subset of the
+    index for the life of the process while the dashboard, which reads the DB,
+    reports 100% coverage. Found live on 2026-09-02: intuition-2019 had 20,648
+    embeddings in index.db and 15,611 rows in the sidecar.
+    """
+    from srclight.embeddings import vector_to_bytes
+    from srclight.vector_cache import VectorCache
+
+    proj = _create_indexed_project(tmp_path, "alpha", [
+        ("Dictionary", "class"), ("lookup", "method"),
+    ])
+
+    db = Database(proj / ".srclight" / "index.db")
+    db.open()
+    sym_ids = [r["id"] for r in db.conn.execute("SELECT id FROM symbols ORDER BY id")]
+    for i, sid in enumerate(sym_ids):
+        db.upsert_embedding(sid, "mock:test", 8, vector_to_bytes([0.1 * (i + 1)] * 8), f"h{i}")
+    db.commit()
+    VectorCache(proj / ".srclight").build_from_db(db.conn)
+
+    # Advance the DB's embedding version, as an interrupted re-embed leaves it.
+    db.conn.execute(
+        "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('embedding_cache_version', '9999')"
+    )
+    db.commit()
+    db.close()
+
+    config = WorkspaceConfig(name="test")
+    config.add_project("alpha", str(proj))
+    with WorkspaceDB(config) as wdb:
+        wdb._get_project_cache("alpha")
+        assert wdb.stale_sidecars() == ["alpha"]
+
+
+def test_fresh_sidecar_is_not_reported_stale(tmp_path, ws_dir):
+    """The staleness check must not cry wolf on a sidecar that matches its DB."""
+    from srclight.embeddings import vector_to_bytes
+    from srclight.vector_cache import VectorCache
+
+    proj = _create_indexed_project(tmp_path, "alpha", [("Dictionary", "class")])
+    db = Database(proj / ".srclight" / "index.db")
+    db.open()
+    sym_ids = [r["id"] for r in db.conn.execute("SELECT id FROM symbols ORDER BY id")]
+    for i, sid in enumerate(sym_ids):
+        db.upsert_embedding(sid, "mock:test", 8, vector_to_bytes([0.1 * (i + 1)] * 8), f"h{i}")
+    db.commit()
+    VectorCache(proj / ".srclight").build_from_db(db.conn)
+    db.close()
+
+    config = WorkspaceConfig(name="test")
+    config.add_project("alpha", str(proj))
+    with WorkspaceDB(config) as wdb:
+        wdb._get_project_cache("alpha")
+        assert wdb.stale_sidecars() == []

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import struct
 from pathlib import Path
 
@@ -81,8 +82,8 @@ class VectorCache:
         self._dir.mkdir(parents=True, exist_ok=True)
 
         # Write sidecar files
-        np.save(self.npy_path, matrix)
-        np.save(self.norms_path, norms)
+        self._atomic_write(self.npy_path, lambda fh: np.save(fh, matrix))
+        self._atomic_write(self.norms_path, lambda fh: np.save(fh, norms))
 
         version = self._get_db_version(conn)
         meta = {
@@ -94,11 +95,35 @@ class VectorCache:
             "symbol_kinds": [row["kind"] for row in rows],
             "file_paths": [row["file_path"] for row in rows],
         }
-        self.meta_path.write_text(json.dumps(meta))
+        self._atomic_write(
+            self.meta_path, lambda fh: fh.write(json.dumps(meta).encode())
+        )
 
         # Load into memory / GPU
         self._load_matrix(matrix, norms, meta)
         logger.info("Built sidecar: %d vectors x %d dims (version %d)", n, dims, version)
+
+    @staticmethod
+    def _atomic_write(path: Path, write) -> None:
+        """Write through a temp file + os.replace().
+
+        A running server holds every sidecar mmap'd for its whole life, and
+        np.save() opens its target "wb" — O_TRUNC on the same inode. Rebuilding
+        in place therefore rewrites pages under the live mapping: the reader
+        either SIGBUSes past the new EOF or silently reads new vectors against
+        an old symbol_ids list. os.replace() swaps the inode instead, so anyone
+        still holding the old file keeps a coherent view of it.
+        """
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            with open(tmp, "wb") as fh:
+                write(fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
     # --- Load sidecar (fast path, server start) ---
 
@@ -124,6 +149,24 @@ class VectorCache:
     def _load_matrix(self, matrix, norms, meta: dict) -> None:
         """Transfer matrix to GPU if available, store metadata."""
         from .vector_math import _backend, _np
+
+        # The three sidecar files are replaced one at a time, so a kill between
+        # renames can pair a new matrix with a stale symbol_ids list. search()
+        # indexes that list directly, and a longer stale list yields a real but
+        # WRONG symbol with a plausible score. Refuse to load instead.
+        n = int(matrix.shape[0])
+        for field in ("symbol_ids", "symbol_kinds", "file_paths"):
+            got = len(meta.get(field) or [])
+            if got != n:
+                raise ValueError(
+                    f"torn sidecar at {self.npy_path}: matrix has {n} rows but "
+                    f"meta lists {got} {field} — rebuild with `srclight index --embed`"
+                )
+        if len(norms) != n:
+            raise ValueError(
+                f"torn sidecar at {self.npy_path}: matrix has {n} rows but "
+                f"{len(norms)} norms — rebuild with `srclight index --embed`"
+            )
 
         if _np is not None and _backend == "cupy":
             self._matrix = _np.asarray(matrix)

@@ -283,3 +283,61 @@ def test_empty_db_build(tmp_path):
     assert not cache.is_loaded()
 
     db.close()
+
+
+def test_rebuild_replaces_the_file_instead_of_truncating_it(tmp_path):
+    """A rebuild must swap the inode, not rewrite bytes under a live mmap.
+
+    The server keeps every sidecar mmap'd for its whole life (load_sidecar uses
+    mmap_mode="r"). np.save() opens its target "wb" — O_TRUNC on the same inode
+    — so `srclight index --embed` running in a second process rewrites pages
+    beneath the running server's mapping. Writing a temp file and os.replace()ing
+    it leaves the old inode intact for anyone still holding it.
+    """
+    db, db_path = _setup_db(tmp_path, n_symbols=5, dims=8)
+    cache = VectorCache(db_path.parent)
+    cache.build_from_db(db.conn)
+
+    live = np.load(cache.npy_path, mmap_mode="r")
+    before = np.array(live)
+
+    # Re-embed every symbol with different vectors — same row count, new bytes.
+    sym_ids = [r["symbol_id"] for r in db.conn.execute(
+        "SELECT symbol_id FROM symbol_embeddings ORDER BY symbol_id")]
+    for i, sid in enumerate(sym_ids):
+        db.upsert_embedding(
+            sid, "mock:test", 8, vector_to_bytes(_make_vec(8, seed=float(i + 100))), f"r{i}"
+        )
+    db.commit()
+    VectorCache(db_path.parent).build_from_db(db.conn)
+
+    # Guard against a vacuous assertion: the rebuild must really differ on disk.
+    on_disk = np.array(np.load(cache.npy_path, mmap_mode="r"))
+    assert not np.array_equal(on_disk, before), "rebuild produced identical bytes"
+
+    assert np.array_equal(np.array(live), before), (
+        "the rebuild rewrote bytes under a live mmap — sidecar was truncated in "
+        "place rather than replaced atomically"
+    )
+
+
+def test_load_refuses_a_sidecar_whose_meta_disagrees_with_the_matrix(tmp_path):
+    """A torn sidecar must fail loudly, never serve the wrong symbol.
+
+    The three sidecar files are replaced one at a time, so a kill between the
+    renames can leave a new matrix beside an older symbol_ids list. search()
+    then evaluates self._symbol_ids[orig_idx]: when the stale list is longer the
+    index is in range and the caller gets a real-but-wrong symbol carrying a
+    plausible similarity score. Wrong answers must not be reachable.
+    """
+    db, db_path = _setup_db(tmp_path, n_symbols=5, dims=8)
+    cache = VectorCache(db_path.parent)
+    cache.build_from_db(db.conn)
+
+    meta = json.loads(cache.meta_path.read_text())
+    meta["symbol_ids"] = meta["symbol_ids"] + [999999]  # stale, one row too long
+    meta["row_count"] = len(meta["symbol_ids"])
+    cache.meta_path.write_text(json.dumps(meta))
+
+    with pytest.raises(ValueError, match="sidecar"):
+        VectorCache(db_path.parent).load_sidecar()

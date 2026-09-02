@@ -191,6 +191,7 @@ class WorkspaceDB:
         self._attached: dict[str, str] = {}  # schema_name -> project_name
         self._all_indexable: list[ProjectEntry] = []  # all entries with an index
         self._caches: dict[str, Any] = {}  # project_name -> VectorCache
+        self._stale_sidecars: set[str] = set()  # project_name, sidecar older than index.db
         # project_name -> (index-file version key, per-project stats). See _collect_stats.
         self._stats_cache: dict[str, tuple[tuple, dict[str, Any]]] = {}
         self._attach_errors: dict[str, str] = {}  # project_name -> why ATTACH failed
@@ -787,6 +788,16 @@ class WorkspaceDB:
         if cache.sidecar_exists():
             try:
                 cache.load_sidecar()
+                if self._sidecar_matches_db(srclight_dir, cache):
+                    self._stale_sidecars.discard(project_name)
+                else:
+                    self._stale_sidecars.add(project_name)
+                    logger.warning(
+                        "Stale embedding sidecar for %s: built from an older index, "
+                        "so semantic search sees only part of it "
+                        "(rebuild with `srclight index --embed`)",
+                        project_name,
+                    )
                 self._caches[project_name] = cache
                 return cache
             except Exception as e:
@@ -795,6 +806,38 @@ class WorkspaceDB:
         # No sidecar or load failed — return None but don't permanently cache it.
         # Next call will re-check sidecar existence (fast filesystem stat).
         return None
+
+    @staticmethod
+    def _sidecar_matches_db(srclight_dir: Path, cache) -> bool:
+        """Whether a just-loaded sidecar's version matches the project's index.db.
+
+        vector_search deliberately skips is_valid() per query — a SQLite connect
+        per project costs ~60ms across 10 projects — so this is the one place the
+        comparison happens: once, when the sidecar is loaded. Without it a sidecar
+        left behind by an interrupted re-embed serves a subset of the index for
+        the life of the process while /api/embedding_status, which reads the DB,
+        reports 100% coverage (intuition-2019, 2026-09-02: 20,648 vs 15,611).
+        """
+        db_file = srclight_dir / "index.db"
+        if not db_file.exists():
+            return True
+        try:
+            conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                return cache.is_valid(conn)
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 -- an unreadable db is reported elsewhere
+            return True
+
+    def stale_sidecars(self) -> list[str]:
+        """Projects whose embedding sidecar is older than their index.db.
+
+        Deliberately NOT @_synchronized: /healthz polls this and must never queue
+        behind a search holding the workspace lock.
+        """
+        return sorted(self._stale_sidecars)
 
     @_synchronized
     def vector_search(

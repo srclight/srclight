@@ -1443,6 +1443,23 @@ def _healthz_payload() -> dict:
         degraded.append("no embeddings: keyword search only")
     if payload["projects_errored"]:
         degraded.append(f"{payload['projects_errored']} project(s) unreadable")
+
+    # A sidecar older than its index.db serves a SUBSET of the repo to semantic
+    # search while /api/embedding_status, which counts rows in the DB, reports
+    # full coverage. Read the workspace global directly rather than calling
+    # _get_workspace_db(): that takes a lock which can be held for seconds while
+    # 39 projects are attached, and /healthz must never queue behind it.
+    wdb = getattr(server_mod, "_workspace_db", None)
+    try:
+        stale = wdb.stale_sidecars() if wdb is not None else []
+    except Exception:  # noqa: BLE001 -- health must answer, not raise
+        stale = []
+    payload["stale_sidecars"] = stale
+    if stale:
+        degraded.append(
+            f"{len(stale)} project(s) with a stale embedding sidecar — semantic "
+            f"search sees only part of the index: {', '.join(stale[:3])}"
+        )
     if warnings:
         degraded.append(f"{len(warnings)} workspace warning(s) in the last hour")
     payload["degraded"] = degraded
