@@ -29,3 +29,24 @@ def test_binds_loopback_only():
     config = _uvicorn_config(_app, port=8742, log_level="info")
     assert config.host == "127.0.0.1"
     assert config.port == 8742
+
+
+def test_close_databases_releases_every_handle(tmp_path):
+    """restart_server() called os._exit(0), which skipped every database close.
+
+    os._exit skips atexit, SQLite close, and therefore the WAL checkpoint — so
+    the dashboard's Restart button left the index sitting entirely in
+    index.db-wal every single time it was pressed (issue #16).
+    """
+    from srclight import server as server_mod
+
+    server_mod.configure(db_path=tmp_path / "index.db", repo_root=tmp_path)
+    db = server_mod._get_db()
+    assert db.conn is not None
+    assert server_mod._db is not None
+
+    server_mod._close_databases()
+
+    assert server_mod._db is None, "server still holds a database handle"
+    assert db.conn is None, "the connection was never closed"
+    server_mod.configure(db_path=None, repo_root=None)

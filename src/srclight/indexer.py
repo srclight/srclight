@@ -674,6 +674,13 @@ class Indexer:
         except Exception:
             logger.debug("Failed to write index signal file", exc_info=True)
 
+        # Fold the WAL into index.db. SQLite only checkpoints when the LAST
+        # connection closes, and a running MCP server means ours never is — so
+        # without this the whole index stays in index.db-wal and the main file
+        # keeps a 4096-byte header. An index.db copied or backed up on its own
+        # would then be an empty database (issue #16).
+        self.db.checkpoint()
+
         return stats
 
     def _extract_symbols(
