@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import json
+import threading
 import logging
 import os
 import re
@@ -200,6 +201,7 @@ _repo_root: Path | None = None
 # Workspace mode state
 _workspace_name: str | None = None
 _workspace_db = None  # WorkspaceDB instance (lazy import to avoid circular)
+_workspace_db_lock = threading.Lock()  # guards (re)creation across web worker threads
 _workspace_config_mtime: float = 0.0  # mtime of workspace config at last load
 
 # Vector cache (GPU-resident embedding matrix)
@@ -233,6 +235,11 @@ def _get_workspace_db():
     `srclight workspace add`). This means you never need to restart the
     MCP server to pick up new repos.
     """
+    with _workspace_db_lock:
+        return _get_workspace_db_locked()
+
+
+def _get_workspace_db_locked():
     global _workspace_db, _workspace_config_mtime
 
     from .workspace import WorkspaceConfig, WorkspaceDB

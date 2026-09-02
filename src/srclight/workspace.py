@@ -14,7 +14,9 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +127,24 @@ def _sanitize_schema_name(name: str) -> str:
 MAX_ATTACH = 10  # SQLite default SQLITE_MAX_ATTACHED
 
 
+def _synchronized(method):
+    """Run a WorkspaceDB method while holding the instance's re-entrant lock.
+
+    The single :memory: connection carries mutable ATTACH state that a batch
+    walk rewrites as it goes. Two walks interleaving from different threads
+    (the web dashboard runs every /api/* handler on its own worker thread)
+    drift ``_attached`` away from what SQLite really has attached, after
+    which every ATTACH fails with "too many attached databases" and every
+    project reports 0 files -- for MCP callers too. See
+    test_workspace_db_concurrent_batch_walks_do_not_poison_connection.
+    """
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class WorkspaceDB:
     """Cross-repo search via ATTACH + UNION.
 
@@ -141,6 +161,8 @@ class WorkspaceDB:
         self._attached: dict[str, str] = {}  # schema_name -> project_name
         self._all_indexable: list[ProjectEntry] = []  # all entries with an index
         self._caches: dict[str, Any] = {}  # project_name -> VectorCache
+        # Re-entrant so a locked method may walk _iter_batches (also locked).
+        self._lock = threading.RLock()
 
     def open(self) -> None:
         self.conn = sqlite3.connect(":memory:", check_same_thread=False)
@@ -152,6 +174,7 @@ class WorkspaceDB:
         # Attach first batch
         self._attach_batch(self._all_indexable[:MAX_ATTACH])
 
+    @_synchronized
     def close(self) -> None:
         if self.conn:
             self.conn.close()
@@ -166,13 +189,20 @@ class WorkspaceDB:
         self.close()
 
     def _detach_all(self) -> None:
-        """Detach all currently attached databases."""
+        """Detach every attached database.
+
+        Trusts ``PRAGMA database_list`` rather than ``_attached`` so the
+        connection can heal itself if bookkeeping and reality ever diverge.
+        """
         assert self.conn is not None
-        for schema in list(self._attached.keys()):
+        for row in self.conn.execute("PRAGMA database_list").fetchall():
+            name = row["name"]
+            if name in ("main", "temp"):
+                continue
             try:
-                self.conn.execute(f"DETACH DATABASE [{schema}]")
-            except sqlite3.OperationalError:
-                pass
+                self.conn.execute(f"DETACH DATABASE [{name}]")
+            except sqlite3.OperationalError as e:
+                logger.warning("Failed to detach %s: %s", name, e)
         self._attached.clear()
 
     def _attach_batch(self, entries: list[ProjectEntry]) -> None:
@@ -201,33 +231,40 @@ class WorkspaceDB:
         if project_filter:
             entries = [e for e in entries if e.name == project_filter]
 
-        if len(entries) <= MAX_ATTACH:
-            # Ensure these specific entries are attached
-            needed = {_sanitize_schema_name(e.name) for e in entries}
-            if not needed.issubset(set(self._attached.keys())):
-                self._detach_all()
-                self._attach_batch(entries)
-            yield list(
-                (s, p) for s, p in self._attached.items()
-                if project_filter is None or p == project_filter
-            )
-        else:
-            # Need to batch
-            for i in range(0, len(entries), MAX_ATTACH):
-                batch = entries[i:i + MAX_ATTACH]
-                self._detach_all()
-                self._attach_batch(batch)
-                yield list(self._attached.items())
+        # Hold the lock across every yield: the consumer's queries run
+        # against the schemas attached here, and another walk rewriting
+        # them mid-loop is exactly the race this guards against. The lock
+        # is released when the generator is exhausted or closed.
+        with self._lock:
+            if len(entries) <= MAX_ATTACH:
+                # Ensure these specific entries are attached
+                needed = {_sanitize_schema_name(e.name) for e in entries}
+                if not needed.issubset(set(self._attached.keys())):
+                    self._detach_all()
+                    self._attach_batch(entries)
+                yield list(
+                    (s, p) for s, p in self._attached.items()
+                    if project_filter is None or p == project_filter
+                )
+            else:
+                # Need to batch
+                for i in range(0, len(entries), MAX_ATTACH):
+                    batch = entries[i:i + MAX_ATTACH]
+                    self._detach_all()
+                    self._attach_batch(batch)
+                    yield list(self._attached.items())
 
     @property
     def project_count(self) -> int:
         return len(self._all_indexable)
 
     @property
+    @_synchronized
     def attached_projects(self) -> dict[str, str]:
         """schema_name -> project_name mapping for currently attached projects."""
         return dict(self._attached)
 
+    @_synchronized
     def list_projects(self) -> list[dict[str, Any]]:
         """List all projects in the workspace with their stats."""
         assert self.conn is not None
@@ -290,6 +327,7 @@ class WorkspaceDB:
 
         return results
 
+    @_synchronized
     def search_symbols(
         self, query: str, kind: str | None = None,
         project: str | None = None, limit: int = 20,
@@ -477,6 +515,7 @@ class WorkspaceDB:
         results.sort(key=lambda r: (r.get("vendored", False), r.get("rank", 0)))
         return results[:limit]
 
+    @_synchronized
     def codebase_map(self, project: str | None = None) -> dict[str, Any]:
         """Get aggregated stats across all projects (or a single one)."""
         assert self.conn is not None
@@ -538,6 +577,7 @@ class WorkspaceDB:
             "projects": project_summaries,
         }
 
+    @_synchronized
     def get_symbol(self, name: str, project: str | None = None) -> list[dict[str, Any]]:
         """Get full symbol details by name across projects."""
         assert self.conn is not None
@@ -585,6 +625,7 @@ class WorkspaceDB:
 
         return results
 
+    @_synchronized
     def _get_project_cache(self, project_name: str):
         """Get or create a VectorCache for a project.
 
@@ -618,6 +659,7 @@ class WorkspaceDB:
         # Next call will re-check sidecar existence (fast filesystem stat).
         return None
 
+    @_synchronized
     def vector_search(
         self, query_embedding: bytes, dimensions: int,
         project: str | None = None, kind: str | None = None, limit: int = 10,
@@ -797,6 +839,7 @@ class WorkspaceDB:
             })
         return results
 
+    @_synchronized
     def embedding_stats(self, project: str | None = None) -> dict[str, Any]:
         """Get embedding statistics across workspace projects."""
         assert self.conn is not None
