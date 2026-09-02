@@ -422,3 +422,199 @@ def test_fresh_sidecar_is_not_reported_stale(tmp_path, ws_dir):
     with WorkspaceDB(config) as wdb:
         wdb._get_project_cache("alpha")
         assert wdb.stale_sidecars() == []
+
+
+def _project_with_content(tmp_path: Path, name: str, sym_name: str, body: str) -> Path:
+    """A project whose symbol BODY carries a token absent from its name."""
+    from srclight.db import Database, FileRecord, SymbolRecord
+    project_dir = tmp_path / name
+    project_dir.mkdir()
+    db_dir = project_dir / ".srclight"
+    db_dir.mkdir()
+    db = Database(db_dir / "index.db")
+    db.open()
+    db.initialize()
+    fid = db.upsert_file(FileRecord(path=f"src/{name}.py", content_hash="h", mtime=1.0,
+                                    language="python", size=len(body), line_count=3))
+    db.insert_symbol(SymbolRecord(file_id=fid, kind="function", name=sym_name,
+                                  qualified_name=f"{name}.{sym_name}",
+                                  start_line=1, end_line=3, content=body,
+                                  body_hash="bh"), f"src/{name}.py")
+    db.commit()
+    db.close()
+    return project_dir
+
+
+def test_workspace_keyword_search_reaches_fts_not_only_the_like_fallback(tmp_path, ws_dir):
+    """Workspace search must actually run FTS5, not silently degrade to LIKE.
+
+    All three legs qualified the table in the WHERE clause —
+    `WHERE [schema].symbol_content_fts MATCH ?`. SQLite reads a two-part name
+    there as table.column, raises `no such column`, and a bare
+    `except sqlite3.OperationalError: pass` swallowed it. Every keyword hit came
+    from the LIKE fallback on symbols.name, so searching for a token that
+    appears only in a symbol's BODY returned nothing at all.
+    """
+    proj = _project_with_content(
+        tmp_path, "alpha", "handler", "def handler():\n    return ZORBLAXSENTINEL\n"
+    )
+    config = WorkspaceConfig(name="fts-test")
+    config.add_project("alpha", str(proj))
+
+    with WorkspaceDB(config) as wdb:
+        hits = wdb.search_symbols("ZORBLAXSENTINEL")
+
+    assert hits, "content search returned nothing — the FTS leg never ran"
+    assert any(h["source"] == "content" for h in hits), (
+        f"no FTS content hit; sources were {[h['source'] for h in hits]}"
+    )
+
+
+def test_a_dead_fts_leg_is_reported_not_silently_swallowed(tmp_path, ws_dir, caplog):
+    """A search leg that cannot run must say so once, not degrade in silence.
+
+    The qualifier bug hid for releases behind `except sqlite3.OperationalError:
+    pass` in the primary search path. A bare pass cannot tell "this project has
+    no FTS tables" from "my SQL is malformed against every project forever", and
+    the LIKE fallback answered plausibly enough that nothing ever looked red.
+    """
+    import logging
+
+    from srclight.db import Database
+
+    proj = _project_with_content(
+        tmp_path, "alpha", "handler", "def handler():\n    return ZORBLAXSENTINEL\n"
+    )
+    db = Database(proj / ".srclight" / "index.db")
+    db.open()
+    db.conn.execute("DROP TABLE symbol_content_fts")
+    db.commit()
+    db.close()
+
+    config = WorkspaceConfig(name="fts-warn-test")
+    config.add_project("alpha", str(proj))
+
+    with WorkspaceDB(config) as wdb:
+        with caplog.at_level(logging.WARNING, logger="srclight.workspace"):
+            wdb.search_symbols("ZORBLAXSENTINEL")
+
+    assert any("fts" in r.getMessage().lower() for r in caplog.records), (
+        f"dead FTS leg logged nothing; records were {[r.getMessage() for r in caplog.records]}"
+    )
+
+
+def test_semantic_enrichment_does_not_write_to_the_project_index(tmp_path, ws_dir):
+    """The semantic-search hot path must open project indexes read-only.
+
+    workspace.py opened `sqlite3.connect(str(entry.index_db))` per project to
+    enrich hits — read-write, on the long-lived server. A SELECT-only read-write
+    connection is still not a reader: since v0.22.2 Database.close() checkpoints,
+    and plain SQLite checkpoints on last-connection close, so an ordinary search
+    rewrote index.db and truncated a WAL left by someone else.
+    """
+    import subprocess
+    import sys
+
+    proj = _project_with_content(
+        tmp_path, "alpha", "handler", "def handler():\n    return ZORBLAXSENTINEL\n"
+    )
+    db_path = proj / ".srclight" / "index.db"
+
+    # Leave a hot WAL: a writer that exits without closing.
+    subprocess.run(
+        [sys.executable, "-c",
+         "import sqlite3,os,sys\n"
+         "c=sqlite3.connect(sys.argv[1])\n"
+         "c.execute('PRAGMA journal_mode=WAL')\n"
+         "c.execute('CREATE TABLE IF NOT EXISTS scratch(x)')\n"
+         "c.execute('INSERT INTO scratch VALUES (1)')\n"
+         "c.commit()\n"
+         "os._exit(0)\n", str(db_path)],
+        check=True,
+    )
+    wal = db_path.with_name("index.db-wal")
+    assert wal.exists() and wal.stat().st_size > 0, "fixture failed to leave a hot WAL"
+    before = (db_path.stat().st_size, wal.stat().st_size)
+
+    config = WorkspaceConfig(name="ro-enrich-test")
+    config.add_project("alpha", str(proj))
+    with WorkspaceDB(config) as wdb:
+        wdb._enrich_workspace_results([("alpha", 0, 0.9, 1)])
+
+    after = (db_path.stat().st_size, wal.stat().st_size if wal.exists() else 0)
+    assert after == before, (
+        f"enrichment wrote to the project index: {before} -> {after}"
+    )
+
+
+@pytest.mark.parametrize("dirname", [
+    "plain", "has space", "issue#42", "what?now", "a+b", "v1.0-100%done", "café",
+])
+def test_read_only_uri_survives_metacharacters(tmp_path, dirname):
+    """The URI must never be built by f-string.
+
+    '#' truncates as a fragment and '?' steals the query string, so mode=ro is
+    silently dropped and SQLite opens — or CREATES — a different file,
+    read-write, with no error raised. ATTACH then succeeds against an empty
+    schema and nothing goes red.
+    """
+    import sqlite3
+
+    from srclight.workspace import _read_only_uri
+
+    d = tmp_path / dirname
+    d.mkdir()
+    db_path = d / "index.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE marker(x)")
+    conn.execute("INSERT INTO marker VALUES (1)")
+    conn.commit()
+    conn.close()
+
+    c = sqlite3.connect(":memory:")
+    c.execute("ATTACH DATABASE ? AS p", (_read_only_uri(db_path),))
+    # the attachment must resolve to the file we meant
+    attached = {r[1]: r[2] for r in c.execute("PRAGMA database_list")}
+    assert attached["p"] == str(db_path.resolve()), (
+        f"attached the wrong file: {attached['p']!r}"
+    )
+    # and it must actually be read-only
+    assert c.execute("SELECT count(*) FROM p.marker").fetchone()[0] == 1
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        c.execute("INSERT INTO p.marker VALUES (2)")
+    c.close()
+
+
+def test_a_missing_project_index_is_an_error_not_a_silently_created_empty_db(tmp_path, ws_dir):
+    """A vanished project index must go red, not be recreated empty.
+
+    A plain-path ATTACH of a missing file silently CREATES a zero-byte database
+    and attaches an empty schema with no error, so the project reports as
+    attached and serves zero symbols. Reachable in normal operation: MAX_ATTACH
+    is 10 against 39 projects, so detach/attach runs constantly, and deleting or
+    moving a project's index while the server is up made srclight write a fresh
+    empty one back into that repo.
+    """
+    proj = _project_with_content(
+        tmp_path, "alpha", "handler", "def handler():\n    return ZORBLAXSENTINEL\n"
+    )
+    db_path = proj / ".srclight" / "index.db"
+
+    config = WorkspaceConfig(name="missing-index-test")
+    config.add_project("alpha", str(proj))
+
+    with WorkspaceDB(config) as wdb:
+        entry = next(e for e in wdb._all_indexable if e.name == "alpha")
+        wdb._detach_all()
+        db_path.unlink()
+        for sidecar in ("index.db-wal", "index.db-shm"):
+            q = db_path.with_name(sidecar)
+            if q.exists():
+                q.unlink()
+
+        wdb._attach_batch([entry])
+
+        assert not db_path.exists(), "srclight recreated a deleted project index"
+        assert "alpha" in wdb._attach_errors, (
+            f"missing index was not reported; errors={wdb._attach_errors}"
+        )
