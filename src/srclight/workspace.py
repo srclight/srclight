@@ -174,15 +174,32 @@ def _read_only_uri(path) -> str:
     uri = Path(path).resolve().as_uri()
     if uri.startswith("file://") and not uri.startswith("file:///"):
         # A Windows UNC path (\\server\share, \\wsl$\...) renders with a
-        # non-empty authority, which SQLite refuses: "invalid uri authority".
-        # Returning the plain path keeps such a project working read-write
-        # rather than turning it into an error row on a platform we cannot test.
+        # non-empty authority, which SQLite refuses outright: measured on Windows,
+        # "invalid uri authority: wsl%24". Fall back to the plain path so this
+        # cannot be the thing that breaks such a project. It is a narrow rescue:
+        # a plain ATTACH of a \\wsl.localhost path returns "database is locked"
+        # anyway, so indexes on that share were already unusable. A real SMB
+        # share is untested.
         logger.warning(
             "Cannot build a read-only URI for %s (UNC path); attaching read-write", path
         )
         return str(path)
     return uri + "?mode=ro"
 
+
+# How many rows each retrieval tier fetches per project. FIXED, and deliberately
+# not a multiple of `limit`: when the fetch scaled with limit, the candidate pool
+# moved too, so a smaller limit was not a prefix of a larger one -- two of
+# `checkpoint`'s top five at limit=5 were absent from the top 50 entirely.
+# Retrieval decides WHAT is considered; `limit` only decides how much is shown.
+TIER_FETCH = 150
+
+# When NOTHING matched on a name, the page would fill from the body and doc
+# tiers -- `quiesce` returned twenty OCR fragments from scanned PDFs. Returning
+# nothing deletes content search, which is a real capability; returning twenty
+# is not an answer either. Show a few, and mark them, so the caller can tell a
+# body mention from a definition.
+NAMELESS_RESULT_CAP = 5
 
 MAX_ATTACH = 10  # SQLite default SQLITE_MAX_ATTACHED
 
@@ -203,6 +220,10 @@ def _synchronized(method):
         with self._lock:
             return method(self, *args, **kwargs)
     return wrapper
+
+
+class _SkipLikeScan(Exception):
+    """Raised to skip the LIKE full scan; caught by the leg's own handler."""
 
 
 class WorkspaceDB:
@@ -230,12 +251,18 @@ class WorkspaceDB:
         self._lock = threading.RLock()
 
     def open(self) -> None:
-        # uri=True is NOT decoration: srclight ships a frozen Windows engine whose
-        # sqlite3.dll (3.49.1) is built WITHOUT SQLITE_USE_URI (verified with
-        # `strings` on engine-windows/_internal/sqlite3.dll; the Linux and macOS
-        # builds do carry it). Without this flag SQLite takes the whole
-        # "file:...?mode=ro" string as a literal filename and CREATES it,
-        # read-write. Do not tidy this argument away.
+        # uri=True matters on WINDOWS ONLY, and for availability rather than
+        # integrity. Measured with sqlite3_compileoption_used against the shipped
+        # binaries: engine-linux libsqlite3.so.0 (3.45.1) has SQLITE_USE_URI=True,
+        # engine-windows sqlite3.dll (3.49.1) has it FALSE.
+        #   Linux/macOS: the compile default already interprets URIs, so mode=ro is
+        #     honoured with or without this flag (verified: uri=False still refuses
+        #     the write and creates no stray file). The flag is a no-op here.
+        #   Windows: without it ATTACH raises "unable to open database" and EVERY
+        #     project lands in _attach_errors, so the desktop app indexes nothing.
+        # It does NOT prevent a silent downgrade to read-write; no such downgrade
+        # was reproducible on either platform. The genuinely silent failure is a
+        # metacharacter truncating the URI, which _read_only_uri() handles.
         self.conn = sqlite3.connect(
             ":memory:", check_same_thread=False, uri=True
         )
@@ -555,7 +582,9 @@ class WorkspaceDB:
         Uses batched ATTACH when projects exceed SQLite's 10-database limit.
         """
         assert self.conn is not None
-        from .db import split_identifier, is_vendored_path
+        from .db import (
+            _IDENT_RE, RUNG_NONE, is_vendored_path, match_rung, split_identifier,
+        )
 
         results: list[dict[str, Any]] = []
         seen_ids: set[tuple[str, int]] = set()  # (project, symbol_id)
@@ -565,38 +594,51 @@ class WorkspaceDB:
         query_tokens = split_identifier(query)
 
         def _rank_result(row_dict: dict) -> float:
-            rank = row_dict.get("rank", 0)
-            name = row_dict.get("name", "")
+            """Score by MATCH QUALITY first; statistics only break ties inside it.
+
+            A rung is worth 1000 and every within-rung adjustment together
+            cannot reach that, so a better match can never be outranked by a
+            worse one with a stronger bm25 -- which is exactly what happened
+            when a hardcoded LIKE constant competed with raw bm25 across tiers.
+            """
+            name = row_dict.get("name", "") or ""
             sym_kind = row_dict.get("kind", "")
             file_path = row_dict.get("file", "")
 
-            if name == query:
-                rank -= 50.0
-            elif name and query_lower in name.lower():
-                rank -= 10.0
-            if sym_kind in _PRIMARY_KINDS:
-                rank -= 5.0
+            score = match_rung(query, name) * 1000.0
+            if not _IDENT_RE.match(name):
+                score += 300.0
+            if sym_kind not in _PRIMARY_KINDS:
+                score += 100.0
             if is_vendored_path(file_path):
-                rank += 20.0
+                score += 50.0
                 row_dict["vendored"] = True
-            return rank
+            # bm25 is comparable only within one table/project/query, so clamp it
+            # to a band far narrower than a rung and use it as a tiebreak alone.
+            base = row_dict.get("rank", 0) or 0
+            score += max(-40.0, min(0.0, float(base))) * 0.5
+            score += min(len(name), 40) * 0.1
+            return score
 
         # Tier 1+2: FTS5 name search + LIKE fallback per schema
         for batch in self._iter_batches(project_filter=project):
           for schema, project_name in batch:
             # FTS5 on symbol names
-            for fts_query in [query, query_tokens]:
+            # `q*` is a prefix match: 4-70 ms per query across all projects against
+            # the scan's 725+, and it finds strictly more than the bare term --
+            # `sqlit` goes from 0 hits to 1060, `checkpoint` from 127 to 159.
+            for fts_query in [query, query_tokens, f"{query}*" if query and " " not in query else ""]:
                 if not fts_query:
                     continue
                 try:
-                    rows = self.conn.execute(
+                    rows = self._fts_execute(
                         f"""SELECT symbol_id, name, file_path, kind, rank,
                                snippet(symbol_names_fts, 1, '>>>', '<<<', '...', 20) as snippet
                            FROM [{schema}].symbol_names_fts
                            WHERE symbol_names_fts MATCH ?
                            ORDER BY rank LIMIT ?""",
-                        (fts_query, limit * 3),
-                    ).fetchall()
+                        (fts_query, TIER_FETCH), schema, "name",
+                    )
                     for row in rows:
                         sid = int(row["symbol_id"])
                         key = (project_name, sid)
@@ -620,13 +662,22 @@ class WorkspaceDB:
                 except sqlite3.OperationalError as e:
                     self._fts_leg_failed(schema, "name", e)
 
-            # LIKE fallback
+            # LIKE fallback: a full scan of symbols JOIN files, 725-1064 ms across
+            # 39 projects and 55-78% of every search. It can only match a literal
+            # substring of ONE name, so a multi-token query cannot be helped by
+            # it -- measured over the whole workspace, `embedding cache`,
+            # `attach read only`, `vector cache` and `wal checkpoint` all return
+            # 0 rows, and `graceful shutdown` returns exactly 1, a section the
+            # FTS name leg already ranks first. Skip it when the query has
+            # whitespace; the FTS legs handle multi-token matching properly.
             try:
+                if len(query.split()) > 1:
+                    raise _SkipLikeScan
                 kind_filter = "AND s.kind = ?" if kind else ""
                 like_params: list = [f"%{query}%"]
                 if kind:
                     like_params.append(kind)
-                like_params.extend([query, limit * 3])
+                like_params.extend([query, TIER_FETCH])
 
                 rows = self.conn.execute(
                     f"""SELECT s.id as symbol_id, s.name, f.path as file_path, s.kind
@@ -659,19 +710,19 @@ class WorkspaceDB:
                     d["rank"] = _rank_result(d)
                     results.append(d)
                     seen_ids.add(key)
-            except sqlite3.OperationalError:
+            except (sqlite3.OperationalError, _SkipLikeScan):
                 pass
 
             # Tier 3: FTS5 on content (trigram)
             try:
-                rows = self.conn.execute(
+                rows = self._fts_execute(
                     f"""SELECT symbol_id, name, file_path, kind, rank,
                            snippet(symbol_content_fts, 0, '>>>', '<<<', '...', 30) as snippet
                        FROM [{schema}].symbol_content_fts
                        WHERE symbol_content_fts MATCH ?
                        ORDER BY rank LIMIT ?""",
-                    (query, limit * 2),
-                ).fetchall()
+                    (query, TIER_FETCH), schema, "content",
+                )
                 for row in rows:
                     sid = int(row["symbol_id"])
                     key = (project_name, sid)
@@ -697,14 +748,14 @@ class WorkspaceDB:
 
             # Tier 4: FTS5 on docs
             try:
-                rows = self.conn.execute(
+                rows = self._fts_execute(
                     f"""SELECT symbol_id, name, file_path, kind, rank,
                            snippet(symbol_docs_fts, 0, '>>>', '<<<', '...', 30) as snippet
                        FROM [{schema}].symbol_docs_fts
                        WHERE symbol_docs_fts MATCH ?
                        ORDER BY rank LIMIT ?""",
-                    (query, limit * 2),
-                ).fetchall()
+                    (query, TIER_FETCH), schema, "docs",
+                )
                 for row in rows:
                     sid = int(row["symbol_id"])
                     key = (project_name, sid)
@@ -728,8 +779,40 @@ class WorkspaceDB:
             except sqlite3.OperationalError as e:
                 self._fts_leg_failed(schema, "docs", e)
 
+        # Collapse repeats. One row per (project, name, kind), carrying how many
+        # it stands for. A human's eye skips a duplicate; an agent reads it as
+        # corroboration -- `id` returned 20 rows with 2 distinct names, 15 of
+        # them one symbol. Hiding the count would trade one distortion for
+        # another, so the survivor reports it.
+        best: dict[tuple, dict] = {}
+        for r in results:
+            key = (r.get("project"), r.get("name"), r.get("kind"))
+            keep = best.get(key)
+            if keep is None or r.get("rank", 0) < keep.get("rank", 0):
+                if keep is not None:
+                    r["duplicates"] = keep.get("duplicates", 1) + 1
+                else:
+                    r["duplicates"] = 1
+                best[key] = r
+            else:
+                keep["duplicates"] = keep.get("duplicates", 1) + 1
+        results = list(best.values())
+
         # Sort by rank (lower = better), project code > vendored
-        results.sort(key=lambda r: (r.get("vendored", False), r.get("rank", 0)))
+        # vendored is a within-rung penalty in the score now, not a primary key.
+        # As a primary key it was an INFINITE demotion that made the +20 dead
+        # arithmetic -- setting that constant to +/-100000 changed no result.
+        results.sort(key=lambda r: (r.get("rank", 0), r.get("project") or "", r.get("name") or ""))
+        # mark every row with whether the NAME matched, and cap a result set that
+        # contains no name match at all
+        any_name_match = False
+        for r in results:
+            matched = match_rung(query, r.get("name", "") or "") < RUNG_NONE
+            r["name_match"] = matched
+            any_name_match = any_name_match or matched
+        if not any_name_match:
+            return results[:min(limit, NAMELESS_RESULT_CAP)]
+
         return results[:limit]
 
     def codebase_map(self, project: str | None = None) -> dict[str, Any]:
@@ -876,6 +959,42 @@ class WorkspaceDB:
         # No sidecar or load failed — return None but don't permanently cache it.
         # Next call will re-check sidecar existence (fast filesystem stat).
         return None
+
+    @staticmethod
+    def _is_fts_query_error(exc: Exception) -> bool:
+        """True when FTS5 rejected the QUERY TEXT, not the table.
+
+        A user's search string is not a broken index. `get(` raises
+        `fts5: syntax error near ""`, `self.conn.execute` raises `syntax error
+        near "."`, an unbalanced quote raises `unterminated string`. Counting
+        those as a dead leg produced 117 warnings from ONE search across 39
+        projects and buried the real signal in /healthz `degraded`.
+        """
+        msg = str(exc).lower()
+        return "syntax error" in msg or "unterminated" in msg
+
+    def _fts_execute(self, sql: str, params: tuple, schema: str, leg: str) -> list:
+        """Run one FTS leg. Returns rows; [] if the leg is unavailable.
+
+        When FTS5 rejects the query text, quote it and retry once: someone
+        searching `get(` means that literal text, not a boolean expression.
+        Quoting is also what makes it work -- bare `get(` errors where `"get("`
+        returns rows. Only a genuine leg failure is reported.
+        """
+        assert self.conn is not None
+        try:
+            return self.conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError as e:
+            if not self._is_fts_query_error(e):
+                self._fts_leg_failed(schema, leg, e)
+                return []
+        quoted = '"' + str(params[0]).replace('"', '""') + '"'
+        try:
+            return self.conn.execute(sql, (quoted, *params[1:])).fetchall()
+        except sqlite3.OperationalError as e:
+            if not self._is_fts_query_error(e):
+                self._fts_leg_failed(schema, leg, e)
+            return []
 
     def _fts_leg_failed(self, schema: str, leg: str, exc: Exception) -> None:
         """Report a search leg that could not run, once per schema and leg.

@@ -9,6 +9,8 @@ timeout_graceful_shutdown defaults to None -> asyncio.wait_for(..., None).
 
 from srclight.cli import _uvicorn_config
 
+from .test_workspace import _create_indexed_project, ws_dir  # noqa: F401  (fixture re-export)
+
 
 async def _app(scope, receive, send):  # minimal ASGI callable
     pass
@@ -105,6 +107,93 @@ def test_get_db_heals_an_empty_database_left_by_the_old_guard(tmp_path):
             )
         }
         assert {"files", "symbols"} <= tables, f"empty db not healed; tables={tables}"
+    finally:
+        server_mod._close_databases()
+        server_mod.configure(db_path=None, repo_root=None)
+
+
+def _call(coro_or_val):
+    """Run an async MCP tool the way the rest of the suite does."""
+    import asyncio
+    return asyncio.run(coro_or_val) if asyncio.iscoroutine(coro_or_val) else coro_or_val
+
+
+def test_workspace_instructions_actually_reach_the_client(tmp_path, ws_dir):
+    """The dynamic instructions must be INSTALLED, not silently dropped.
+
+    _refresh_instructions wrote to `mcp._mcp_server.instructions`, which was
+    correct under FastMCP and does not exist on mcp v2's MCPServer. The
+    AttributeError went into `except Exception: pass`, so the whole workspace
+    walk ran and its result was discarded — every client got the generic
+    fallback blob. Broken since the ironmcp v2 cutover (2026-08-31) and shipped
+    in seven releases, because nothing ever read the surface back.
+    """
+    from srclight import server as server_mod
+    from srclight.workspace import WorkspaceConfig
+
+    proj = _create_indexed_project(tmp_path, "alpha", [("Dictionary", "class")])
+    config = WorkspaceConfig(name="instr-test")
+    config.add_project("alpha", str(proj))
+    config.save()
+
+    server_mod.configure_workspace("instr-test")
+    try:
+        text = server_mod.mcp.instructions
+        assert "instr-test" in text, f"workspace name missing from instructions: {text[:200]!r}"
+        assert "indexed project" in text, "project count missing from instructions"
+        # and the value the wire actually carries must be the same one
+        opts = server_mod.mcp._lowlevel_server.create_initialization_options()
+        assert "instr-test" in opts.instructions
+    finally:
+        server_mod._close_databases()
+
+
+def test_reindex_refuses_a_foreign_path_in_both_modes(tmp_path, ws_dir, monkeypatch):
+    """`path` is an index ROOT, not a filter, and it deletes what is not under it.
+
+    Indexer reads the WHOLE database's file list and removes every file outside
+    the new root, so reindex(path=X) does not pollute an index, it empties it.
+    Measured in single-repo mode: 3 files -> 1, files_removed 3, path rewritten,
+    and a success JSON with errors 0.
+
+    The first guard only refused in WORKSPACE mode -- but the published plugin
+    runs `uvx srclight serve --transport stdio` with NO --workspace, so it never
+    fired for a single plugin user, while the comment justifying it cited the
+    plugin by name. Refuse a foreign path in BOTH modes.
+    """
+    import json
+
+    from srclight import server as server_mod
+    from srclight.workspace import WorkspaceConfig
+
+    # tests must never reach a real index: _get_db() walks up from the CWD, and
+    # an earlier version of this test wrote its temp dir into srclight's own
+    # project index twice, removing 70 files.
+    monkeypatch.chdir(tmp_path)
+
+    proj = _create_indexed_project(tmp_path, "alpha", [("Dictionary", "class")])
+    other = tmp_path / "unrelated"
+    other.mkdir()
+    (other / "x.py").write_text("def stranger():\n    return 1\n")
+
+    # --- workspace mode ---
+    config = WorkspaceConfig(name="reindex-test")
+    config.add_project("alpha", str(proj))
+    config.save()
+    server_mod.configure_workspace("reindex-test")
+    try:
+        result = json.loads(_call(server_mod.reindex(path=str(other))))
+        assert "error" in result, f"workspace mode accepted a foreign path: {result}"
+    finally:
+        server_mod._close_databases()
+
+    # --- single-repo mode: the one the published plugin actually runs ---
+    server_mod._workspace_name = None
+    server_mod.configure(db_path=proj / ".srclight" / "index.db", repo_root=proj)
+    try:
+        result = json.loads(_call(server_mod.reindex(path=str(other))))
+        assert "error" in result, f"single-repo mode accepted a foreign path: {result}"
+        assert not (other / ".srclight" / "index.db").exists()
     finally:
         server_mod._close_databases()
         server_mod.configure(db_path=None, repo_root=None)

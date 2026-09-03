@@ -17,12 +17,105 @@ from typing import Any
 
 
 # Paths that indicate vendored/third-party code
-VENDORED_PREFIXES = ("third_party/", "third-party/", "vendor/", "ext/", "depends/")
+VENDORED_PREFIXES = (
+    "third_party/", "third-party/", "thirdparty/", "3rdparty/",
+    "vendor/", "vendored/", "ext/", "external/", "depends/",
+    "node_modules/", "site-packages/", "bower_components/",
+)
+
+# A minified file is somebody else's build output, whatever directory it sits in.
+VENDORED_SUFFIXES = (".min.js", ".min.css", ".bundle.js")
 
 
 def is_vendored_path(path: str) -> bool:
-    """Check if a file path is in a vendored/third-party directory."""
-    return any(path.startswith(p) or f"/{p}" in path for p in VENDORED_PREFIXES)
+    """Whether a path looks like code the project did not write.
+
+    Conventions, never places: naming a particular repository's vendored
+    directory would make this that repository's config. It fired on 5.74% of
+    files before and missed node_modules, site-packages and minified assets
+    entirely. The trailing slash matters -- `ext/` must not match `extensions/`.
+    """
+    if not path:
+        return False
+    p = path.replace("\\", "/")
+    if p.endswith(VENDORED_SUFFIXES):
+        return True
+    return any(p.startswith(prefix) or f"/{prefix}" in p for prefix in VENDORED_PREFIXES)
+
+
+# --- the match ladder -------------------------------------------------------
+# A lower rung never outranks a higher one, however strong its statistics.
+# Retrieval tiers (FTS name / LIKE / content / docs) say only WHERE a candidate
+# was found; they must not decide its score. bm25 is comparable only within one
+# FTS table, one project and one query string -- measured 3x spread across
+# projects for the same query, and -16.7 vs -55.5 for the same row under two
+# query forms -- so it can break ties inside a rung and nothing wider.
+RUNG_EXACT = 0            # name == query
+RUNG_EXACT_CI = 1         # differs only in case
+RUNG_FOLDED = 2           # same word-parts: check_point == checkPoint
+RUNG_TOKENS_ORDERED = 3   # every query token a word-part, in the name's order
+RUNG_TOKENS_ANY = 4       # every query token a word-part, any order
+RUNG_SUBSTRING = 5        # raw substring of the name
+RUNG_NONE = 9             # the name does not match; only body or docs did
+
+# An identifier-shaped name gets the identifier ladder; a prose name (a markdown
+# heading like "1.2 Checkpoint") is demoted WITHIN its rung, never across one.
+# 63% of this index is `section`/`document`, and only 8.9% of sections are
+# identifier-shaped against 100% of functions -- so shape separates prose from
+# code without naming a kind or a project.
+_IDENT_RE = re.compile(r"^[A-Za-z_~$@][A-Za-z0-9_:<>~$@.\-]*$")
+
+_WORD_PART_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def name_tokens(text: str) -> list[str]:
+    """Lowercase word-parts of an identifier or phrase.
+
+    camelCase, snake_case, dotted and spaced names all reduce to the same parts,
+    which is what lets `check point` reach the same rung as `checkPoint`.
+    """
+    out: list[str] = []
+    for chunk in re.split(r"[^A-Za-z0-9]+", text or ""):
+        if chunk:
+            out.extend(_WORD_PART_RE.findall(chunk))
+    return [t.lower() for t in out if t]
+
+
+def match_rung(query: str, name: str) -> int:
+    """Which rung `name` reaches for `query`. Lower is better."""
+    if not name or not query:
+        return RUNG_NONE
+    if name == query:
+        return RUNG_EXACT
+    ql, nl = query.lower(), name.lower()
+    if nl == ql:
+        return RUNG_EXACT_CI
+
+    nt, qt = name_tokens(name), name_tokens(query)
+    # Compare the CONCATENATION, so folding works in both directions:
+    # query 'check point' vs name 'checkPoint', and query 'checkpoint' vs
+    # name 'check point', are the same identifier written two ways.
+    if qt and "".join(nt) == "".join(qt):
+        return RUNG_FOLDED
+
+    def _reaches(tok: str, part: str) -> bool:
+        # a query token matches a word-part it equals or begins
+        return part == tok or part.startswith(tok)
+
+    if qt:
+        i = 0
+        for part in nt:
+            if i < len(qt) and _reaches(qt[i], part):
+                i += 1
+        if i == len(qt):
+            return RUNG_TOKENS_ORDERED
+        if all(any(_reaches(t, part) for part in nt) for t in qt):
+            return RUNG_TOKENS_ANY
+
+    if ql in nl:
+        return RUNG_SUBSTRING
+    return RUNG_NONE
+
 
 
 def split_identifier(name: str) -> str:
@@ -332,8 +425,14 @@ class Database:
             return None
 
     def close(self) -> None:
+        # Deliberately does NOT checkpoint. server.py opens and closes a
+        # Database in 17 places, most of them pure reads in workspace mode, and
+        # a checkpoint here made every one of them a writer: one SELECT rewrote
+        # the main file and truncated another process's WAL. It also bumped the
+        # mtime that the stats cache is keyed on, so every graph query
+        # invalidated the cache that exists to avoid re-COUNTing. Checkpointing
+        # belongs where writes happen: after an index run, and on shutdown.
         if self.conn:
-            self.checkpoint()
             self.conn.close()
             self.conn = None
 
@@ -648,30 +747,28 @@ class Database:
             if sid not in seen_ids:
                 if kind and row_dict["kind"] != kind:
                     return
-                rank = row_dict.get("rank", 0)
-                name = row_dict.get("name", "")
+                # Same ladder as workspace mode. This is the mode the published
+                # plugin runs (`serve --transport stdio`, no --workspace), and it
+                # carried a second, older scoring implementation whose
+                # case-sensitive `name == query` let a substring outrank an exact
+                # match: for 'checkpoint' it returned getcheckpointing before
+                # checkPoint. Two ranking implementations is one too many.
+                name = row_dict.get("name", "") or ""
                 sym_kind = row_dict.get("kind", "")
-                # Boost exact name matches
-                if name == query:
-                    rank -= 50.0
-                elif name and query_lower in name.lower():
-                    rank -= 10.0
-                # Boost primary symbol kinds (class/struct > prototype/namespace)
-                if sym_kind in _PRIMARY_KINDS:
-                    rank -= 5.0
-                # Name length normalization: shorter names closer to query length
-                # are more relevant (ICaptureService > CaptureServiceImpl::OnHover)
-                query_len = len(query)
-                name_len = len(name)
-                if name_len > query_len:
-                    rank += min((name_len - query_len) * 0.3, 5.0)
-                # Path-based ranking: core > bindings > vendored
                 file_path = row_dict.get("file", "")
+                rank = match_rung(query, name) * 1000.0
+                if not _IDENT_RE.match(name):
+                    rank += 300.0
+                if sym_kind not in _PRIMARY_KINDS:
+                    rank += 100.0
                 if is_vendored_path(file_path):
-                    rank += 20.0
+                    rank += 50.0
                     row_dict["vendored"] = True
                 elif file_path.startswith("bindings/"):
-                    rank += 3.0  # Slight penalty vs core src/
+                    rank += 5.0
+                base = row_dict.get("rank", 0) or 0
+                rank += max(-40.0, min(0.0, float(base))) * 0.5
+                rank += min(len(name), 40) * 0.1
                 row_dict["rank"] = rank
                 results.append(row_dict)
                 seen_ids.add(sid)
@@ -821,7 +918,23 @@ class Database:
                 pass
 
         # Sort: project code first, then by rank within each group
-        results.sort(key=lambda r: (r.get("vendored", False), r.get("rank", 0)))
+        # Collapse repeats, as workspace mode does: one row per (name, kind)
+        # carrying how many it stands for. A name defined in several files
+        # otherwise fills the page, and an agent reads the repetition as
+        # corroboration rather than as one symbol.
+        best: dict[tuple, dict] = {}
+        for r in results:
+            key = (r.get("name"), r.get("kind"))
+            keep = best.get(key)
+            if keep is None or r.get("rank", 0) < keep.get("rank", 0):
+                r["duplicates"] = (keep.get("duplicates", 1) + 1) if keep else 1
+                best[key] = r
+            else:
+                keep["duplicates"] = keep.get("duplicates", 1) + 1
+        results = list(best.values())
+
+        # vendored is a within-rung penalty now, not an infinite primary key
+        results.sort(key=lambda r: (r.get("rank", 0), r.get("name") or ""))
         return results[:limit]
 
     # --- Edges ---
