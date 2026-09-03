@@ -187,6 +187,13 @@ def _read_only_uri(path) -> str:
     return uri + "?mode=ro"
 
 
+# How many rows each retrieval tier fetches per project. FIXED, and deliberately
+# not a multiple of `limit`: when the fetch scaled with limit, the candidate pool
+# moved too, so a smaller limit was not a prefix of a larger one -- two of
+# `checkpoint`'s top five at limit=5 were absent from the top 50 entirely.
+# Retrieval decides WHAT is considered; `limit` only decides how much is shown.
+TIER_FETCH = 150
+
 MAX_ATTACH = 10  # SQLite default SQLITE_MAX_ATTACHED
 
 
@@ -206,6 +213,10 @@ def _synchronized(method):
         with self._lock:
             return method(self, *args, **kwargs)
     return wrapper
+
+
+class _SkipLikeScan(Exception):
+    """Raised to skip the LIKE full scan; caught by the leg's own handler."""
 
 
 class WorkspaceDB:
@@ -606,7 +617,10 @@ class WorkspaceDB:
         for batch in self._iter_batches(project_filter=project):
           for schema, project_name in batch:
             # FTS5 on symbol names
-            for fts_query in [query, query_tokens]:
+            # `q*` is a prefix match: 4-70 ms per query across all projects against
+            # the scan's 725+, and it finds strictly more than the bare term --
+            # `sqlit` goes from 0 hits to 1060, `checkpoint` from 127 to 159.
+            for fts_query in [query, query_tokens, f"{query}*" if query and " " not in query else ""]:
                 if not fts_query:
                     continue
                 try:
@@ -616,7 +630,7 @@ class WorkspaceDB:
                            FROM [{schema}].symbol_names_fts
                            WHERE symbol_names_fts MATCH ?
                            ORDER BY rank LIMIT ?""",
-                        (fts_query, limit * 3), schema, "name",
+                        (fts_query, TIER_FETCH), schema, "name",
                     )
                     for row in rows:
                         sid = int(row["symbol_id"])
@@ -641,13 +655,22 @@ class WorkspaceDB:
                 except sqlite3.OperationalError as e:
                     self._fts_leg_failed(schema, "name", e)
 
-            # LIKE fallback
+            # LIKE fallback: a full scan of symbols JOIN files, 725-1064 ms across
+            # 39 projects and 55-78% of every search. It can only match a literal
+            # substring of ONE name, so a multi-token query cannot be helped by
+            # it -- measured over the whole workspace, `embedding cache`,
+            # `attach read only`, `vector cache` and `wal checkpoint` all return
+            # 0 rows, and `graceful shutdown` returns exactly 1, a section the
+            # FTS name leg already ranks first. Skip it when the query has
+            # whitespace; the FTS legs handle multi-token matching properly.
             try:
+                if len(query.split()) > 1:
+                    raise _SkipLikeScan
                 kind_filter = "AND s.kind = ?" if kind else ""
                 like_params: list = [f"%{query}%"]
                 if kind:
                     like_params.append(kind)
-                like_params.extend([query, limit * 3])
+                like_params.extend([query, TIER_FETCH])
 
                 rows = self.conn.execute(
                     f"""SELECT s.id as symbol_id, s.name, f.path as file_path, s.kind
@@ -680,7 +703,7 @@ class WorkspaceDB:
                     d["rank"] = _rank_result(d)
                     results.append(d)
                     seen_ids.add(key)
-            except sqlite3.OperationalError:
+            except (sqlite3.OperationalError, _SkipLikeScan):
                 pass
 
             # Tier 3: FTS5 on content (trigram)
@@ -691,7 +714,7 @@ class WorkspaceDB:
                        FROM [{schema}].symbol_content_fts
                        WHERE symbol_content_fts MATCH ?
                        ORDER BY rank LIMIT ?""",
-                    (query, limit * 2), schema, "content",
+                    (query, TIER_FETCH), schema, "content",
                 )
                 for row in rows:
                     sid = int(row["symbol_id"])
@@ -724,7 +747,7 @@ class WorkspaceDB:
                        FROM [{schema}].symbol_docs_fts
                        WHERE symbol_docs_fts MATCH ?
                        ORDER BY rank LIMIT ?""",
-                    (query, limit * 2), schema, "docs",
+                    (query, TIER_FETCH), schema, "docs",
                 )
                 for row in rows:
                     sid = int(row["symbol_id"])

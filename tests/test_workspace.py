@@ -905,3 +905,106 @@ def test_repeated_symbols_collapse_to_one_row_that_counts_them(tmp_path, ws_dir)
     assert rows[0].get("duplicates") == 6, (
         f"collapsed row must report how many it stands for; got {rows[0].get('duplicates')!r}"
     )
+
+
+def test_retrieval_pool_does_not_move_with_limit(tmp_path, ws_dir):
+    """`limit` must truncate, not change what is retrieved.
+
+    Every tier fetched `limit * 3` or `limit * 2` rows, so the candidate pool
+    itself moved with `limit`. On the real workspace two of `checkpoint`'s top
+    five at limit=5 did not appear in the top 50 at all, because the small pool
+    never contained them. An agent that widens a search to see more expects the
+    rows it already had to stay put.
+
+    A fixture cannot show this -- with uniform names bm25 and the ladder agree,
+    so any pool yields the same prefix. What is testable, and what the fix
+    actually is, is that the fetch size no longer depends on `limit`.
+    """
+    proj = _project_with_content(tmp_path, "alpha", "handler",
+                                 "def handler():\n    return TOK\n")
+    config = WorkspaceConfig(name="pool-test")
+    config.add_project("alpha", str(proj))
+
+    seen: list[int] = []
+
+    class _Spy:
+        """Delegating proxy -- sqlite3.Connection.execute is read-only."""
+
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, params=()):
+            if "LIMIT ?" in str(sql) and params and isinstance(params[-1], int):
+                seen.append(params[-1])
+            return self._real.execute(sql, params)
+
+        def __getattr__(self, item):
+            return getattr(self._real, item)
+
+    with WorkspaceDB(config) as wdb:
+        real_conn = wdb.conn
+        wdb.conn = _Spy(real_conn)      # type: ignore[assignment]
+        wdb.search_symbols("TOK", limit=3)
+        small = list(seen)
+        seen.clear()
+        wdb.search_symbols("TOK", limit=40)
+        large = list(seen)
+        wdb.conn = real_conn            # type: ignore[assignment]
+
+    assert small and large, "no FTS leg ran; the spy saw nothing"
+    assert set(small) == set(large), (
+        f"per-tier fetch size moved with limit: {sorted(set(small))} vs {sorted(set(large))}"
+    )
+
+
+def test_multi_word_queries_skip_the_full_scan_and_keep_their_results(tmp_path, ws_dir):
+    """The LIKE leg is a full scan and cannot help a multi-token query.
+
+    `name LIKE '%a b%'` needs the literal phrase inside one name. Measured over
+    all 39 projects: `embedding cache` 0 rows, `attach read only` 0, `vector
+    cache` 0, `wal checkpoint` 0, `graceful shutdown` exactly 1 -- and that one
+    row is a section the FTS name leg already returns first. It cost 725-1064 ms
+    a query, 55-78% of every search, to add nothing.
+    """
+    from srclight.db import Database, FileRecord, SymbolRecord
+
+    d = tmp_path / "alpha" / ".srclight"
+    d.mkdir(parents=True)
+    db = Database(d / "index.db")
+    db.open()
+    db.initialize()
+    fid = db.upsert_file(FileRecord(path="doc.md", content_hash="h", mtime=1.0,
+                                    language="markdown", size=40, line_count=4))
+    db.insert_symbol(SymbolRecord(file_id=fid, kind="section", name="Graceful Shutdown",
+                                  start_line=1, end_line=2, content="about draining",
+                                  body_hash="b1"), "doc.md")
+    db.commit()
+    db.close()
+
+    config = WorkspaceConfig(name="skip-like-test")
+    config.add_project("alpha", str(tmp_path / "alpha"))
+
+    scans: list[str] = []
+
+    class _Spy:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, params=()):
+            if "LIKE ? COLLATE NOCASE" in str(sql):
+                scans.append(str(params[0]) if params else "")
+            return self._real.execute(sql, params)
+
+        def __getattr__(self, item):
+            return getattr(self._real, item)
+
+    with WorkspaceDB(config) as wdb:
+        real_conn = wdb.conn
+        wdb.conn = _Spy(real_conn)      # type: ignore[assignment]
+        hits = wdb.search_symbols("graceful shutdown", limit=10)
+        wdb.conn = real_conn            # type: ignore[assignment]
+
+    assert not scans, f"the full scan ran for a multi-token query: {scans}"
+    assert any(h["name"] == "Graceful Shutdown" for h in hits), (
+        f"skipping the scan lost the result; got {[h['name'] for h in hits]}"
+    )
