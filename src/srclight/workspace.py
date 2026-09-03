@@ -174,9 +174,12 @@ def _read_only_uri(path) -> str:
     uri = Path(path).resolve().as_uri()
     if uri.startswith("file://") and not uri.startswith("file:///"):
         # A Windows UNC path (\\server\share, \\wsl$\...) renders with a
-        # non-empty authority, which SQLite refuses: "invalid uri authority".
-        # Returning the plain path keeps such a project working read-write
-        # rather than turning it into an error row on a platform we cannot test.
+        # non-empty authority, which SQLite refuses outright: measured on Windows,
+        # "invalid uri authority: wsl%24". Fall back to the plain path so this
+        # cannot be the thing that breaks such a project. It is a narrow rescue:
+        # a plain ATTACH of a \\wsl.localhost path returns "database is locked"
+        # anyway, so indexes on that share were already unusable. A real SMB
+        # share is untested.
         logger.warning(
             "Cannot build a read-only URI for %s (UNC path); attaching read-write", path
         )
@@ -230,12 +233,14 @@ class WorkspaceDB:
         self._lock = threading.RLock()
 
     def open(self) -> None:
-        # uri=True is NOT decoration: srclight ships a frozen Windows engine whose
-        # sqlite3.dll (3.49.1) is built WITHOUT SQLITE_USE_URI (verified with
-        # `strings` on engine-windows/_internal/sqlite3.dll; the Linux and macOS
-        # builds do carry it). Without this flag SQLite takes the whole
-        # "file:...?mode=ro" string as a literal filename and CREATES it,
-        # read-write. Do not tidy this argument away.
+        # uri=True is NOT decoration. Confirmed by calling sqlite3_compileoption_used
+        # on the shipped engine-windows/_internal/sqlite3.dll (3.49.1):
+        # SQLITE_USE_URI is FALSE there, while the Linux and macOS builds carry it.
+        # Without this flag SQLite treats "file:...?mode=ro" as a literal filename.
+        # On Linux that CREATES a file of that name, read-write; on Windows, where
+        # '?' is not legal in a path, ATTACH instead raises "unable to open
+        # database" and every project lands in _attach_errors. Either way the
+        # read-only guarantee is gone. Do not tidy this argument away.
         self.conn = sqlite3.connect(
             ":memory:", check_same_thread=False, uri=True
         )
