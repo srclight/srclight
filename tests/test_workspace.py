@@ -828,3 +828,36 @@ def test_sidecar_freshness_check_survives_a_metacharacter_path(tmp_path):
     strays = [q.name for q in tmp_path.iterdir() if q.name != "issue#42"]
     assert not strays, f"created stray databases beside the project: {strays}"
     assert fresh is False, "reported a stale sidecar as fresh"
+
+
+def test_a_punctuation_query_searches_instead_of_flooding_the_health_signal(
+    tmp_path, ws_dir, caplog
+):
+    """A query carrying FTS5 syntax must be searched, not counted as a dead leg.
+
+    `get(` raises `fts5: syntax error near ""`, and the leg-failure reporter
+    added in v0.23.0 read that as "this leg is unavailable" — 117 warnings from
+    ONE query on the 39-project workspace, straight into warning_ring and
+    /healthz `degraded`. A signal meant to surface a permanently dead leg cannot
+    survive an agent typing a parenthesis. Quoting the term also makes the query
+    work: `"get("` returns rows where the bare form returned an error.
+    """
+    import logging
+
+    proj = _project_with_content(
+        tmp_path, "alpha", "get_thing", "def get_thing():\n    return 1\n"
+    )
+    config = WorkspaceConfig(name="punct-test")
+    config.add_project("alpha", str(proj))
+
+    with WorkspaceDB(config) as wdb:
+        with caplog.at_level(logging.WARNING, logger="srclight.workspace"):
+            hits = wdb.search_symbols("get(")
+
+    leg_warnings = [r.getMessage() for r in caplog.records if "fts" in r.getMessage().lower()]
+    assert not leg_warnings, (
+        f"a malformed query was reported as {len(leg_warnings)} dead leg(s): {leg_warnings[:2]}"
+    )
+    assert any(h["name"] == "get_thing" for h in hits), (
+        f"punctuation query found nothing; got {[h['name'] for h in hits]}"
+    )

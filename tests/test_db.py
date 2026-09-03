@@ -280,3 +280,47 @@ def test_checkpoint_failure_is_not_fatal(tmp_path):
     db.conn.close()          # pull the connection out from under it
 
     assert db.checkpoint() is None
+
+
+def test_a_read_only_session_does_not_checkpoint_someone_elses_wal(tmp_path):
+    """Opening and closing a Database to READ must not rewrite the index.
+
+    v0.22.2 put `PRAGMA wal_checkpoint(TRUNCATE)` in Database.close(), and
+    server.py opens/closes a Database in 17 places — get_callers, get_callees,
+    find_dead_code and friends. Measured: one `SELECT count(*)` through that
+    path changed the main file's md5 and truncated a 4,152-byte WAL to zero.
+    The same session named that behaviour a defect two hours later and fixed it
+    in one place only. Checkpointing belongs where writes happen: the indexer
+    and the deliberate shutdown path.
+    """
+    import hashlib
+    import subprocess
+    import sys
+
+    db_path = tmp_path / "index.db"
+    Database(db_path).__enter__().initialize()
+
+    # leave a hot WAL: a writer that exits without closing
+    subprocess.run(
+        [sys.executable, "-c",
+         "import sqlite3,os,sys\n"
+         "c=sqlite3.connect(sys.argv[1])\n"
+         "c.execute('PRAGMA journal_mode=WAL')\n"
+         "c.execute('CREATE TABLE IF NOT EXISTS scratch(x)')\n"
+         "c.execute('INSERT INTO scratch VALUES (1)')\n"
+         "c.commit()\n"
+         "os._exit(0)\n", str(db_path)],
+        check=True,
+    )
+    wal = db_path.with_name("index.db-wal")
+    assert wal.exists() and wal.stat().st_size > 0, "fixture left no hot WAL"
+    before = (hashlib.md5(db_path.read_bytes()).hexdigest(), wal.stat().st_size)
+
+    reader = Database(db_path)
+    reader.open()
+    reader.conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    reader.close()
+
+    after = (hashlib.md5(db_path.read_bytes()).hexdigest(),
+             wal.stat().st_size if wal.exists() else 0)
+    assert after == before, f"a read-only session rewrote the index: {before} -> {after}"

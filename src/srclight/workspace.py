@@ -598,14 +598,14 @@ class WorkspaceDB:
                 if not fts_query:
                     continue
                 try:
-                    rows = self.conn.execute(
+                    rows = self._fts_execute(
                         f"""SELECT symbol_id, name, file_path, kind, rank,
                                snippet(symbol_names_fts, 1, '>>>', '<<<', '...', 20) as snippet
                            FROM [{schema}].symbol_names_fts
                            WHERE symbol_names_fts MATCH ?
                            ORDER BY rank LIMIT ?""",
-                        (fts_query, limit * 3),
-                    ).fetchall()
+                        (fts_query, limit * 3), schema, "name",
+                    )
                     for row in rows:
                         sid = int(row["symbol_id"])
                         key = (project_name, sid)
@@ -673,14 +673,14 @@ class WorkspaceDB:
 
             # Tier 3: FTS5 on content (trigram)
             try:
-                rows = self.conn.execute(
+                rows = self._fts_execute(
                     f"""SELECT symbol_id, name, file_path, kind, rank,
                            snippet(symbol_content_fts, 0, '>>>', '<<<', '...', 30) as snippet
                        FROM [{schema}].symbol_content_fts
                        WHERE symbol_content_fts MATCH ?
                        ORDER BY rank LIMIT ?""",
-                    (query, limit * 2),
-                ).fetchall()
+                    (query, limit * 2), schema, "content",
+                )
                 for row in rows:
                     sid = int(row["symbol_id"])
                     key = (project_name, sid)
@@ -706,14 +706,14 @@ class WorkspaceDB:
 
             # Tier 4: FTS5 on docs
             try:
-                rows = self.conn.execute(
+                rows = self._fts_execute(
                     f"""SELECT symbol_id, name, file_path, kind, rank,
                            snippet(symbol_docs_fts, 0, '>>>', '<<<', '...', 30) as snippet
                        FROM [{schema}].symbol_docs_fts
                        WHERE symbol_docs_fts MATCH ?
                        ORDER BY rank LIMIT ?""",
-                    (query, limit * 2),
-                ).fetchall()
+                    (query, limit * 2), schema, "docs",
+                )
                 for row in rows:
                     sid = int(row["symbol_id"])
                     key = (project_name, sid)
@@ -885,6 +885,42 @@ class WorkspaceDB:
         # No sidecar or load failed — return None but don't permanently cache it.
         # Next call will re-check sidecar existence (fast filesystem stat).
         return None
+
+    @staticmethod
+    def _is_fts_query_error(exc: Exception) -> bool:
+        """True when FTS5 rejected the QUERY TEXT, not the table.
+
+        A user's search string is not a broken index. `get(` raises
+        `fts5: syntax error near ""`, `self.conn.execute` raises `syntax error
+        near "."`, an unbalanced quote raises `unterminated string`. Counting
+        those as a dead leg produced 117 warnings from ONE search across 39
+        projects and buried the real signal in /healthz `degraded`.
+        """
+        msg = str(exc).lower()
+        return "syntax error" in msg or "unterminated" in msg
+
+    def _fts_execute(self, sql: str, params: tuple, schema: str, leg: str) -> list:
+        """Run one FTS leg. Returns rows; [] if the leg is unavailable.
+
+        When FTS5 rejects the query text, quote it and retry once: someone
+        searching `get(` means that literal text, not a boolean expression.
+        Quoting is also what makes it work -- bare `get(` errors where `"get("`
+        returns rows. Only a genuine leg failure is reported.
+        """
+        assert self.conn is not None
+        try:
+            return self.conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError as e:
+            if not self._is_fts_query_error(e):
+                self._fts_leg_failed(schema, leg, e)
+                return []
+        quoted = '"' + str(params[0]).replace('"', '""') + '"'
+        try:
+            return self.conn.execute(sql, (quoted, *params[1:])).fetchall()
+        except sqlite3.OperationalError as e:
+            if not self._is_fts_query_error(e):
+                self._fts_leg_failed(schema, leg, e)
+            return []
 
     def _fts_leg_failed(self, schema: str, leg: str, exc: Exception) -> None:
         """Report a search leg that could not run, once per schema and leg.

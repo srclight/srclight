@@ -332,8 +332,14 @@ class Database:
             return None
 
     def close(self) -> None:
+        # Deliberately does NOT checkpoint. server.py opens and closes a
+        # Database in 17 places, most of them pure reads in workspace mode, and
+        # a checkpoint here made every one of them a writer: one SELECT rewrote
+        # the main file and truncated another process's WAL. It also bumped the
+        # mtime that the stats cache is keyed on, so every graph query
+        # invalidated the cache that exists to avoid re-COUNTing. Checkpointing
+        # belongs where writes happen: after an index run, and on shutdown.
         if self.conn:
-            self.checkpoint()
             self.conn.close()
             self.conn = None
 

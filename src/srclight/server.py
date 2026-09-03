@@ -170,9 +170,20 @@ def _refresh_instructions() -> None:
     """Update the MCP server instructions with current workspace state."""
     try:
         dynamic = _build_dynamic_instructions()
-        mcp._mcp_server.instructions = _INSTRUCTIONS_TEMPLATE.format(dynamic_section=dynamic)
-    except Exception:
-        pass  # Keep existing instructions on error
+        # `_mcp_server` was the FastMCP handle and does not exist on mcp v2's
+        # MCPServer; the AttributeError went into a bare except and the whole
+        # workspace walk was discarded for seven releases. `mcp.instructions` is
+        # a read-only property, so the settable handle is the lowlevel server —
+        # and create_initialization_options() reads it per connection, so a
+        # value set here reaches every client that connects afterwards.
+        mcp._lowlevel_server.instructions = _INSTRUCTIONS_TEMPLATE.format(
+            dynamic_section=dynamic
+        )
+    except Exception as e:  # noqa: BLE001 -- startup must not die for a string
+        logger.warning(
+            "Could not install dynamic instructions (%s); clients will see the "
+            "generic blob without workspace details", e,
+        )
 
 
 # Shared estate policy, vendored as a single generated file (mcpkit). This REPLACES the
@@ -1222,6 +1233,29 @@ async def reindex(path: str | None = None) -> str:
         path: Optional specific directory to re-index (default: entire repo)
     """
     global _vector_cache
+    # `path` is used as an index ROOT, not a filter: Indexer reads the whole
+    # database's file list and DELETES every file not under it. So a foreign
+    # path does not pollute an index, it empties it — measured, 3 files to 1
+    # with a success JSON. And `_get_db()` resolves the database by walking up
+    # from the SERVER'S working directory, not from `path`, so in workspace mode
+    # the two are unrelated entirely.
+    #
+    # Refuse in BOTH modes. An earlier guard covered only workspace mode, which
+    # is the safe one; the published plugin runs `serve --transport stdio` with
+    # no --workspace, from the user's own repository, so it never fired where it
+    # was needed. Sub-path reindexing should return as a FILTER, not a new root.
+    if path is not None:
+        requested = Path(path).resolve()
+        configured = Path(_repo_root).resolve() if _repo_root else None
+        if configured is None or requested != configured:
+            return json.dumps({
+                "error": "reindex does not accept a path",
+                "reason": "`path` is treated as a new index root and removes every "
+                          "indexed file outside it, which empties the index.",
+                "hint": "Reindex the configured repository with reindex(), or index "
+                        "another tree from the CLI: `srclight index /path --embed`",
+                "configured_root": str(configured) if configured else None,
+            })
     root = Path(path) if path else _repo_root
     if root is None:
         return json.dumps({"error": "No repo root configured"})
@@ -2922,6 +2956,11 @@ def _close_databases() -> None:
         if handle is None:
             continue
         try:
+            # Shutdown is a write boundary: fold the WAL back so index.db is
+            # self-contained at rest. close() no longer does this, because most
+            # callers are readers.
+            if hasattr(handle, "checkpoint"):
+                handle.checkpoint()
             handle.close()
         except Exception:  # noqa: BLE001 -- cleanup must never block an exit
             logger.warning("Failed to close the %s database cleanly", label, exc_info=True)
