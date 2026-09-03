@@ -1,5 +1,8 @@
 """The match ladder: a pure function of (query, name), no database.
 
+It lives in db.py because BOTH modes score with it — workspace mode and the
+single-repo mode the published plugin runs.
+
 A lower rung never outranks a higher one, however strong its statistics. The
 scoring bug this replaces let bm25 and a hardcoded LIKE constant decide across
 tiers, so a symbol FTS5 found could sort below one only LIKE could find.
@@ -7,7 +10,7 @@ tiers, so a symbol FTS5 found could sort below one only LIKE could find.
 
 import pytest
 
-from srclight.workspace import RUNG_NONE, match_rung
+from srclight.db import RUNG_NONE, match_rung
 
 
 @pytest.mark.parametrize("query,name,expected", [

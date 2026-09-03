@@ -324,3 +324,66 @@ def test_a_read_only_session_does_not_checkpoint_someone_elses_wal(tmp_path):
     after = (hashlib.md5(db_path.read_bytes()).hexdigest(),
              wal.stat().st_size if wal.exists() else 0)
     assert after == before, f"a read-only session rewrote the index: {before} -> {after}"
+
+
+def test_single_repo_mode_ranks_by_match_quality_too(tmp_path):
+    """The mode the published plugin runs must use the same ladder.
+
+    `uvx srclight serve --transport stdio` takes no --workspace, so every plugin
+    user is in single-repo mode -- and db.py carried a SECOND, older scoring
+    implementation: case-sensitive `name == query`, and constants that let a
+    substring outrank an exact match. Measured before this fix, query
+    'checkpoint': getcheckpointing -28.2, checkPoint -15.0, WalCheckpoint -14.1.
+    The exact match came second, behind a substring.
+    """
+    db_path = tmp_path / "index.db"
+    db = Database(db_path)
+    db.open()
+    db.initialize()
+    fid = db.upsert_file(FileRecord(path="a.py", content_hash="h", mtime=1.0,
+                                    language="python", size=10, line_count=2))
+    for nm in ("getcheckpointing", "WalCheckpoint", "checkPoint"):
+        db.insert_symbol(SymbolRecord(file_id=fid, kind="function", name=nm,
+                                      start_line=1, end_line=2, content="x",
+                                      body_hash=nm), "a.py")
+    db.commit()
+
+    names = [r["name"] for r in db.search_symbols("checkpoint", limit=10)]
+    db.close()
+
+    assert names[0] == "checkPoint", (
+        f"exact-but-for-case must rank first; got {names}"
+    )
+    assert names.index("WalCheckpoint") < names.index("getcheckpointing"), (
+        f"a word-part match must beat a bare substring; got {names}"
+    )
+
+
+def test_single_repo_mode_collapses_repeats_like_workspace_mode(tmp_path):
+    """Both modes must dedup, or they disagree about what a result set is.
+
+    Dedup shipped to workspace mode first; single-repo — the mode the published
+    plugin runs — kept returning one row per symbol_id, so a name defined in
+    several files filled the page. One row per (name, kind), carrying how many
+    it stands for.
+    """
+    db_path = tmp_path / "index.db"
+    db = Database(db_path)
+    db.open()
+    db.initialize()
+    for i in range(5):
+        fid = db.upsert_file(FileRecord(path=f"m{i}.py", content_hash=f"h{i}", mtime=1.0,
+                                        language="python", size=10, line_count=2))
+        db.insert_symbol(SymbolRecord(file_id=fid, kind="function", name="search_symbols",
+                                      start_line=1, end_line=2, content="x",
+                                      body_hash=f"b{i}"), f"m{i}.py")
+    db.commit()
+
+    rows = [r for r in db.search_symbols("search_symbols", limit=20)
+            if r["name"] == "search_symbols"]
+    db.close()
+
+    assert len(rows) == 1, f"{len(rows)} rows for one name+kind; expected 1"
+    assert rows[0].get("duplicates") == 5, (
+        f"the collapsed row must report the count; got {rows[0].get('duplicates')!r}"
+    )
