@@ -1,3 +1,3 @@
 """Srclight — Deep code indexing for AI agents."""
 
-__version__ = "0.23.0"
+__version__ = "0.24.0"
