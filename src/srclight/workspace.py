@@ -233,14 +233,18 @@ class WorkspaceDB:
         self._lock = threading.RLock()
 
     def open(self) -> None:
-        # uri=True is NOT decoration. Confirmed by calling sqlite3_compileoption_used
-        # on the shipped engine-windows/_internal/sqlite3.dll (3.49.1):
-        # SQLITE_USE_URI is FALSE there, while the Linux and macOS builds carry it.
-        # Without this flag SQLite treats "file:...?mode=ro" as a literal filename.
-        # On Linux that CREATES a file of that name, read-write; on Windows, where
-        # '?' is not legal in a path, ATTACH instead raises "unable to open
-        # database" and every project lands in _attach_errors. Either way the
-        # read-only guarantee is gone. Do not tidy this argument away.
+        # uri=True matters on WINDOWS ONLY, and for availability rather than
+        # integrity. Measured with sqlite3_compileoption_used against the shipped
+        # binaries: engine-linux libsqlite3.so.0 (3.45.1) has SQLITE_USE_URI=True,
+        # engine-windows sqlite3.dll (3.49.1) has it FALSE.
+        #   Linux/macOS: the compile default already interprets URIs, so mode=ro is
+        #     honoured with or without this flag (verified: uri=False still refuses
+        #     the write and creates no stray file). The flag is a no-op here.
+        #   Windows: without it ATTACH raises "unable to open database" and EVERY
+        #     project lands in _attach_errors, so the desktop app indexes nothing.
+        # It does NOT prevent a silent downgrade to read-write; no such downgrade
+        # was reproducible on either platform. The genuinely silent failure is a
+        # metacharacter truncating the URI, which _read_only_uri() handles.
         self.conn = sqlite3.connect(
             ":memory:", check_same_thread=False, uri=True
         )
