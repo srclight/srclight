@@ -1008,3 +1008,42 @@ def test_multi_word_queries_skip_the_full_scan_and_keep_their_results(tmp_path, 
     assert any(h["name"] == "Graceful Shutdown" for h in hits), (
         f"skipping the scan lost the result; got {[h['name'] for h in hits]}"
     )
+
+
+def test_a_query_matching_no_name_returns_a_few_body_hits_not_a_full_page(tmp_path, ws_dir):
+    """When nothing matches on a NAME, do not fill the page from the body tier.
+
+    `quiesce` matches no symbol name anywhere in the workspace, so every row came
+    from the content and doc tiers -- twenty OCR fragments from scanned PDFs
+    ("The Morn- thg Watch", "= 0.5"). Returning nothing would delete content
+    search, which is a real capability; returning twenty is not an answer either.
+    A few, marked, is the honest middle.
+    """
+    from srclight.db import Database, FileRecord, SymbolRecord
+
+    d = tmp_path / "alpha" / ".srclight"
+    d.mkdir(parents=True)
+    db = Database(d / "index.db")
+    db.open()
+    db.initialize()
+    for i in range(12):
+        fid = db.upsert_file(FileRecord(path=f"n{i}.md", content_hash=f"h{i}", mtime=1.0,
+                                        language="markdown", size=60, line_count=5))
+        db.insert_symbol(SymbolRecord(
+            file_id=fid, kind="section", name=f"Unrelated Heading {i}",
+            start_line=1, end_line=2,
+            content=f"prose mentioning QUIESCETOKEN in passing {i}",
+            body_hash=f"b{i}"), f"n{i}.md")
+    db.commit()
+    db.close()
+
+    config = WorkspaceConfig(name="floor-test")
+    config.add_project("alpha", str(tmp_path / "alpha"))
+    with WorkspaceDB(config) as wdb:
+        hits = wdb.search_symbols("QUIESCETOKEN", limit=20)
+
+    assert hits, "content search must still work"
+    assert len(hits) <= 5, f"a name-less query filled the page with {len(hits)} body hits"
+    assert all(h.get("name_match") is False for h in hits), (
+        "rows with no name match must say so"
+    )

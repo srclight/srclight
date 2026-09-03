@@ -17,12 +17,30 @@ from typing import Any
 
 
 # Paths that indicate vendored/third-party code
-VENDORED_PREFIXES = ("third_party/", "third-party/", "vendor/", "ext/", "depends/")
+VENDORED_PREFIXES = (
+    "third_party/", "third-party/", "thirdparty/", "3rdparty/",
+    "vendor/", "vendored/", "ext/", "external/", "depends/",
+    "node_modules/", "site-packages/", "bower_components/",
+)
+
+# A minified file is somebody else's build output, whatever directory it sits in.
+VENDORED_SUFFIXES = (".min.js", ".min.css", ".bundle.js")
 
 
 def is_vendored_path(path: str) -> bool:
-    """Check if a file path is in a vendored/third-party directory."""
-    return any(path.startswith(p) or f"/{p}" in path for p in VENDORED_PREFIXES)
+    """Whether a path looks like code the project did not write.
+
+    Conventions, never places: naming a particular repository's vendored
+    directory would make this that repository's config. It fired on 5.74% of
+    files before and missed node_modules, site-packages and minified assets
+    entirely. The trailing slash matters -- `ext/` must not match `extensions/`.
+    """
+    if not path:
+        return False
+    p = path.replace("\\", "/")
+    if p.endswith(VENDORED_SUFFIXES):
+        return True
+    return any(p.startswith(prefix) or f"/{prefix}" in p for prefix in VENDORED_PREFIXES)
 
 
 # --- the match ladder -------------------------------------------------------

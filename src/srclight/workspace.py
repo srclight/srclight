@@ -194,6 +194,13 @@ def _read_only_uri(path) -> str:
 # Retrieval decides WHAT is considered; `limit` only decides how much is shown.
 TIER_FETCH = 150
 
+# When NOTHING matched on a name, the page would fill from the body and doc
+# tiers -- `quiesce` returned twenty OCR fragments from scanned PDFs. Returning
+# nothing deletes content search, which is a real capability; returning twenty
+# is not an answer either. Show a few, and mark them, so the caller can tell a
+# body mention from a definition.
+NAMELESS_RESULT_CAP = 5
+
 MAX_ATTACH = 10  # SQLite default SQLITE_MAX_ATTACHED
 
 
@@ -576,7 +583,7 @@ class WorkspaceDB:
         """
         assert self.conn is not None
         from .db import (
-            _IDENT_RE, is_vendored_path, match_rung, split_identifier,
+            _IDENT_RE, RUNG_NONE, is_vendored_path, match_rung, split_identifier,
         )
 
         results: list[dict[str, Any]] = []
@@ -796,6 +803,16 @@ class WorkspaceDB:
         # As a primary key it was an INFINITE demotion that made the +20 dead
         # arithmetic -- setting that constant to +/-100000 changed no result.
         results.sort(key=lambda r: (r.get("rank", 0), r.get("project") or "", r.get("name") or ""))
+        # mark every row with whether the NAME matched, and cap a result set that
+        # contains no name match at all
+        any_name_match = False
+        for r in results:
+            matched = match_rung(query, r.get("name", "") or "") < RUNG_NONE
+            r["name_match"] = matched
+            any_name_match = any_name_match or matched
+        if not any_name_match:
+            return results[:min(limit, NAMELESS_RESULT_CAP)]
+
         return results[:limit]
 
     def codebase_map(self, project: str | None = None) -> dict[str, Any]:

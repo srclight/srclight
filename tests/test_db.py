@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from srclight.db import Database, FileRecord, SymbolRecord, EdgeRecord, content_hash
+from srclight.db import Database, FileRecord, SymbolRecord, EdgeRecord, content_hash, is_vendored_path
 
 
 @pytest.fixture
@@ -387,3 +387,29 @@ def test_single_repo_mode_collapses_repeats_like_workspace_mode(tmp_path):
     assert rows[0].get("duplicates") == 5, (
         f"the collapsed row must report the count; got {rows[0].get('duplicates')!r}"
     )
+
+
+@pytest.mark.parametrize("path,vendored", [
+    # already covered
+    ("third_party/foo.c", True),
+    ("vendor/bar.go", True),
+    ("src/ext/baz.cpp", True),
+    # generic conventions that were missed
+    ("web/node_modules/react/index.js", True),
+    (".venv/lib/python3.12/site-packages/numpy/core.py", True),
+    ("wwwroot/js/jquery.min.js", True),
+    ("static/css/bootstrap.min.css", True),
+    ("external/googletest/gtest.h", True),
+    ("3rdparty/zlib/zlib.c", True),
+    # ordinary source must never be marked vendored
+    ("src/main.py", False),
+    ("lib/parser/tokenizer.rs", False),
+    ("extensions/my_extension.py", False),   # 'ext' must not match a word prefix
+])
+def test_vendored_path_covers_the_common_conventions(path, vendored):
+    """The predicate fired on 5.74% of files and missed minified and node_modules.
+
+    It cannot name a specific repository's vendored directory without becoming
+    that repository's config, so it covers conventions rather than places.
+    """
+    assert is_vendored_path(path) is vendored, path
