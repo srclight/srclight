@@ -162,6 +162,80 @@ def _sanitize_schema_name(name: str) -> str:
 _FTS_WARN_INTERVAL_SECONDS = 900
 
 
+# --- the match ladder -------------------------------------------------------
+# A lower rung never outranks a higher one, however strong its statistics.
+# Retrieval tiers (FTS name / LIKE / content / docs) say only WHERE a candidate
+# was found; they must not decide its score. bm25 is comparable only within one
+# FTS table, one project and one query string -- measured 3x spread across
+# projects for the same query, and -16.7 vs -55.5 for the same row under two
+# query forms -- so it can break ties inside a rung and nothing wider.
+RUNG_EXACT = 0            # name == query
+RUNG_EXACT_CI = 1         # differs only in case
+RUNG_FOLDED = 2           # same word-parts: check_point == checkPoint
+RUNG_TOKENS_ORDERED = 3   # every query token a word-part, in the name's order
+RUNG_TOKENS_ANY = 4       # every query token a word-part, any order
+RUNG_SUBSTRING = 5        # raw substring of the name
+RUNG_NONE = 9             # the name does not match; only body or docs did
+
+# An identifier-shaped name gets the identifier ladder; a prose name (a markdown
+# heading like "1.2 Checkpoint") is demoted WITHIN its rung, never across one.
+# 63% of this index is `section`/`document`, and only 8.9% of sections are
+# identifier-shaped against 100% of functions -- so shape separates prose from
+# code without naming a kind or a project.
+_IDENT_RE = re.compile(r"^[A-Za-z_~$@][A-Za-z0-9_:<>~$@.\-]*$")
+
+_WORD_PART_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def name_tokens(text: str) -> list[str]:
+    """Lowercase word-parts of an identifier or phrase.
+
+    camelCase, snake_case, dotted and spaced names all reduce to the same parts,
+    which is what lets `check point` reach the same rung as `checkPoint`.
+    """
+    out: list[str] = []
+    for chunk in re.split(r"[^A-Za-z0-9]+", text or ""):
+        if chunk:
+            out.extend(_WORD_PART_RE.findall(chunk))
+    return [t.lower() for t in out if t]
+
+
+def match_rung(query: str, name: str) -> int:
+    """Which rung `name` reaches for `query`. Lower is better."""
+    if not name or not query:
+        return RUNG_NONE
+    if name == query:
+        return RUNG_EXACT
+    ql, nl = query.lower(), name.lower()
+    if nl == ql:
+        return RUNG_EXACT_CI
+
+    nt, qt = name_tokens(name), name_tokens(query)
+    # Compare the CONCATENATION, so folding works in both directions:
+    # query 'check point' vs name 'checkPoint', and query 'checkpoint' vs
+    # name 'check point', are the same identifier written two ways.
+    if qt and "".join(nt) == "".join(qt):
+        return RUNG_FOLDED
+
+    def _reaches(tok: str, part: str) -> bool:
+        # a query token matches a word-part it equals or begins
+        return part == tok or part.startswith(tok)
+
+    if qt:
+        i = 0
+        for part in nt:
+            if i < len(qt) and _reaches(qt[i], part):
+                i += 1
+        if i == len(qt):
+            return RUNG_TOKENS_ORDERED
+        if all(any(_reaches(t, part) for part in nt) for t in qt):
+            return RUNG_TOKENS_ANY
+
+    if ql in nl:
+        return RUNG_SUBSTRING
+    return RUNG_NONE
+
+
 def _read_only_uri(path) -> str:
     """A `file:` URI that ATTACH and connect() honour as read-only.
 
@@ -574,21 +648,31 @@ class WorkspaceDB:
         query_tokens = split_identifier(query)
 
         def _rank_result(row_dict: dict) -> float:
-            rank = row_dict.get("rank", 0)
-            name = row_dict.get("name", "")
+            """Score by MATCH QUALITY first; statistics only break ties inside it.
+
+            A rung is worth 1000 and every within-rung adjustment together
+            cannot reach that, so a better match can never be outranked by a
+            worse one with a stronger bm25 -- which is exactly what happened
+            when a hardcoded LIKE constant competed with raw bm25 across tiers.
+            """
+            name = row_dict.get("name", "") or ""
             sym_kind = row_dict.get("kind", "")
             file_path = row_dict.get("file", "")
 
-            if name == query:
-                rank -= 50.0
-            elif name and query_lower in name.lower():
-                rank -= 10.0
-            if sym_kind in _PRIMARY_KINDS:
-                rank -= 5.0
+            score = match_rung(query, name) * 1000.0
+            if not _IDENT_RE.match(name):
+                score += 300.0
+            if sym_kind not in _PRIMARY_KINDS:
+                score += 100.0
             if is_vendored_path(file_path):
-                rank += 20.0
+                score += 50.0
                 row_dict["vendored"] = True
-            return rank
+            # bm25 is comparable only within one table/project/query, so clamp it
+            # to a band far narrower than a rung and use it as a tiebreak alone.
+            base = row_dict.get("rank", 0) or 0
+            score += max(-40.0, min(0.0, float(base))) * 0.5
+            score += min(len(name), 40) * 0.1
+            return score
 
         # Tier 1+2: FTS5 name search + LIKE fallback per schema
         for batch in self._iter_batches(project_filter=project):
@@ -737,8 +821,30 @@ class WorkspaceDB:
             except sqlite3.OperationalError as e:
                 self._fts_leg_failed(schema, "docs", e)
 
+        # Collapse repeats. One row per (project, name, kind), carrying how many
+        # it stands for. A human's eye skips a duplicate; an agent reads it as
+        # corroboration -- `id` returned 20 rows with 2 distinct names, 15 of
+        # them one symbol. Hiding the count would trade one distortion for
+        # another, so the survivor reports it.
+        best: dict[tuple, dict] = {}
+        for r in results:
+            key = (r.get("project"), r.get("name"), r.get("kind"))
+            keep = best.get(key)
+            if keep is None or r.get("rank", 0) < keep.get("rank", 0):
+                if keep is not None:
+                    r["duplicates"] = keep.get("duplicates", 1) + 1
+                else:
+                    r["duplicates"] = 1
+                best[key] = r
+            else:
+                keep["duplicates"] = keep.get("duplicates", 1) + 1
+        results = list(best.values())
+
         # Sort by rank (lower = better), project code > vendored
-        results.sort(key=lambda r: (r.get("vendored", False), r.get("rank", 0)))
+        # vendored is a within-rung penalty in the score now, not a primary key.
+        # As a primary key it was an INFINITE demotion that made the +20 dead
+        # arithmetic -- setting that constant to +/-100000 changed no result.
+        results.sort(key=lambda r: (r.get("rank", 0), r.get("project") or "", r.get("name") or ""))
         return results[:limit]
 
     def codebase_map(self, project: str | None = None) -> dict[str, Any]:

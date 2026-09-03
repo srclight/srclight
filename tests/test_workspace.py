@@ -861,3 +861,47 @@ def test_a_punctuation_query_searches_instead_of_flooding_the_health_signal(
     assert any(h["name"] == "get_thing" for h in hits), (
         f"punctuation query found nothing; got {[h['name'] for h in hits]}"
     )
+
+
+def _project_with_repeats(tmp_path: Path, name: str, sym: str, n: int) -> Path:
+    """A project carrying the same name+kind n times, as vendored code does."""
+    from srclight.db import Database, FileRecord, SymbolRecord
+    project_dir = tmp_path / name
+    project_dir.mkdir()
+    d = project_dir / ".srclight"
+    d.mkdir()
+    db = Database(d / "index.db")
+    db.open()
+    db.initialize()
+    for i in range(n):
+        fid = db.upsert_file(FileRecord(path=f"src/f{i}.py", content_hash=f"h{i}",
+                                        mtime=1.0, language="python", size=20, line_count=3))
+        db.insert_symbol(SymbolRecord(file_id=fid, kind="function", name=sym,
+                                      start_line=1, end_line=2,
+                                      content=f"def {sym}(): pass", body_hash=f"b{i}"),
+                         f"src/f{i}.py")
+    db.commit()
+    db.close()
+    return project_dir
+
+
+def test_repeated_symbols_collapse_to_one_row_that_counts_them(tmp_path, ws_dir):
+    """One row per (project, name, kind), carrying how many it stands for.
+
+    A human's eye skips a duplicate; an agent reads it as corroboration. Measured
+    on the real workspace: `id` returned 20 rows with 2 distinct names, 15 of
+    them one symbol; `checkpoint` had UserWalCheckpointer at positions 3, 4 and 5.
+    Collapsing must not hide the count, so the survivor carries `duplicates`.
+    """
+    proj = _project_with_repeats(tmp_path, "alpha", "WriteSyncCheckpoint", 6)
+    config = WorkspaceConfig(name="dupes-test")
+    config.add_project("alpha", str(proj))
+
+    with WorkspaceDB(config) as wdb:
+        hits = wdb.search_symbols("WriteSyncCheckpoint", limit=20)
+
+    rows = [h for h in hits if h["name"] == "WriteSyncCheckpoint"]
+    assert len(rows) == 1, f"{len(rows)} rows for one name+kind; expected 1 collapsed row"
+    assert rows[0].get("duplicates") == 6, (
+        f"collapsed row must report how many it stands for; got {rows[0].get('duplicates')!r}"
+    )
