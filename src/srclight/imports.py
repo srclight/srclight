@@ -10,7 +10,19 @@ from __future__ import annotations
 
 import re
 
+from .refmask import mask_noncode
+
 __all__ = ["IMPORT_PATTERNS", "extract_imports"]
+
+# Nothing may precede the loader's name: `self.require(x)` is some table's own
+# method, and `myrequire(x)` somebody else's function.
+_LUA_CALLER = r"(?<![\w.:])"
+# A quoted path. The two quote styles are separate branches rather than one
+# character class so that `include('a")` cannot match across them, and so an
+# apostrophe inside a double-quoted path survives. A `.lua` suffix comes off:
+# consumers reduce a module to the name it ends in, and a module keeping its
+# extension reduces to "lua".
+_LUA_PATH = r"""(?:"([^"]+?)(?i:\.lua)?"|'([^']+?)(?i:\.lua)?')"""
 
 # Import extraction patterns by language (regex-based, not tree-sitter)
 IMPORT_PATTERNS: dict[str, list[str]] = {
@@ -37,6 +49,12 @@ IMPORT_PATTERNS: dict[str, list[str]] = {
         r"^use\s+([\w\\]+)",
         r"(?:require|include)(?:_once)?\s*['\"]([^'\"]+)['\"]",
     ],
+    # `require` is standard Lua; embedding hosts add their own loader, and
+    # Garry's Mod's include/AddCSLuaFile is common enough to be worth matching.
+    "lua": [
+        rf"{_LUA_CALLER}require\s*\(?\s*{_LUA_PATH}",
+        rf"{_LUA_CALLER}(?:include|AddCSLuaFile)\s*\(?\s*{_LUA_PATH}",
+    ],
 }
 
 
@@ -48,6 +66,15 @@ def extract_imports(content: str, language: str) -> list[dict]:
 
     imports = []
     seen_statements = set()
+
+    if language == "lua":
+        # Blank the comments before scanning. A line-oriented pass cannot do it:
+        # `--` need not start the line, `--[[ ]]` spans several, and callers pass
+        # a truncated head that can cut the closing `]]` off entirely. Strings
+        # are left alone, since the module name is inside one; a `require`
+        # written inside some other string therefore still matches, as it does
+        # for every language here.
+        content = mask_noncode(content, language, mask_strings=False)
 
     for line in content.splitlines():
         stripped = line.strip()

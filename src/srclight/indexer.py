@@ -10,6 +10,7 @@ import fnmatch
 import hashlib
 import json
 import logging
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -269,6 +270,203 @@ def _extract_signature(source_bytes: bytes, node: Node, lang: str) -> str | None
                        name_node.end_byte)
             return source_bytes[node.start_byte:sig_end].decode("utf-8", errors="replace").strip()
 
+    elif lang == "lua":
+        # Lua declares no return type, so the parameter list ends the signature.
+        # It may hang off the node itself (`function f(a)`) or off the value it
+        # is assigned (`f = function(a)`), which is the same definition.
+        params = _lua_parameters(node)
+        if params is not None:
+            return source_bytes[node.start_byte:params.end_byte].decode(
+                "utf-8", errors="replace").strip()
+
+    return None
+
+
+def _lua_nameless_definition(node: Node) -> bool:
+    """True when a definition has no name a caller could write.
+
+    A computed key — `{ [k] = function() end }` — is one: `k` holds the key
+    rather than being it. A string key does name the function, and the query
+    captures it from inside the string.
+    """
+    if node.type == "field":
+        if node.child_count == 0 or node.child(0).type != "[":
+            return False
+        key = node.child_by_field_name("name")
+        return key is None or key.type != "string"
+
+    # An assignment target that is not a path names nothing either: a call, a
+    # parenthesised expression. Its source text would carry newlines and
+    # punctuation into the name index in place of a name. This asks the shape
+    # of the target, not whether a dotted path can be spelled from it —
+    # `t["my-key"]` has no dotted form and still names its function.
+    if node.type == "variable_declaration":
+        inner = node.named_children[0] if node.named_children else None
+        return inner is None or _lua_nameless_definition(inner)
+
+    if node.type == "assignment_statement":
+        return not _lua_is_path(node.child_by_field_name("name"))
+
+    return False
+
+
+def _lua_is_path(node: Node | None) -> bool:
+    """Whether a node is a name or a chain of index expressions ending in one."""
+    while node is not None and node.type != "identifier":
+        if node.type not in (
+            "dot_index_expression", "bracket_index_expression", "method_index_expression",
+        ):
+            return False
+        node = node.child_by_field_name("table")
+    return node is not None
+
+
+def _lua_definition_path(node: Node) -> str | None:
+    """The full path a Lua definition hangs off, e.g. `Stack:pop` or `von.Entity`.
+
+    The name a call site writes is not always the whole path, so the path is
+    kept as the qualified name. `t["k"]` is written as the dotted path it is
+    equivalent to: a qualified name carrying quotes and brackets matches
+    nothing a reader or a caller would write.
+    """
+    if node.type == "field":
+        name = _lua_key_name(node.child_by_field_name("name"))
+        if name is None:
+            return None
+        table = _lua_enclosing_table(node)
+        return f"{table}.{name}" if table else name
+
+    if node.type == "variable_declaration":
+        inner = node.named_children[0] if node.named_children else None
+        return _lua_definition_path(inner) if inner is not None else None
+
+    return _lua_target_path(node.child_by_field_name("name"))
+
+
+# A key only joins a dotted path if it could have been written as one.
+_LUA_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _lua_key_name(node: Node | None) -> str | None:
+    """A table key as a path segment, or None if it cannot be written as one."""
+    if node is None:
+        return None
+    if node.type == "string":
+        content = node.child_by_field_name("content")
+        node_text = content.text if content is not None else b""
+    elif node.type == "identifier":
+        node_text = node.text
+    else:
+        return None
+    name = node_text.decode("utf-8", errors="replace")
+    return name if _LUA_IDENTIFIER.match(name) else None
+
+
+def _lua_target_path(node: Node | None) -> str | None:
+    """The dotted path of an assignment target, e.g. `t.a.b` for `t["a"]["b"]`.
+
+    Walked iteratively: a generated file can carry a path thousands of segments
+    long, and recursing over one exhausts the stack.
+
+    None for anything that is not a path — a call, a parenthesised expression, a
+    computed key. Such a target has no name a reader would write, and its source
+    text can carry newlines and punctuation into the name index.
+    """
+    segments: list[tuple[str, str]] = []
+    while node is not None and node.type != "identifier":
+        if node.type == "method_index_expression":
+            separator, key = ":", node.child_by_field_name("method")
+        elif node.type in ("dot_index_expression", "bracket_index_expression"):
+            separator, key = ".", node.child_by_field_name("field")
+        else:
+            return None
+        name = _lua_key_name(key)
+        if name is None:
+            return None
+        segments.append((separator, name))
+        node = node.child_by_field_name("table")
+
+    if node is None:
+        return None
+    path = node.text.decode("utf-8", errors="replace")
+    for separator, name in reversed(segments):
+        path += separator + name
+    return path
+
+
+def _lua_enclosing_table(field: Node, depth: int = 0) -> str | None:
+    """The path of the table a literal's field belongs to, when it has one.
+
+    `local encode = { ["Entity"] = function() end }` gives `encode`, so that two
+    tables holding the same key do not collapse onto one qualified name. A table
+    nested in another field answers with that field's own path, which is where
+    the depth limit comes in — a path deeper than this says nothing useful.
+    """
+    if depth > 16:
+        return None
+    table = field.parent
+    if table is None or table.type != "table_constructor":
+        return None
+
+    holder = table.parent
+    if holder is None:
+        return None
+
+    if holder.type == "field":                       # a table inside a table
+        name = _lua_key_name(holder.child_by_field_name("name"))
+        if name is None:
+            return None
+        outer = _lua_enclosing_table(holder, depth + 1)
+        return f"{outer}.{name}" if outer else name
+
+    if holder.type != "expression_list":
+        return None
+    assignment = holder.parent
+    if assignment is None or assignment.type != "assignment_statement":
+        return None
+
+    # `local P, Q = {…}, {…}` — the table's own position picks its name.
+    values = list(holder.named_children)
+    variables = next(
+        (c for c in assignment.named_children if c.type == "variable_list"), None,
+    )
+    if variables is None or table not in values:
+        return None
+    position = values.index(table)
+    targets = list(variables.named_children)
+    if position >= len(targets):
+        return None
+    return _lua_target_path(targets[position])
+
+
+def _lua_parameters(node: Node) -> Node | None:
+    """The parameter list of the function a Lua definition node defines.
+
+    The route is spelled out per shape rather than searched: a general descent
+    finds whichever function comes first in the tree, which for an assignment
+    is the one in the *target* if any (`(function(a) end)().x = function(b) end`
+    gives `a`), and on a long dotted path it recurses deep enough to exhaust
+    the stack — losing not just the symbol but every symbol in the file.
+    """
+    params = node.child_by_field_name("parameters")
+    if params is not None:                       # function f(a) / function(a)
+        return params
+
+    if node.type == "variable_declaration":      # local f = function(a)
+        inner = node.named_children[0] if node.named_children else None
+        return _lua_parameters(inner) if inner is not None else None
+
+    if node.type == "assignment_statement":      # T.f = function(a)
+        for child in node.named_children:
+            if child.type == "expression_list":
+                value = child.child_by_field_name("value")
+                return _lua_parameters(value) if value is not None else None
+        return None
+
+    if node.type == "field":                     # { f = function(a) }
+        value = node.child_by_field_name("value")
+        return _lua_parameters(value) if value is not None else None
+
     return None
 
 
@@ -294,6 +492,10 @@ def _kind_from_capture(capture_name: str) -> str:
         "define": "macro",
         "proto": "prototype",
         "qproto": "prototype",
+        "ptrfn": "function",   # C/C++ pointer return types
+        "ptrfn2": "function",
+        "ptrproto": "prototype",
+        "ptrproto2": "prototype",
         "trait": "trait",
         "impl": "impl",
         "template": "template",
@@ -368,6 +570,10 @@ def _build_qualified_name(symbol_name: str | None, node: Node, lang: str) -> str
         if scopes:
             return ".".join(scopes + [symbol_name])
         return symbol_name
+    elif lang == "lua":
+        # The table a function hangs off is written on the definition itself,
+        # not in an enclosing scope node the way a class body is.
+        return _lua_definition_path(node) or symbol_name
     else:
         scopes = _get_enclosing_scope(node)
         if scopes:
@@ -727,6 +933,16 @@ class Indexer:
             # For templates without a name, extract from the inner declaration
             if symbol_name is None and kind == "template":
                 symbol_name = _extract_template_name(def_node)
+
+            # Error recovery inserts MISSING nodes whose text is empty, and a
+            # path left dangling by one — `M. = function() end` — ends on its
+            # separator. An empty name is not NULL, so it would slip past every
+            # IS NOT NULL filter and reach the name index.
+            if symbol_name == "" or (symbol_name or "").endswith((".", ":")):
+                continue
+
+            if lang == "lua" and _lua_nameless_definition(def_node):
+                continue
 
             raw_symbols.append((def_node, kind, symbol_name))
 

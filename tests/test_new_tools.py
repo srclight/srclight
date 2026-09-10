@@ -333,6 +333,26 @@ class TestExtractImports:
         assert "kotlin.collections.List" in modules
         assert "com.example.Utils" in modules
 
+    def test_lua_require(self):
+        content = 'local json = require("dkjson")\nrequire "socket"'
+        imports = _extract_imports(content, "lua")
+        modules = [i["module"] for i in imports]
+        assert "dkjson" in modules
+        assert "socket" in modules
+
+    def test_lua_include(self):
+        """Hosts that embed Lua often load files with include/AddCSLuaFile."""
+        content = 'include("lib/validate.lua")\nAddCSLuaFile("cl_init.lua")'
+        imports = _extract_imports(content, "lua")
+        modules = [i["module"] for i in imports]
+        assert "lib/validate" in modules
+        assert "cl_init" in modules
+
+    def test_lua_require_needs_a_word_boundary(self):
+        """`myrequire(...)` is somebody else's function, not an import."""
+        imports = _extract_imports('local x = myrequire("dkjson")', "lua")
+        assert imports == []
+
     def test_unsupported_language_returns_empty(self):
         imports = _extract_imports("some content", "markdown")
         assert imports == []
@@ -493,3 +513,58 @@ class TestFindImportsIntegration:
         modules = [i["module"] for i in raw_imports]
         assert "stdio.h" in modules
         assert "mylib.h" in modules
+
+
+class TestLuaCommentImports:
+    """A require inside a comment is not a dependency."""
+
+    def test_commented_out_require_is_not_an_import(self):
+        imports = _extract_imports('-- require("legacy_module")', "lua")
+        assert imports == []
+
+    def test_commented_out_include_is_not_an_import(self):
+        imports = _extract_imports('  -- include("old/path.lua")', "lua")
+        assert imports == []
+
+    def test_block_commented_require_is_not_an_import(self):
+        """`--[[ ... ]]` is how a chunk of Lua is disabled; only line 1 has `--`."""
+        content = '--[[\nrequire("legacy_module")\n]]\nrequire("live_module")'
+        modules = [i["module"] for i in _extract_imports(content, "lua")]
+        assert "legacy_module" not in modules
+        assert "live_module" in modules
+
+    def test_lua_include_module_keeps_the_path_without_the_extension(self):
+        """The edge builder reduces a module by splitting on `.` before `/`,
+        so one that kept its extension would reduce to "lua" and name no file.
+        """
+        content = 'include("lib/validate.lua")'
+        module = _extract_imports(content, "lua")[0]["module"]
+
+        assert module == "lib/validate"
+
+    def test_trailing_comment_require_is_not_an_import(self):
+        """A comment need not start the line to be a comment."""
+        imports = _extract_imports('local x = 1  -- require("legacy_module")', "lua")
+        assert imports == []
+
+    def test_unterminated_block_comment_is_not_a_source_of_imports(self):
+        """Callers pass a truncated head, which cuts the closing `]]` off."""
+        content = '--[[ disabled for now\nrequire("legacy_module")\ninclude("old.lua")'
+        assert _extract_imports(content, "lua") == []
+
+    def test_lua_require_also_drops_the_lua_extension(self):
+        """Whatever `include` does with a path, `require` must do too."""
+        modules = [i["module"] for i in _extract_imports('require("lib/validate.lua")', "lua")]
+        assert modules == ["lib/validate"]
+
+    def test_lua_include_rejects_mismatched_quotes(self):
+        imports = _extract_imports('include(\'mixed.lua")', "lua")
+        assert imports == []
+
+    def test_lua_include_of_a_quoted_path_survives_an_apostrophe(self):
+        modules = [i["module"] for i in _extract_imports('include("it\'s.lua")', "lua")]
+        assert modules == ["it's"]
+
+    def test_a_method_named_require_is_not_an_import(self):
+        """`self.require(...)` belongs to some table, not to the loader."""
+        assert _extract_imports('local m = self.require("notmine")', "lua") == []

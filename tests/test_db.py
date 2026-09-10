@@ -124,6 +124,37 @@ def test_symbols_in_file(db):
     assert [s.name for s in syms] == ["foo", "bar", "baz"]
 
 
+def test_get_symbol_by_name_prefers_definition(db):
+    """A name shared by a prototype and a definition resolves to the definition.
+
+    Edges hang off the definition, so returning the prototype leaves callers
+    and callees empty.
+    """
+    file_id = db.upsert_file(FileRecord(
+        path="src/lib.c", content_hash="abc",
+        mtime=1000.0, language="c", size=100, line_count=20,
+    ))
+
+    # Prototype first, so an unordered LIMIT 1 would return it.
+    db.insert_symbol(SymbolRecord(
+        file_id=file_id, kind="prototype", name="node_create",
+        start_line=1, end_line=1, content="Node* node_create(int value);", line_count=1,
+    ), "src/lib.c")
+
+    definition_id = db.insert_symbol(SymbolRecord(
+        file_id=file_id, kind="function", name="node_create",
+        start_line=5, end_line=8, content="Node* node_create(int value) { return 0; }",
+        line_count=4,
+    ), "src/lib.c")
+
+    db.commit()
+
+    sym = db.get_symbol_by_name("node_create")
+    assert sym is not None
+    assert sym.id == definition_id
+    assert sym.kind == "function"
+
+
 def test_edges(db):
     """Can insert and query symbol relationships."""
     file_id = db.upsert_file(FileRecord(

@@ -44,6 +44,18 @@ _C_QUERY = """
     declarator: (function_declarator
         declarator: (identifier) @fn.name)) @fn.def
 
+; A `T*` return type wraps the declarator in a pointer_declarator, `T**` nests two.
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (identifier) @ptrfn.name))) @ptrfn.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (identifier) @ptrfn2.name)))) @ptrfn2.def
+
 (struct_specifier
     name: (type_identifier) @struct.name) @struct.def
 
@@ -53,6 +65,17 @@ _C_QUERY = """
 (declaration
     declarator: (function_declarator
         declarator: (identifier) @proto.name)) @proto.def
+
+(declaration
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (identifier) @ptrproto.name))) @ptrproto.def
+
+(declaration
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (identifier) @ptrproto2.name)))) @ptrproto2.def
 
 (type_definition
     declarator: (type_identifier) @typedef.name) @typedef.def
@@ -72,6 +95,23 @@ _CPP_QUERY = """
 (function_definition
     declarator: (function_declarator
         declarator: (qualified_identifier) @method.name)) @method.def
+
+; A `T*` return type wraps the declarator in a pointer_declarator, `T**` nests two.
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (identifier) @ptrfn.name))) @ptrfn.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (identifier) @ptrfn2.name)))) @ptrfn2.def
+
+(declaration
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (identifier) @ptrproto.name))) @ptrproto.def
 
 (class_specifier
     name: (type_identifier) @cls.name) @cls.def
@@ -341,6 +381,86 @@ _GROOVY_QUERY = """
     (identifier) @fn.name) @fn.def
 """
 
+# Lua has no declaration keyword for tables, so a "class" is a table a function
+# hangs off. `function T.f()` and `T.f = function()` are the same definition
+# written two ways, and both are captured.
+#
+# The symbol name is whatever a call site writes. `T.f()` is written in full, so
+# the dotted path is the name; `T:f()` never is — a method is called on an
+# instance, `obj:f()` — so there the name is `f` alone, and the path is kept as
+# the qualified name. Same for `t["f"]`, which no call site spells that way.
+_LUA_QUERY = """
+(function_declaration
+    name: (identifier) @fn.name) @fn.def
+
+(function_declaration
+    name: (dot_index_expression) @fn.name) @fn.def
+
+(function_declaration
+    name: (method_index_expression
+        method: (identifier) @method.name)) @method.def
+
+; `T.f = function()` as a statement. The anchors pin one name to one value:
+; without them `local n, f = 0, function() end` captures `n` as a function too,
+; since the pattern only asks that *some* value in the list be a function. A
+; multi-assignment is therefore skipped whole — a miss beats a symbol that
+; claims a number is a function. For the same reason the value must *be* a
+; function rather than contain one, so the define-once idiom `M.f = M.f or
+; function() end` is missed: matching any expression containing a function
+; would make `M.f = wrap(function() end)` a definition of `M.f` too.
+;
+; chunk and block are spelled out rather than matched with a wildcard parent:
+; the third parent an assignment can have is variable_declaration, and that one
+; needs the pattern below, which would otherwise capture the same node twice.
+(chunk
+    (assignment_statement
+        (variable_list . name: [(identifier) (dot_index_expression)] @fn.name .)
+        (expression_list . value: (function_definition) .)) @fn.def)
+
+(block
+    (assignment_statement
+        (variable_list . name: [(identifier) (dot_index_expression)] @fn.name .)
+        (expression_list . value: (function_definition) .)) @fn.def)
+
+; `t["f"] = function()`. Only a string key defines a name; `t[k] = function()`
+; names nothing, since `k` is a variable holding the key rather than the key.
+(chunk
+    (assignment_statement
+        (variable_list
+            . name: (bracket_index_expression
+                field: (string (string_content) @fn.name)) .)
+        (expression_list . value: (function_definition) .)) @fn.def)
+
+(block
+    (assignment_statement
+        (variable_list
+            . name: (bracket_index_expression
+                field: (string (string_content) @fn.name)) .)
+        (expression_list . value: (function_definition) .)) @fn.def)
+
+; `local f = function()`. The wrapper is the symbol, not the assignment inside
+; it: the `local` keyword and the doc comment above it both live out there.
+(variable_declaration
+    (assignment_statement
+        (variable_list . name: (identifier) @fn.name (attribute)? .)
+        (expression_list . value: (function_definition) .))) @fn.def
+
+; A function hung off a table literal — `local M = { f = function() end }`.
+; A key written `["f"]` is the same definition, so the name comes from inside
+; the string: `f`, not `"f"`, to match what the identifier form yields.
+;
+; The grammar gives `f = ...` and `[f] = ...` the same `name:` field, and a
+; query cannot ask for the absence of the brackets, so the computed-key form is
+; rejected in the indexer instead — see _lua_nameless_definition.
+(field
+    name: (identifier) @fn.name
+    value: (function_definition)) @fn.def
+
+(field
+    name: (string (string_content) @fn.name)
+    value: (function_definition)) @fn.def
+"""
+
 
 LANGUAGES: dict[str, LanguageConfig] = {
     "python": LanguageConfig(
@@ -450,6 +570,12 @@ LANGUAGES: dict[str, LanguageConfig] = {
         extensions=(".groovy", ".gradle"),
         loader="tree_sitter_groovy",
         symbol_query=_GROOVY_QUERY,
+    ),
+    "lua": LanguageConfig(
+        name="lua",
+        extensions=(".lua",),
+        loader="tree_sitter_lua",
+        symbol_query=_LUA_QUERY,
     ),
 }
 

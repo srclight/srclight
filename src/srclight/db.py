@@ -636,12 +636,23 @@ class Database:
         self.conn.execute("DELETE FROM symbols WHERE file_id = ?", (file_id,))
 
     def get_symbol_by_name(self, name: str) -> SymbolRecord | None:
-        """Get first symbol matching exact name. Use get_symbols_by_name for all matches."""
+        """Get first symbol matching exact name. Use get_symbols_by_name for all matches.
+
+        In C and C++ a name resolves to both a declaration and a definition.
+        Edges hang off the definition, so an unordered LIMIT 1 landing on the
+        prototype makes callers and callees come back empty. Rank definitions
+        first, then prefer the row that carries edges.
+        """
         assert self.conn is not None
         row = self.conn.execute(
             """SELECT s.*, f.path as file_path FROM symbols s
                JOIN files f ON s.file_id = f.id
-               WHERE s.name = ? LIMIT 1""",
+               WHERE s.name = ?
+               ORDER BY CASE s.kind WHEN 'prototype' THEN 1 ELSE 0 END,
+                        (SELECT count(*) FROM symbol_edges e
+                          WHERE e.target_id = s.id OR e.source_id = s.id) DESC,
+                        s.id
+               LIMIT 1""",
             (name,),
         ).fetchone()
         if row is None:

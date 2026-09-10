@@ -46,6 +46,7 @@ TREE_SITTER_PACKAGES = [
     "tree_sitter_swift",
     "tree_sitter_kotlin",
     "tree_sitter_markdown",
+    "tree_sitter_lua",
 ]
 
 # ---------------------------------------------------------------------------

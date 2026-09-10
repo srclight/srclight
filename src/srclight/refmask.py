@@ -18,12 +18,46 @@ __all__ = ["mask_noncode"]
 _HASH_LANGS = {"python", "shell", "bash", "ruby", "yaml", "toml", "perl"}
 _SLASH_LANGS = {"c", "cpp", "js", "javascript", "ts", "typescript", "java", "go",
                 "rust", "dart", "swift", "csharp", "c_sharp", "kotlin", "scala", "php"}
+# `--` comments. Lua needs its own tier because `#` measures a table there and
+# `//` divides, so the generic one — which allows both — blanks live code.
+_DASH_LANGS = {"lua"}
 
 
-def mask_noncode(content: str, language: str) -> str:
+def _long_bracket_end(content: str, i: int) -> int | None:
+    """End offset of the Lua long bracket opening at `i` (`[[`, `[=[`, ...).
+
+    Returns None when no bracket opens there — `t[1]` must stay code.
+    """
+    if i >= len(content) or content[i] != "[":
+        return None
+    j = i + 1
+    while j < len(content) and content[j] == "=":
+        j += 1
+    if j >= len(content) or content[j] != "[":
+        return None
+    close = "]" + "=" * (j - i - 1) + "]"
+    end = content.find(close, j + 1)
+    return len(content) if end == -1 else end + len(close)
+
+
+def mask_noncode(content: str, language: str, *, mask_strings: bool = True) -> str:
+    """Blank comments and strings, keeping every offset.
+
+    Pass mask_strings=False to blank comments only. Strings are still scanned —
+    a `--` inside one is not a comment — but their content survives, which is
+    what a caller needs when the thing it looks for lives in a string. In that
+    mode an unbalanced quote leaves the rest of the input unscanned, so it suits
+    a language where one cannot occur outside a string, not prose.
+    """
     lang = (language or "").lower()
-    use_hash = lang in _HASH_LANGS or lang not in _SLASH_LANGS   # generic: allow # too
-    use_slash = lang in _SLASH_LANGS or lang not in _HASH_LANGS  # generic: allow // too
+    generic = lang not in _SLASH_LANGS and lang not in _HASH_LANGS and lang not in _DASH_LANGS
+    use_hash = lang in _HASH_LANGS or generic                    # generic: allow # too
+    use_slash = lang in _SLASH_LANGS or generic                  # generic: allow // too
+    use_dash = lang in _DASH_LANGS
+    # Long brackets are Lua's alone, and stay tied to the language rather than
+    # to the `--` tier: elsewhere `[[` is a nested index, and reading it as a
+    # string opener blanks the rest of the body when no `]]` ever follows.
+    use_long_brackets = lang == "lua"
     hash_is_directive = lang in ("c", "cpp")                     # keep #include lines
 
     out = list(content)
@@ -42,15 +76,34 @@ def mask_noncode(content: str, language: str) -> str:
             q = content[i:i + 3]
             end = content.find(q, i + 3)
             end = n if end == -1 else end + 3
+            if mask_strings:
+                blank(i, end)
+            i = end
+            continue
+        # `-- to end of line`, or in lua `--[[ ... ]]` spanning lines
+        if use_dash and two == "--":
+            end = _long_bracket_end(content, i + 2) if use_long_brackets else None
+            if end is None:
+                end = content.find("\n", i)
+                end = n if end == -1 else end
             blank(i, end)
             i = end
             continue
+        # lua long strings: [[ ... ]], [=[ ... ]=]
+        if use_long_brackets and ch == "[":
+            end = _long_bracket_end(content, i)
+            if end is not None:
+                if mask_strings:
+                    blank(i, end)
+                i = end
+                continue
         if ch in ("'", '"'):
             j = i + 1
             while j < n and content[j] != ch:
                 j += 2 if content[j] == "\\" else 1
             j = min(j + 1, n)
-            blank(i, j)
+            if mask_strings:
+                blank(i, j)
             i = j
             continue
         if use_slash and two == "//":

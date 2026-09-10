@@ -46,6 +46,7 @@ dependencies = [
     "tree-sitter-cmake>=0.7.0",
     "tree-sitter-sql>=0.3.0",
     "tree-sitter-groovy>=0.1.0",
+    "tree-sitter-lua>=0.5.0",
     "numpy>=1.26.0",
     "networkx>=3.0",
 ]
