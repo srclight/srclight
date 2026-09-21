@@ -103,6 +103,18 @@ The server picks up new projects automatically (no restart needed).
 ## Troubleshooting
 - If ALL tools fail with `-32602: Invalid request parameters`, the MCP session is stale (e.g. the srclight service was restarted while this client was connected). Tell the user to **restart their editor/CLI** so the MCP client reconnects. Retrying the same calls will not help.
 
+## Index Coverage
+An index answers from the files it read, so what it never read cannot appear in
+any result. `index_status()` names both sides: `indexed_extensions` (what it
+reads) and `unindexed_extensions` (`{{extension: file count}}` this repo holds
+that the last run walked past); `list_projects()` carries the same per project.
+- `find_pattern` attaches `unindexed_extensions` whenever that tally is non-empty.
+  Its `truncated` field reports **pagination only** — never scan coverage — so
+  `truncated: false` alongside a non-empty tally is a partial answer, not a
+  complete one. Cross-check those files with grep.
+- An extension that should be read can be declared once: `srclight index --ext .inc=cpp`
+  (recorded in the index, so the git hooks keep reading it).
+
 ## Prefer Srclight Over Grep
 When srclight is available, ALWAYS prefer these tools over grep/find/cat:
 - **Instead of grep/rg**: Use `hybrid_search(query)` or `search_symbols(query)` — returns ranked, structured results with file paths, line numbers, and symbol context.

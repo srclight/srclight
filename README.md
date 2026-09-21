@@ -27,7 +27,8 @@ AI coding agents (Claude Code, Cursor, etc.) spend **40-60% of their tokens on o
 - **Minimal dependencies** — single SQLite file per repo, no Docker/Redis/vector DB
 - **Fully offline** — no API calls, works air-gapped (Ollama local embeddings)
 - **Incremental** — only re-indexes changed files (content hash detection)
-- **19 languages** — Python, C, C++, C#, Java, Kotlin, Swift, Dart, Go, Rust, JavaScript, TypeScript, PHP, Lua, Bash, SQL, Groovy, CMake, Markdown
+- **19 languages** — Python, C, C++, C#, Java, Kotlin, Swift, Dart, Go, Rust, JavaScript, TypeScript, PHP, Lua, Bash, SQL, Groovy, CMake, Markdown — include fragments (`.inc`, `.inl`, `.ipp`, `.tcc`) included, plus any extension you declare with `--ext`
+- **Says what it skipped** — `index_status` names the extensions a run walked past, so an incomplete answer never reads as a complete one
 - **10 document formats** — PDF, DOCX, XLSX, HTML, CSV/TSV, email (.eml), images (PNG/JPG/SVG/etc.), plain text, RST, Markdown
 - **Optional OCR** — PaddleOCR for scanned/image-only PDF pages; pytesseract for images
 - **4 search modes** — symbol names, source code (trigram), documentation (stemmed), semantic (embeddings)
@@ -64,6 +65,41 @@ it is now — reindex (`srclight index`) or read the live file before acting on
 line numbers or bodies from it. `"verified-fresh"` is the affirmative signal;
 its absence on a workspace-mode result means freshness was not checkable for
 that result, never that it is fresh.
+
+## Index coverage
+
+`index_status` reports both sides of what an index holds: `indexed_extensions`,
+every suffix it reads, and `unindexed_extensions`, the `{extension: file count}`
+this repo holds that the last run walked past. Deliberately ignored paths
+(binaries, vendored trees, `.git`) are not counted — only files that could have
+carried code and did not reach the index. `list_projects` carries the same per
+project, and `find_pattern` attaches the tally plus a note whenever it is
+non-empty.
+
+`truncated` on a `find_pattern` result means the page was cut short, and
+nothing else. It has never described scan coverage: the search runs over
+indexed symbols, so files the indexer never read cannot appear whatever it
+says. A gap is now readable from the index instead of being discoverable only
+by comparing a result to a `grep`.
+
+Include fragments (`.inc`, `.inl`, `.ipp`, `.tcc`) — the files a project uses
+to split an oversized translation unit, included at file scope and holding real
+definitions — are indexed as source. `.inc` names an include convention rather
+than a language, so its content decides: PHP, C++, else C.
+
+For a house extension srclight does not know, declare it once:
+
+```bash
+srclight index --ext .zz=cpp          # repeatable; --ext none clears
+```
+
+The declaration is stored in the index, not the command line, so the git hooks'
+flag-less reindexes keep reading those files.
+
+**AI agents:** a non-empty `unindexed_extensions` means the answer you are
+holding is not a whole-tree answer, whatever `truncated` says — cross-check
+with `grep`, or have the extension declared. An empty one is the affirmative
+signal.
 
 ## Graph resolution labels
 
@@ -119,6 +155,9 @@ srclight index
 
 # Index with embeddings (requires Ollama running)
 srclight index --embed qwen3-embedding
+
+# Read an extra extension as a known language (recorded in the index)
+srclight index --ext .inc=cpp
 
 # Search
 srclight search "lookup"
