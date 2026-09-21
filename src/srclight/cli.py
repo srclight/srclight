@@ -83,7 +83,7 @@ def parse_extension_overrides(values: tuple[str, ...]) -> dict[str, str]:
     leaving the files silently unread. The single value `none` clears a
     declaration an index already holds.
     """
-    from .languages import LANGUAGES
+    from .languages import LANGUAGES, SKIP_LANGUAGE, normalize_extension
 
     if len(values) == 1 and values[0].strip().lower() == "none":
         return {}
@@ -94,15 +94,12 @@ def parse_extension_overrides(values: tuple[str, ...]) -> dict[str, str]:
         ext, lang = ext.strip(), lang.strip().lower()
         if not sep or not ext or not lang:
             raise ValueError(f"Malformed --ext value '{value}': expected EXT=LANGUAGE")
-        if lang not in LANGUAGES:
+        if lang != SKIP_LANGUAGE and lang not in LANGUAGES:
             raise ValueError(
-                f"Unknown language '{lang}' in --ext value '{value}': "
-                f"expected one of {', '.join(sorted(LANGUAGES))}"
+                f"Unknown language '{lang}' in --ext value '{value}': expected "
+                f"{SKIP_LANGUAGE} or one of {', '.join(sorted(LANGUAGES))}"
             )
-        ext = ext.lower()
-        if not ext.startswith("."):
-            ext = "." + ext
-        overrides[ext] = lang
+        overrides[normalize_extension(ext)] = lang
     return overrides
 
 
@@ -120,9 +117,10 @@ def parse_extension_overrides(values: tuple[str, ...]) -> dict[str, str]:
               help="Stop embedding this index for good: later runs, git hooks included, "
                    "leave embeddings alone until --embed is passed again.")
 @click.option("--ext", "ext_overrides", multiple=True, metavar="EXT=LANGUAGE",
-              help="Read an extra extension as the given language (e.g. --ext .inc=cpp). "
-                   "Repeatable. Recorded in the index, so later runs and the git hooks "
-                   "keep reading those files; pass --ext none to clear.")
+              help="Read an extra extension as the given language (e.g. --ext .inc=cpp), "
+                   "or --ext .inc=skip to leave it unread. Repeatable. Recorded in the "
+                   "index, so later runs and the git hooks keep the same rule; pass "
+                   "--ext none to clear.")
 def index(path: str, db_path: str | None, embed_model: str | None, no_embed: bool,
           forget_embed_model: bool, ext_overrides: tuple[str, ...]):
     """Index a codebase for AI-powered search."""

@@ -114,3 +114,32 @@ def test_parse_extension_overrides_rejects_an_unknown_language():
 def test_parse_extension_overrides_rejects_a_malformed_pair():
     with pytest.raises(ValueError, match="EXT=LANGUAGE"):
         parse_extension_overrides((".zz",))
+
+
+def test_a_declaration_made_through_the_api_is_normalized(repo, db):
+    """The CLI normalizes; IndexConfig is public and must agree with it."""
+    Indexer(db, IndexConfig(root=repo, extension_overrides={"ZZ": "python"})).index()
+
+    rows = db.conn.execute(
+        """SELECT s.name FROM symbols s JOIN files f ON s.file_id = f.id
+           WHERE f.path = 'helpers.zz'"""
+    ).fetchall()
+
+    assert {r["name"] for r in rows} == {"draw_outline"}
+    assert db.get_extension_overrides() == {".zz": "python"}
+
+
+def test_an_extension_can_be_declared_unreadable(tmp_path, db):
+    """Sniffing gives `.inc` a language; a project must be able to say no."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "rules.inc").write_text("include config.mk\nall: build\n")
+
+    Indexer(db, IndexConfig(root=root, extension_overrides={".inc": "skip"})).index()
+
+    assert db.conn.execute("SELECT COUNT(*) n FROM files").fetchone()["n"] == 0
+    assert db.get_unindexed_extensions() == {".inc": 1}
+
+
+def test_parse_extension_overrides_accepts_skip():
+    assert parse_extension_overrides((".inc=skip",)) == {".inc": "skip"}

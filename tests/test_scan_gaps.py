@@ -128,3 +128,63 @@ def test_find_pattern_stays_quiet_when_nothing_was_skipped(tmp_path, db, monkeyp
 
     assert "unindexed_extensions" not in res
     assert "unindexed_note" not in res
+
+
+def test_index_status_names_the_indexed_extensions_in_workspace_mode(tmp_path, monkeypatch):
+    """`find_pattern`'s note sends the caller here, in either mode."""
+    import srclight.workspace as ws_mod
+    monkeypatch.setattr(ws_mod, "WORKSPACES_DIR", tmp_path / "workspaces")
+
+    project = tmp_path / "alpha"
+    project.mkdir()
+    (project / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    (project / ".srclight").mkdir()
+    project_db = Database(project / ".srclight" / "index.db")
+    project_db.open()
+    project_db.initialize()
+    Indexer(project_db, IndexConfig(root=project)).index()
+    project_db.close()
+
+    config = ws_mod.WorkspaceConfig(name="gaps")
+    config.add_project("alpha", str(project))
+    monkeypatch.setattr(server, "_workspace_name", "gaps")
+    monkeypatch.setattr(server, "_workspace_db", None)
+    monkeypatch.setattr(server, "_workspace_config_mtime", None)
+
+    res = json.loads(_run(server.index_status()))
+
+    assert ".py" in res["indexed_extensions"]
+
+
+def test_a_file_too_big_to_index_is_reported_as_a_gap(tmp_path, db):
+    """The size limit is srclight's own choice, not the project's."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    (root / "generated.py").write_text("x = 1\n" * 500)
+
+    Indexer(db, IndexConfig(root=root, max_file_size=100)).index()
+
+    assert db.get_oversize_skipped() == 1
+
+
+def test_index_status_reports_oversize_files(repo_with_a_gap, db):
+    res = json.loads(_run(server.index_status()))
+
+    assert res["oversize_skipped"] == 0
+
+
+def test_find_pattern_reports_oversize_files_it_never_read(tmp_path, db, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    (root / "generated.py").write_text("def draw_outline():\n    return 1\n" * 200)
+    Indexer(db, IndexConfig(root=root, max_file_size=200)).index()
+    monkeypatch.setattr(server, "_db", db)
+    monkeypatch.setattr(server, "_repo_root", root)
+    monkeypatch.setattr(server, "_workspace_name", None)
+
+    res = json.loads(_run(server.find_pattern(pattern="draw_outline")))
+
+    assert res["oversize_skipped"] == 1
+    assert "truncated" in res["unindexed_note"]

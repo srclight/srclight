@@ -636,9 +636,15 @@ SNIFFED_EXTENSIONS = (".h", ".inc")
 
 
 def _read_head(path: Path, size: int = 4096) -> str | None:
-    """Read the first `size` characters, or None if the file cannot be read."""
+    """Read the first `size` characters, or None if the file cannot be read.
+
+    Reads from the open file rather than decoding it whole and slicing: a
+    `.inc` or `.h` can be a generated data table of any size, and detection
+    runs before the indexer's size limit, so nothing else bounds this.
+    """
     try:
-        return path.read_text(errors="replace")[:size]
+        with path.open(errors="replace") as fh:
+            return fh.read(size)
     except OSError:
         return None
 
@@ -683,6 +689,23 @@ def detect_language(path: Path) -> str | None:
             return "cpp"
 
     return lang
+
+
+# A declaration value meaning "do not read this extension at all". Detection
+# for an ambiguous suffix like `.inc` always yields some language, so without
+# this a project that uses `.inc` for Makefile or SQL fragments has no way to
+# keep them out of the index.
+SKIP_LANGUAGE = "skip"
+
+
+def normalize_extension(ext: str) -> str:
+    """Canonical form of an extension: lower-case, leading dot.
+
+    Detection looks a suffix up in lower case with its dot, so a declaration
+    written any other way would be stored and then never match a file.
+    """
+    ext = ext.strip().lower()
+    return ext if ext.startswith(".") else "." + ext
 
 
 def code_extensions() -> tuple[str, ...]:

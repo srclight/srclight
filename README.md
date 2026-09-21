@@ -70,11 +70,12 @@ that result, never that it is fresh.
 
 `index_status` reports both sides of what an index holds: `indexed_extensions`,
 every suffix it reads, and `unindexed_extensions`, the `{extension: file count}`
-this repo holds that the last run walked past. Deliberately ignored paths
-(binaries, vendored trees, `.git`) are not counted — only files that could have
-carried code and did not reach the index. `list_projects` carries the same per
-project, and `find_pattern` attaches the tally plus a note whenever it is
-non-empty.
+this repo holds that the last run walked past, plus `oversize_skipped` for files
+srclight recognised but refused on size. Deliberately ignored paths (binaries,
+vendored trees, `.git`) are not counted, in both the `git ls-files` and
+directory-walk modes — only files that could have carried code and did not reach
+the index. `list_projects` carries the same per project, and `find_pattern`
+attaches the tally plus a note whenever it is non-empty.
 
 `truncated` on a `find_pattern` result means the page was cut short, and
 nothing else. It has never described scan coverage: the search runs over
@@ -91,7 +92,12 @@ For a house extension srclight does not know, declare it once:
 
 ```bash
 srclight index --ext .zz=cpp          # repeatable; --ext none clears
+srclight index --ext .inc=skip        # or: leave an extension unread
 ```
+
+`skip` is the way out of the `.inc` sniff for a project that uses it for
+Makefile or SQL fragments: those files then count as a declared gap rather than
+being parsed as C.
 
 The declaration is stored in the index, not the command line, so the git hooks'
 flag-less reindexes keep reading those files.

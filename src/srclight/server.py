@@ -108,12 +108,14 @@ An index answers from the files it read, so what it never read cannot appear in
 any result. `index_status()` names both sides: `indexed_extensions` (what it
 reads) and `unindexed_extensions` (`{{extension: file count}}` this repo holds
 that the last run walked past); `list_projects()` carries the same per project.
-- `find_pattern` attaches `unindexed_extensions` whenever that tally is non-empty.
+- `oversize_skipped` counts files srclight recognised but refused on size.
+- `find_pattern` attaches both whenever either is non-zero.
   Its `truncated` field reports **pagination only** — never scan coverage — so
   `truncated: false` alongside a non-empty tally is a partial answer, not a
   complete one. Cross-check those files with grep.
 - An extension that should be read can be declared once: `srclight index --ext .inc=cpp`
-  (recorded in the index, so the git hooks keep reading it).
+  (recorded in the index, so the git hooks keep reading it). `--ext .inc=skip`
+  declares the opposite: leave it unread, and count it as a gap.
 
 ## Prefer Srclight Over Grep
 When srclight is available, ALWAYS prefer these tools over grep/find/cat:
@@ -1289,24 +1291,34 @@ def _indexed_extensions(db: Database | None = None) -> list[str]:
     return sorted(exts)
 
 
-def _unindexed_warning(unindexed: dict[str, int]) -> dict[str, object]:
+def _unindexed_warning(unindexed: dict[str, int], oversize: int = 0) -> dict[str, object]:
     """Fields that keep a result from reading as a complete scan.
 
     A result whose completeness field says `truncated: false` is taken to
     mean the whole tree was searched. It only ever meant the page was not
     cut short, so when files were never read, the result says so itself.
     """
-    if not unindexed:
+    if not unindexed and not oversize:
         return {}
-    skipped = sum(unindexed.values())
-    return {
-        "unindexed_extensions": unindexed,
+    reasons = []
+    if unindexed:
+        reasons.append(
+            f"{sum(unindexed.values())} file(s) carry an extension this index does not read"
+        )
+    if oversize:
+        reasons.append(f"{oversize} file(s) exceeded the size limit")
+    fields: dict[str, object] = {
         "unindexed_note": (
-            f"{skipped} file(s) carry an extension this index does not read and were never "
-            f"scanned, so this result is not a whole-tree answer; `truncated` reports "
-            f"pagination only. Call index_status() for the extensions that are read."
+            f"{' and '.join(reasons)}, so they were never scanned and this result is not a "
+            f"whole-tree answer; `truncated` reports pagination only. Call index_status() "
+            f"for the extensions that are read."
         ),
     }
+    if unindexed:
+        fields["unindexed_extensions"] = unindexed
+    if oversize:
+        fields["oversize_skipped"] = oversize
+    return fields
 
 
 @mcp.tool()
@@ -1323,9 +1335,16 @@ def index_status() -> str:
     if _is_workspace_mode():
         wdb = _get_workspace_db()
         projects = wdb.list_projects()
+        # Every project's declared extensions count as read, since a
+        # workspace answer can come from any of them — and `find_pattern`'s
+        # note sends the caller here in this mode too.
+        declared: set[str] = set()
+        for p in projects:
+            declared |= set(p.get("extension_overrides") or {})
         return json.dumps({
             "mode": "workspace",
             "workspace": _workspace_name,
+            "indexed_extensions": sorted(set(_indexed_extensions()) | declared),
             "projects": projects,
         }, indent=2)
 
@@ -1347,6 +1366,9 @@ def index_status() -> str:
         # means the run indexed everything it saw — the one case where a
         # result may be read as covering the whole tree.
         "unindexed_extensions": db.get_unindexed_extensions(),
+        # Files srclight recognised but refused on size — its own limit, so a
+        # zero here is part of the same affirmative signal.
+        "oversize_skipped": db.get_oversize_skipped(),
     }
 
     if state:
@@ -2413,6 +2435,7 @@ def find_pattern(
             pattern, language=language, kind=kind, limit=limit + 1, offset=offset
         )
         unindexed = db.get_unindexed_extensions()
+        oversize = db.get_oversize_skipped()
         db.close()
     else:
         db = _get_db()
@@ -2420,6 +2443,7 @@ def find_pattern(
             pattern, language=language, kind=kind, limit=limit + 1, offset=offset
         )
         unindexed = db.get_unindexed_extensions()
+        oversize = db.get_oversize_skipped()
 
     # Asking for limit + 1 is how truncation is detected: holding one more than
     # requested proves more exist. Exact, and the scan still stops early.
@@ -2442,7 +2466,7 @@ def find_pattern(
         "file_count": len(by_file),
         "by_file": by_file,
     }
-    result.update(_unindexed_warning(unindexed))
+    result.update(_unindexed_warning(unindexed, oversize))
     if project:
         result["project"] = project
     if language:

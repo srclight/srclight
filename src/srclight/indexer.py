@@ -26,9 +26,11 @@ from .db import Database, EdgeRecord, FileRecord, SymbolRecord, content_hash
 from .extractors import DOCUMENT_EXTENSIONS, detect_document_language, get_registry
 from .languages import (
     LANGUAGES,
+    SKIP_LANGUAGE,
     LanguageConfig,
     detect_language,
     get_language,
+    normalize_extension,
 )
 
 logger = logging.getLogger("srclight.indexer")
@@ -847,9 +849,13 @@ class Indexer:
         declared = self.config.extension_overrides
         if declared is None:
             return self.db.get_extension_overrides()
-        overrides = {str(k): str(v) for k, v in declared.items()}
+        overrides = {normalize_extension(str(k)): str(v).lower() for k, v in declared.items()}
         self.db.set_extension_overrides(overrides)
         return overrides
+
+    def _declared_unreadable(self, path: Path) -> bool:
+        """True when this index was told to leave the extension unread."""
+        return self._ext_overrides.get(path.suffix.lower()) == SKIP_LANGUAGE
 
     def _detect_language(self, path: Path) -> str | None:
         """Detect a file's language, honouring this index's declared extensions."""
@@ -913,10 +919,17 @@ class Indexer:
         # Extensions walked past, so the index can say what it never read
         # instead of letting every answer imply it read everything.
         unindexed_exts: dict[str, int] = {}
+        # Files srclight could read but refused on size — its own limit, not
+        # the project's choice, so it belongs in the gap report too.
+        oversize_skipped = 0
         if use_git:
             for rel in sorted(git_files):
                 path = root / rel
                 if not path.is_file():
+                    continue
+
+                if self._declared_unreadable(path):
+                    _count_unindexed(unindexed_exts, path)
                     continue
 
                 lang = self._detect_language(path)
@@ -925,13 +938,21 @@ class Indexer:
                     lang = detect_document_language(path.suffix)
                     is_doc = True
                 if lang is None:
-                    _count_unindexed(unindexed_exts, path)
+                    # git ls-files has already applied .gitignore, so this
+                    # branch indexes what git tracks. The ignore patterns
+                    # still decide what counts as a GAP: a tracked font or a
+                    # vendored tree is excluded on purpose, and reporting it
+                    # would leave the tally non-empty on every real repo —
+                    # burying the extensions that are genuinely missing.
+                    if not _should_ignore(path, root, self.config.ignore_patterns):
+                        _count_unindexed(unindexed_exts, path)
                     continue
 
                 size_limit = self.config.max_doc_file_size if is_doc else self.config.max_file_size
                 try:
                     if path.stat().st_size > size_limit:
                         stats.files_skipped += 1
+                        oversize_skipped += 1
                         continue
                 except OSError:
                     continue
@@ -948,6 +969,10 @@ class Indexer:
                 if _should_ignore(path, root, self.config.ignore_patterns):
                     continue
 
+                if self._declared_unreadable(path):
+                    _count_unindexed(unindexed_exts, path)
+                    continue
+
                 lang = self._detect_language(path)
                 is_doc = False
                 if lang is None:
@@ -960,6 +985,7 @@ class Indexer:
                 size_limit = self.config.max_doc_file_size if is_doc else self.config.max_file_size
                 if path.stat().st_size > size_limit:
                     stats.files_skipped += 1
+                    oversize_skipped += 1
                     continue
 
                 if self.config.languages and lang not in self.config.languages:
@@ -1093,6 +1119,7 @@ class Indexer:
         # later — so this replaces the previous record rather than adding to
         # it, and a gap that has been closed disappears.
         self.db.set_unindexed_extensions(unindexed_exts)
+        self.db.set_oversize_skipped(oversize_skipped)
 
         # Update index state
         git_head = _get_git_head(root)

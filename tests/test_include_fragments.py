@@ -139,3 +139,24 @@ void start_outline() {
     ).fetchall()
 
     assert "shape_draw.inc" in {r["source_file"] for r in rows}
+
+
+def test_sniffing_reads_only_the_head_of_a_large_fragment(tmp_path):
+    """`.inc` is also used for generated data tables, which can be huge.
+
+    Detection runs before the indexer's size limit, so loading the file to
+    read its first line has no guard in front of it.
+    """
+    import tracemalloc
+
+    big = tmp_path / "table.inc"
+    big.write_text("static const int table[] = {\n" + "0x00,\n" * 800_000)
+
+    tracemalloc.start()
+    try:
+        assert detect_language(big) == "c"
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 1_000_000, f"loaded {peak} bytes to read a 4 KB head"

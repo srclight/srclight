@@ -1438,6 +1438,28 @@ class Database:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def set_oversize_skipped(self, count: int) -> None:
+        """Record how many files the last run skipped for exceeding the size limit."""
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('oversize_skipped', ?)",
+            (str(int(count)),),
+        )
+        self.conn.commit()
+
+    def get_oversize_skipped(self) -> int:
+        """Files skipped for size by the last run. Zero when none were, or when unrecorded."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'oversize_skipped'"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return 0
+
     def set_extension_overrides(self, overrides: dict[str, str]) -> None:
         """Record the extra extensions this index reads, as {extension: language}.
 

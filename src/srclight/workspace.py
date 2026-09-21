@@ -446,16 +446,10 @@ class WorkspaceDB:
         last_indexed = q(f"SELECT MAX(indexed_at) as t FROM [{schema}].files").fetchone()["t"]
         # What the project's last index run walked past. Read here so a
         # per-project answer can say what it never scanned.
-        unindexed: dict[str, int] = {}
-        row = q(f"SELECT value FROM [{schema}].schema_info "
-                f"WHERE key = 'unindexed_extensions'").fetchone()
-        if row:
-            try:
-                loaded = json.loads(row["value"])
-            except (TypeError, ValueError):
-                loaded = None
-            if isinstance(loaded, dict):
-                unindexed = loaded
+        unindexed = self._read_json_setting(schema, "unindexed_extensions")
+        # And the extra extensions it was told to read, so a workspace answer
+        # can name them as indexed.
+        overrides = self._read_json_setting(schema, "extension_overrides")
         embedded, model, dimensions = 0, None, None
         if q(f"SELECT name FROM [{schema}].sqlite_master "
               f"WHERE type='table' AND name='symbol_embeddings'").fetchone():
@@ -468,8 +462,22 @@ class WorkspaceDB:
             "files": files, "symbols": symbols, "edges": edges,
             "languages": languages, "kinds": kinds, "last_indexed": last_indexed,
             "embedded": embedded, "model": model, "dimensions": dimensions,
-            "unindexed_extensions": unindexed,
+            "unindexed_extensions": unindexed, "extension_overrides": overrides,
         }
+
+    def _read_json_setting(self, schema: str, key: str) -> dict:
+        """Read one JSON-valued schema_info row from an attached project."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            f"SELECT value FROM [{schema}].schema_info WHERE key = ?", (key,)
+        ).fetchone()
+        if not row:
+            return {}
+        try:
+            loaded = json.loads(row["value"])
+        except (TypeError, ValueError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
 
     def _collect_stats(self, project_filter: str | None = None) -> dict[str, dict[str, Any]]:
         """project_name -> stats for every indexable project (or one).
@@ -571,6 +579,8 @@ class WorkspaceDB:
                 # {extension: file count} this project holds and the index
                 # never read. Empty means the run covered what it walked.
                 "unindexed_extensions": st.get("unindexed_extensions", {}),
+                # Extra extensions declared for this project, {extension: language}.
+                "extension_overrides": st.get("extension_overrides", {}),
             })
 
         # Also list unindexed projects
