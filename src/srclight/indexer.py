@@ -33,6 +33,7 @@ from .languages import (
     LANGUAGES,
     SKIP_LANGUAGE,
     LanguageConfig,
+    code_extensions,
     detect_language,
     detect_language_by_filename,
     get_language,
@@ -874,23 +875,51 @@ class Indexer:
         if declared is None:
             return self.db.get_extension_overrides()
         overrides = {normalize_extension(str(k)): str(v).lower() for k, v in declared.items()}
+        # Validated here, not only in the CLI: a language that does not exist
+        # is written into every FileRecord it touches, produces no symbols,
+        # and shows up in index_status as a language of the codebase.
+        unknown = {
+            lang for lang in overrides.values()
+            if lang != SKIP_LANGUAGE and lang not in LANGUAGES
+        }
+        if unknown:
+            raise ValueError(
+                f"Unknown language(s) in extension_overrides: {', '.join(sorted(unknown))}"
+            )
         self.db.set_extension_overrides(overrides)
         return overrides
 
     def _ignored_only_by_its_own_extension(self, path: Path, root: Path,
                                            patterns: list[str]) -> bool:
-        """True when a file is ignored solely by a conditional extension pattern.
+        """True when a readable format is hidden by its own extension pattern alone.
 
-        Such a file is unread for want of an extractor, not by intent, so it
-        counts as a gap — but only if nothing ELSE excludes it. A PDF inside
-        `node_modules` or a vendored tree is excluded on purpose whatever
-        srclight can read, and reporting it would put the warning back on
-        every result of a default install.
+        Two cases reach here: a document format whose extractor is missing,
+        and a source extension that carries an ignore pattern anyway —
+        `*.cmake` sits in the default list next to the build artefacts, while
+        cmake is a language srclight parses. Both are unread by accident
+        rather than by intent.
+
+        It holds only if nothing ELSE excludes the file: a PDF or a generated
+        `.cmake` inside `build/`, `node_modules` or a vendored tree is
+        excluded on purpose whatever srclight can read, and reporting it
+        would put the warning back on every result.
         """
         ext = path.suffix.lower()
-        if ext not in unreadable_document_extensions():
+        if ext not in code_extensions() and ext not in unreadable_document_extensions():
             return False
         return not _should_ignore(path, root, [p for p in patterns if p != f"*{ext}"])
+
+    def _grammar_missing(self, lang: str) -> bool:
+        """True when a source language has no usable tree-sitter grammar here.
+
+        Indexing such a file writes a row and extracts nothing, so it would
+        be reported as read while holding no searchable symbol — the same
+        false completeness in another guise. Document languages are parsed
+        by extractors, not grammars, so they never answer True.
+        """
+        if lang not in LANGUAGES:
+            return False
+        return self._get_parser(lang) is None
 
     def _effective_ignore_patterns(self) -> list[str]:
         """Ignore patterns minus those a declaration overrides.
@@ -984,13 +1013,17 @@ class Indexer:
             logger.info("Using git ls-files (%d tracked files)", len(git_files))
 
         # Collect files to process
-        files_to_index: list[Path] = []
+        # (path, language): detected once, during collection. Detecting again
+        # in the processing loop reopened `.h` and `.inc` files and read them
+        # as they were THEN, not as the bytes that were hashed.
+        files_to_index: list[tuple[Path, str]] = []
         # Extensions walked past, so the index can say what it never read
         # instead of letting every answer imply it read everything.
         unindexed_exts: dict[str, int] = {}
         # Files srclight could read but refused on size — its own limit, not
         # the project's choice, so it belongs in the gap report too.
         oversize_skipped = 0
+        failed_files = 0
         if use_git:
             for rel in sorted(git_files):
                 path = root / rel
@@ -1030,7 +1063,11 @@ class Indexer:
                 if self.config.languages and lang not in self.config.languages:
                     continue
 
-                files_to_index.append(path)
+                if self._grammar_missing(lang):
+                    _count_unindexed(unindexed_exts, path)
+                    continue
+
+                files_to_index.append((path, lang))
                 stats.files_scanned += 1
         else:
             for path in sorted(root.rglob("*")):
@@ -1058,15 +1095,25 @@ class Indexer:
                     continue
 
                 size_limit = self.config.max_doc_file_size if is_doc else self.config.max_file_size
-                if path.stat().st_size > size_limit:
-                    stats.files_skipped += 1
-                    oversize_skipped += 1
+                try:
+                    if path.stat().st_size > size_limit:
+                        stats.files_skipped += 1
+                        oversize_skipped += 1
+                        continue
+                except OSError:
+                    # Build output and editor temp files vanish mid-walk. The
+                    # git branch has always tolerated it; here it aborted the
+                    # run, and the coverage record with it.
                     continue
 
                 if self.config.languages and lang not in self.config.languages:
                     continue
 
-                files_to_index.append(path)
+                if self._grammar_missing(lang):
+                    _count_unindexed(unindexed_exts, path)
+                    continue
+
+                files_to_index.append((path, lang))
                 stats.files_scanned += 1
 
         # Track existing files for removal detection
@@ -1074,7 +1121,7 @@ class Indexer:
         indexed_paths: set[str] = set()
 
         # Process each file
-        for i, path in enumerate(files_to_index):
+        for i, (path, lang) in enumerate(files_to_index):
             rel_path = str(path.relative_to(root))
             indexed_paths.add(rel_path)
 
@@ -1088,12 +1135,6 @@ class Indexer:
                 # Skip if unchanged
                 if not self.db.file_needs_reindex(rel_path, file_hash):
                     stats.files_unchanged += 1
-                    continue
-
-                lang = self._detect_language(path)
-                if lang is None:
-                    lang = detect_document_language(path.suffix)
-                if lang is None:
                     continue
 
                 line_count = raw.count(b"\n") + (1 if raw and not raw.endswith(b"\n") else 0)
@@ -1118,8 +1159,12 @@ class Indexer:
                 stats.files_indexed += 1
 
             except Exception as e:
+                # Unread is unread, whatever the reason: a file that raised
+                # here is absent from the index, and a coverage report that
+                # omitted it would call the scan complete without it.
                 logger.error("Error indexing %s: %s", path, e)
                 stats.errors += 1
+                failed_files += 1
 
         # Remove files that no longer exist
         for old_path in existing_paths - indexed_paths:
@@ -1172,6 +1217,12 @@ class Indexer:
         # took the parse work down with it if it failed. A second writer (the
         # git hook firing while the MCP server embeds) got 'database is locked'
         # and lost its own run: no busy_timeout is set.
+        # The coverage record goes with it, for the same reason: an index
+        # whose gaps changed would otherwise keep serving the old tally.
+        self.db.set_unindexed_extensions(unindexed_exts)
+        self.db.set_oversize_skipped(oversize_skipped)
+        self.db.set_failed_files(failed_files)
+
         self.db.commit()
 
         # Build embeddings (optional, only if a model is configured or known)
@@ -1193,8 +1244,7 @@ class Indexer:
         # Every run walks the whole tree — the content-hash skip happens
         # later — so this replaces the previous record rather than adding to
         # it, and a gap that has been closed disappears.
-        self.db.set_unindexed_extensions(unindexed_exts)
-        self.db.set_oversize_skipped(oversize_skipped)
+
 
         # Update index state
         git_head = _get_git_head(root)

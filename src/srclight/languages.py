@@ -654,14 +654,18 @@ def _sniff_include_fragment(path: Path) -> str:
 
     Fragments are included at file scope and hold real definitions, so they
     parse like any other source file. C is the fallback: the C grammar covers
-    the plain-function case, and a fragment that is neither C nor PHP (an
-    assembler table, say) yields no symbols under either grammar rather than
-    wrong ones.
+    the plain-function case, and a fragment it does not fit — an assembler
+    table, a Makefile snippet — is unlikely to yield much, though
+    tree-sitter's error recovery means "little" is not "nothing". A project
+    that keeps such fragments can declare `--ext .inc=skip`, which leaves
+    them unread and reports them as a gap.
     """
     head = _read_head(path)
     if head is None:
         return "c"
-    if "<?php" in head:
+    # `<?=` is the short echo tag, valid PHP on its own — a template
+    # fragment may never write the long form.
+    if "<?php" in head or "<?=" in head:
         return "php"
     if any(ind in head for ind in _CPP_INDICATORS):
         return "cpp"

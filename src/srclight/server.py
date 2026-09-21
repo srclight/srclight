@@ -108,7 +108,8 @@ An index answers from the files it read, so what it never read cannot appear in
 any result. `index_status()` names both sides: `indexed_extensions` (what it
 reads) and `unindexed_extensions` (`{{extension: file count}}` this repo holds
 that the last run walked past); `list_projects()` carries the same per project.
-- `oversize_skipped` counts files srclight recognised but refused on size.
+- `oversize_skipped` counts files refused on size; `failed_files` counts files
+  that could not be read or parsed. Both are gaps like any unread file.
 - The tally covers code that was never read: paths ignored on purpose and inert
   suffixes (config, data, manifests, suffixless files) are left out, while a
   document format missing its optional extra is counted.
@@ -1301,14 +1302,15 @@ def _indexed_extensions(db: Database | None = None) -> list[str]:
     return sorted(exts)
 
 
-def _unindexed_warning(unindexed: dict[str, int], oversize: int = 0) -> dict[str, object]:
+def _unindexed_warning(unindexed: dict[str, int], oversize: int = 0,
+                       failed: int = 0) -> dict[str, object]:
     """Fields that keep a result from reading as a complete scan.
 
     A result whose completeness field says `truncated: false` is taken to
     mean the whole tree was searched. It only ever meant the page was not
     cut short, so when files were never read, the result says so itself.
     """
-    if not unindexed and not oversize:
+    if not unindexed and not oversize and not failed:
         return {}
     reasons = []
     if unindexed:
@@ -1317,6 +1319,8 @@ def _unindexed_warning(unindexed: dict[str, int], oversize: int = 0) -> dict[str
         )
     if oversize:
         reasons.append(f"{oversize} file(s) exceeded the size limit")
+    if failed:
+        reasons.append(f"{failed} file(s) could not be read or parsed")
     fields: dict[str, object] = {
         "unindexed_note": (
             f"{' and '.join(reasons)}, so they were never scanned and this result is not a "
@@ -1328,6 +1332,8 @@ def _unindexed_warning(unindexed: dict[str, int], oversize: int = 0) -> dict[str
         fields["unindexed_extensions"] = unindexed
     if oversize:
         fields["oversize_skipped"] = oversize
+    if failed:
+        fields["failed_files"] = failed
     return fields
 
 
@@ -1386,6 +1392,8 @@ def index_status() -> str:
         # Files srclight recognised but refused on size — its own limit, so a
         # zero here is part of the same affirmative signal.
         "oversize_skipped": db.get_oversize_skipped(),
+        # Files the run could not read or parse — unread like any other.
+        "failed_files": db.get_failed_files(),
     }
 
     if state:
@@ -2453,6 +2461,7 @@ def find_pattern(
         )
         unindexed = db.get_unindexed_extensions()
         oversize = db.get_oversize_skipped()
+        failed = db.get_failed_files()
         db.close()
     else:
         db = _get_db()
@@ -2461,6 +2470,7 @@ def find_pattern(
         )
         unindexed = db.get_unindexed_extensions()
         oversize = db.get_oversize_skipped()
+        failed = db.get_failed_files()
 
     # Asking for limit + 1 is how truncation is detected: holding one more than
     # requested proves more exist. Exact, and the scan still stops early.
@@ -2483,7 +2493,7 @@ def find_pattern(
         "file_count": len(by_file),
         "by_file": by_file,
     }
-    result.update(_unindexed_warning(unindexed, oversize))
+    result.update(_unindexed_warning(unindexed, oversize, failed))
     if project:
         result["project"] = project
     if language:

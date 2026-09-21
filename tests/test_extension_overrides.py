@@ -197,3 +197,18 @@ def test_a_declaration_re_enables_an_extension_the_ignore_list_blocks(tmp_path, 
 
     paths = {r["path"] for r in db.conn.execute("SELECT path FROM files")}
     assert "FindZlib.cmake" in paths
+
+
+def test_parse_extension_overrides_rejects_a_multi_part_extension():
+    """`.d.ts` looks right and matches nothing: Path.suffix is `.ts`."""
+    with pytest.raises(ValueError, match=r"\.d\.ts"):
+        parse_extension_overrides((".d.ts=typescript",))
+
+
+def test_a_programmatic_declaration_validates_its_language(tmp_path, db):
+    """The CLI rejects a typo; IndexConfig must not accept one silently."""
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    with pytest.raises(ValueError, match="cpp11"):
+        Indexer(db, IndexConfig(root=root, extension_overrides={".zz": "cpp11"})).index()

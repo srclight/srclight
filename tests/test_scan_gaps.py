@@ -8,6 +8,7 @@ that record.
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
@@ -320,3 +321,129 @@ def test_no_readable_document_format_is_left_ignored():
     for ext in DOCUMENT_EXTENSIONS:
         if f"*{ext}" in DEFAULT_IGNORE:
             assert f"*{ext}" not in db_patterns or ext in CONDITIONALLY_IGNORED_DOCUMENT_EXTENSIONS
+
+
+def test_a_readable_extension_the_ignore_list_blocks_is_a_gap(tmp_path, db):
+    """`*.cmake` is ignored while cmake is a language srclight reads.
+
+    The directory walk skipped those files and said nothing, while
+    index_status listed `.cmake` as read — an affirmative signal over a
+    repo whose CMake modules were never opened.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    (root / "FindZlib.cmake").write_text("find_package(ZLIB)\n")
+
+    Indexer(db, IndexConfig(root=root)).index()
+
+    assert db.get_unindexed_extensions() == {".cmake": 1}
+
+
+def test_a_readable_extension_inside_an_ignored_tree_is_still_not_a_gap(tmp_path, db):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    generated = root / "build" / "CMakeFiles"
+    generated.mkdir(parents=True)
+    (generated / "FindZlib.cmake").write_text("find_package(ZLIB)\n")
+
+    Indexer(db, IndexConfig(root=root)).index()
+
+    assert db.get_unindexed_extensions() == {}
+
+
+def test_a_file_that_failed_to_index_is_a_gap(tmp_path, db, monkeypatch):
+    """An unreadable file is unread, whatever the reason."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    (root / "broken.py").write_text("def draw_frame():\n    return 2\n")
+
+    real = Indexer._extract_symbols
+
+    def explode(self, file_id, rel_path, source, lang):
+        if rel_path.endswith("broken.py"):
+            raise UnicodeDecodeError("utf-8", b"", 0, 1, "boom")
+        return real(self, file_id, rel_path, source, lang)
+
+    monkeypatch.setattr(Indexer, "_extract_symbols", explode)
+    Indexer(db, IndexConfig(root=root)).index()
+
+    assert db.get_failed_files() == 1
+
+
+def test_a_language_whose_grammar_is_missing_is_a_gap(tmp_path, db, monkeypatch):
+    """A file indexed with no parser holds no searchable symbol.
+
+    Recording it as read, with an empty symbol list, is the same false
+    completeness in a different guise.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    (root / "widget.lua").write_text("function draw_frame()\nend\n")
+
+    real = Indexer._get_parser
+    monkeypatch.setattr(
+        Indexer, "_get_parser",
+        lambda self, lang: None if lang == "lua" else real(self, lang),
+    )
+    Indexer(db, IndexConfig(root=root)).index()
+
+    paths = {r["path"] for r in db.conn.execute("SELECT path FROM files")}
+    assert "widget.lua" not in paths
+    assert db.get_unindexed_extensions() == {".lua": 1}
+
+
+def test_index_status_and_find_pattern_report_failed_files(tmp_path, db, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    (root / "broken.py").write_text("def draw_frame():\n    return 2\n")
+
+    real = Indexer._extract_symbols
+
+    def explode(self, file_id, rel_path, source, lang):
+        if rel_path.endswith("broken.py"):
+            raise UnicodeDecodeError("utf-8", b"", 0, 1, "boom")
+        return real(self, file_id, rel_path, source, lang)
+
+    monkeypatch.setattr(Indexer, "_extract_symbols", explode)
+    Indexer(db, IndexConfig(root=root)).index()
+    monkeypatch.setattr(server, "_db", db)
+    monkeypatch.setattr(server, "_repo_root", root)
+    monkeypatch.setattr(server, "_workspace_name", None)
+
+    status = json.loads(_run(server.index_status()))
+    assert status["failed_files"] == 1
+
+    res = json.loads(_run(server.find_pattern(pattern="draw_outline")))
+    assert res["failed_files"] == 1
+    assert "truncated" in res["unindexed_note"]
+
+
+def test_a_file_that_vanishes_mid_walk_does_not_abort_the_run(tmp_path, db, monkeypatch):
+    """Build output and editor temp files disappear while a walk is running."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    ghost = root / "ghost.py"
+    ghost.write_text("def gone():\n    return 0\n")
+
+    real_stat = Path.stat
+    seen = {"ghost.py": 0}
+
+    def vanishing(self, *args, **kwargs):
+        # The walk stats it once to see it is a file, then again for its
+        # size. It disappears in between.
+        if self.name == "ghost.py":
+            seen["ghost.py"] += 1
+            if seen["ghost.py"] > 1:
+                raise FileNotFoundError(self)
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", vanishing)
+    stats = Indexer(db, IndexConfig(root=root)).index()
+
+    assert stats.files_indexed == 1

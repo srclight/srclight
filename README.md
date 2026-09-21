@@ -71,7 +71,7 @@ that result, never that it is fresh.
 `index_status` reports both sides of what an index holds: `indexed_extensions`,
 every suffix it reads, and `unindexed_extensions`, the `{extension: file count}`
 this repo holds that the last run walked past, plus `oversize_skipped` for files
-srclight recognised but refused on size. `list_projects` carries the same per
+refused on size and `failed_files` for files that could not be read or parsed. `list_projects` carries the same per
 project, and `find_pattern` attaches the tally plus a note whenever it is
 non-empty.
 
@@ -84,7 +84,11 @@ those; counting them would leave the tally non-empty everywhere, put the
 warning on every result and bury the extensions that genuinely hold unread
 code. A document format this install cannot read for want of an extra
 (`.pdf`, `.docx`, `.xlsx`, `.html`) IS counted — it is unread, and one
-`pip install` away from being read.
+`pip install` away from being read. So is a source extension the ignore list
+blocks anyway (`*.cmake` sits next to the build artefacts while cmake is a
+language srclight parses), and a language whose tree-sitter grammar is not
+installed — indexing those files would record them as read while they hold no
+searchable symbol.
 
 `truncated` on a `find_pattern` result means the page was cut short, and
 nothing else. It has never described scan coverage: the search runs over

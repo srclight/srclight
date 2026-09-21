@@ -99,7 +99,16 @@ def parse_extension_overrides(values: tuple[str, ...]) -> dict[str, str]:
                 f"Unknown language '{lang}' in --ext value '{value}': expected "
                 f"{SKIP_LANGUAGE} or one of {', '.join(sorted(LANGUAGES))}"
             )
-        overrides[normalize_extension(ext)] = lang
+        normalized = normalize_extension(ext)
+        # Detection looks up Path.suffix, which is only the last component:
+        # a declaration on `.d.ts` would be stored, echoed back, and never
+        # match a file. Better rejected than confirmed as a no-op.
+        if "." in normalized[1:]:
+            raise ValueError(
+                f"Multi-part extension '{ext}' in --ext value '{value}': only a final "
+                f"suffix can be matched (use '.ts', not '.d.ts')"
+            )
+        overrides[normalized] = lang
     return overrides
 
 

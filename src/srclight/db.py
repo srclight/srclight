@@ -1460,6 +1460,28 @@ class Database:
         except (TypeError, ValueError):
             return 0
 
+    def set_failed_files(self, count: int) -> None:
+        """Record how many files the last run could not read or parse."""
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('failed_files', ?)",
+            (str(int(count)),),
+        )
+        self.conn.commit()
+
+    def get_failed_files(self) -> int:
+        """Files the last run failed on. Zero when none did, or when unrecorded."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'failed_files'"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return 0
+
     def set_extension_overrides(self, overrides: dict[str, str]) -> None:
         """Record the extra extensions this index reads, as {extension: language}.
 

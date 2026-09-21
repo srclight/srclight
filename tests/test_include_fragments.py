@@ -160,3 +160,10 @@ def test_sniffing_reads_only_the_head_of_a_large_fragment(tmp_path):
         tracemalloc.stop()
 
     assert peak < 1_000_000, f"loaded {peak} bytes to read a 4 KB head"
+
+
+def test_inc_opening_with_a_php_short_echo_tag_is_php(tmp_path):
+    path = tmp_path / "row.inc"
+    path.write_text("<?= $row['name'] ?>\n<?= $row['size'] ?>\n")
+
+    assert detect_language(path) == "php"
