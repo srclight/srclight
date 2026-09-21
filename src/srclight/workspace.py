@@ -444,6 +444,18 @@ class WorkspaceDB:
             for r in q(f"SELECT kind, COUNT(*) as n FROM [{schema}].symbols GROUP BY kind")
         }
         last_indexed = q(f"SELECT MAX(indexed_at) as t FROM [{schema}].files").fetchone()["t"]
+        # What the project's last index run walked past. Read here so a
+        # per-project answer can say what it never scanned.
+        unindexed: dict[str, int] = {}
+        row = q(f"SELECT value FROM [{schema}].schema_info "
+                f"WHERE key = 'unindexed_extensions'").fetchone()
+        if row:
+            try:
+                loaded = json.loads(row["value"])
+            except (TypeError, ValueError):
+                loaded = None
+            if isinstance(loaded, dict):
+                unindexed = loaded
         embedded, model, dimensions = 0, None, None
         if q(f"SELECT name FROM [{schema}].sqlite_master "
               f"WHERE type='table' AND name='symbol_embeddings'").fetchone():
@@ -456,6 +468,7 @@ class WorkspaceDB:
             "files": files, "symbols": symbols, "edges": edges,
             "languages": languages, "kinds": kinds, "last_indexed": last_indexed,
             "embedded": embedded, "model": model, "dimensions": dimensions,
+            "unindexed_extensions": unindexed,
         }
 
     def _collect_stats(self, project_filter: str | None = None) -> dict[str, dict[str, Any]]:
@@ -555,6 +568,9 @@ class WorkspaceDB:
                 "last_file_change": st.get("last_file_change", st["last_indexed"]),
                 "embedded_symbols": st["embedded"],
                 "embedding_coverage": round(st["embedded"] / st["symbols"], 4) if st["symbols"] else 0.0,
+                # {extension: file count} this project holds and the index
+                # never read. Empty means the run covered what it walked.
+                "unindexed_extensions": st.get("unindexed_extensions", {}),
             })
 
         # Also list unindexed projects

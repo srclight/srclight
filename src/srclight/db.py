@@ -1403,6 +1403,41 @@ class Database:
             "dimensions": model_row["dimensions"] if model_row else None,
         }
 
+    # --- Scan gaps ---
+
+    def set_unindexed_extensions(self, counts: dict[str, int]) -> None:
+        """Record the extensions the last index run walked past.
+
+        What an index never read is what its answers cannot mention, so the
+        record travels with the index rather than being recomputed by every
+        caller who thinks to doubt a result.
+        """
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('unindexed_extensions', ?)",
+            (json.dumps(counts, sort_keys=True),),
+        )
+        self.conn.commit()
+
+    def get_unindexed_extensions(self) -> dict[str, int]:
+        """Extensions seen but not indexed, as {extension: file count}.
+
+        Empty when the last run indexed everything it walked, and also when
+        the index predates this record — an old index cannot claim a gap it
+        never measured.
+        """
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'unindexed_extensions'"
+        ).fetchone()
+        if row is None:
+            return {}
+        try:
+            data = json.loads(row["value"])
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
     # --- Index State ---
 
     def get_index_state(self, repo_root: str) -> dict | None:

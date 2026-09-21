@@ -685,6 +685,17 @@ def detect_language(path: Path) -> str | None:
     return lang
 
 
+def code_extensions() -> tuple[str, ...]:
+    """Every suffix the indexer reads as source code, sorted.
+
+    Callers use it to see what an index covers without discovering the gaps
+    by comparing a result against a grep.
+    """
+    exts = {ext for config in LANGUAGES.values() for ext in config.extensions}
+    exts.update(SNIFFED_EXTENSIONS)
+    return tuple(sorted(exts))
+
+
 def get_language(name: str) -> Language | None:
     """Get a tree-sitter Language object by name. Lazy-loads the grammar."""
     if name in _LANGUAGES:

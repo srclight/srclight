@@ -187,6 +187,12 @@ def resolve_embed_model(db: Database, config: IndexConfig) -> str | None:
     return os.environ.get(EMBED_MODEL_ENV, "").strip() or None
 
 
+def _count_unindexed(counts: dict[str, int], path: Path) -> None:
+    """Tally one file the walk is about to skip, by extension."""
+    ext = path.suffix.lower() or "(no extension)"
+    counts[ext] = counts.get(ext, 0) + 1
+
+
 def _should_ignore(path: Path, root: Path, patterns: list[str]) -> bool:
     """Check if a path matches any ignore pattern."""
     rel = str(path.relative_to(root))
@@ -876,6 +882,9 @@ class Indexer:
 
         # Collect files to process
         files_to_index: list[Path] = []
+        # Extensions walked past, so the index can say what it never read
+        # instead of letting every answer imply it read everything.
+        unindexed_exts: dict[str, int] = {}
         if use_git:
             for rel in sorted(git_files):
                 path = root / rel
@@ -888,6 +897,7 @@ class Indexer:
                     lang = detect_document_language(path.suffix)
                     is_doc = True
                 if lang is None:
+                    _count_unindexed(unindexed_exts, path)
                     continue
 
                 size_limit = self.config.max_doc_file_size if is_doc else self.config.max_file_size
@@ -916,6 +926,7 @@ class Indexer:
                     lang = detect_document_language(path.suffix)
                     is_doc = True
                 if lang is None:
+                    _count_unindexed(unindexed_exts, path)
                     continue
 
                 size_limit = self.config.max_doc_file_size if is_doc else self.config.max_file_size
@@ -1049,6 +1060,11 @@ class Indexer:
         # reindex that only removed files, both land here.
         if (stats.files_indexed or stats.files_removed) and not stats.symbols_embedded:
             self._invalidate_sidecar()
+
+        # Every run walks the whole tree — the content-hash skip happens
+        # later — so this replaces the previous record rather than adding to
+        # it, and a gap that has been closed disappears.
+        self.db.set_unindexed_extensions(unindexed_exts)
 
         # Update index state
         git_head = _get_git_head(root)

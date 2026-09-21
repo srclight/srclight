@@ -1267,9 +1267,41 @@ def check_freshness(paths: list[str] | None = None, project: str | None = None) 
     )
 
 
+def _indexed_extensions() -> list[str]:
+    """Every extension an index can hold — source plus document formats."""
+    from .extractors import DOCUMENT_EXTENSIONS
+    from .languages import code_extensions
+    return sorted(set(code_extensions()) | set(DOCUMENT_EXTENSIONS))
+
+
+def _unindexed_warning(unindexed: dict[str, int]) -> dict[str, object]:
+    """Fields that keep a result from reading as a complete scan.
+
+    A result whose completeness field says `truncated: false` is taken to
+    mean the whole tree was searched. It only ever meant the page was not
+    cut short, so when files were never read, the result says so itself.
+    """
+    if not unindexed:
+        return {}
+    skipped = sum(unindexed.values())
+    return {
+        "unindexed_extensions": unindexed,
+        "unindexed_note": (
+            f"{skipped} file(s) carry an extension this index does not read and were never "
+            f"scanned, so this result is not a whole-tree answer; `truncated` reports "
+            f"pagination only. Call index_status() for the extensions that are read."
+        ),
+    }
+
+
 @mcp.tool()
 def index_status() -> str:
     """Check the current state of the code index.
+
+    Reports which extensions the index reads (`indexed_extensions`) and
+    which ones this repo holds but the index walked past
+    (`unindexed_extensions`), so a gap is visible without comparing a
+    result to a grep.
 
     In workspace mode, shows per-project stats.
     """
@@ -1295,6 +1327,11 @@ def index_status() -> str:
         "edges": stats["edges"],
         "db_size_mb": stats["db_size_mb"],
         "languages": stats["languages"],
+        "indexed_extensions": _indexed_extensions(),
+        # What the last run walked past, as {extension: file count}. Empty
+        # means the run indexed everything it saw — the one case where a
+        # result may be read as covering the whole tree.
+        "unindexed_extensions": db.get_unindexed_extensions(),
     }
 
     if state:
@@ -2360,12 +2397,14 @@ def find_pattern(
         matches = db.find_pattern_in_symbols(
             pattern, language=language, kind=kind, limit=limit + 1, offset=offset
         )
+        unindexed = db.get_unindexed_extensions()
         db.close()
     else:
         db = _get_db()
         matches = db.find_pattern_in_symbols(
             pattern, language=language, kind=kind, limit=limit + 1, offset=offset
         )
+        unindexed = db.get_unindexed_extensions()
 
     # Asking for limit + 1 is how truncation is detected: holding one more than
     # requested proves more exist. Exact, and the scan still stops early.
@@ -2388,6 +2427,7 @@ def find_pattern(
         "file_count": len(by_file),
         "by_file": by_file,
     }
+    result.update(_unindexed_warning(unindexed))
     if project:
         result["project"] = project
     if language:
