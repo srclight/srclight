@@ -508,7 +508,8 @@ LANGUAGES: dict[str, LanguageConfig] = {
     ),
     "cpp": LanguageConfig(
         name="cpp",
-        extensions=(".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h", ".mm"),
+        extensions=(".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h", ".mm",
+                    ".inl", ".ipp", ".tcc"),
         loader="tree_sitter_cpp",
         symbol_query=_CPP_QUERY,
     ),
@@ -625,6 +626,42 @@ _FILENAME_TO_LANG: dict[str, str] = {
 }
 
 
+_CPP_INDICATORS = ("class ", "namespace ", "template", "::", "std::")
+
+# Suffixes the content decides, because the same suffix carries different
+# languages in different projects. `.h` is C or C++; `.inc` is an include
+# fragment — a C++ project fills it with method definitions, a PHP project
+# with PHP.
+SNIFFED_EXTENSIONS = (".h", ".inc")
+
+
+def _read_head(path: Path, size: int = 4096) -> str | None:
+    """Read the first `size` characters, or None if the file cannot be read."""
+    try:
+        return path.read_text(errors="replace")[:size]
+    except OSError:
+        return None
+
+
+def _sniff_include_fragment(path: Path) -> str:
+    """Decide what language a `.inc` fragment holds.
+
+    Fragments are included at file scope and hold real definitions, so they
+    parse like any other source file. C is the fallback: the C grammar covers
+    the plain-function case, and a fragment that is neither C nor PHP (an
+    assembler table, say) yields no symbols under either grammar rather than
+    wrong ones.
+    """
+    head = _read_head(path)
+    if head is None:
+        return "c"
+    if "<?php" in head:
+        return "php"
+    if any(ind in head for ind in _CPP_INDICATORS):
+        return "cpp"
+    return "c"
+
+
 def detect_language(path: Path) -> str | None:
     """Detect language from file extension or filename."""
     # Check exact filename first (e.g. CMakeLists.txt)
@@ -633,17 +670,17 @@ def detect_language(path: Path) -> str | None:
         return lang
 
     suffix = path.suffix.lower()
+
+    if suffix == ".inc":
+        return _sniff_include_fragment(path)
+
     lang = _EXT_TO_LANG.get(suffix)
 
     # Heuristic: .h files — check for C++ indicators
     if suffix == ".h" and lang == "c":
-        try:
-            content = path.read_text(errors="replace")[:4096]
-            cpp_indicators = ("class ", "namespace ", "template", "::", "std::")
-            if any(ind in content for ind in cpp_indicators):
-                return "cpp"
-        except OSError:
-            pass
+        head = _read_head(path)
+        if head and any(ind in head for ind in _CPP_INDICATORS):
+            return "cpp"
 
     return lang
 
