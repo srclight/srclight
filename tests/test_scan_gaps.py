@@ -188,3 +188,73 @@ def test_find_pattern_reports_oversize_files_it_never_read(tmp_path, db, monkeyp
 
     assert res["oversize_skipped"] == 1
     assert "truncated" in res["unindexed_note"]
+
+
+def test_config_and_extensionless_files_are_not_gaps(tmp_path, db):
+    """A gap means code that was never read, not repo furniture.
+
+    Every repo carries a LICENSE, a lockfile and some YAML. Counting them
+    leaves the tally non-empty everywhere, which puts the warning on every
+    answer and buries the extensions that genuinely hold unread code.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    (root / "LICENSE").write_text("MIT\n")
+    (root / "Dockerfile").write_text("FROM python\n")
+    (root / "pyproject.toml").write_text("[project]\n")
+    (root / "settings.json").write_text("{}\n")
+    (root / "ci.yml").write_text("on: push\n")
+    (root / "outline.wgsl").write_text("fn main() {}\n")
+
+    Indexer(db, IndexConfig(root=root)).index()
+
+    assert db.get_unindexed_extensions() == {".wgsl": 1}
+
+
+def test_workspace_index_status_reports_oversize_files(tmp_path, monkeypatch):
+    """`find_pattern`'s note points at index_status in workspace mode too."""
+    import srclight.workspace as ws_mod
+    monkeypatch.setattr(ws_mod, "WORKSPACES_DIR", tmp_path / "workspaces")
+
+    project = tmp_path / "alpha"
+    project.mkdir()
+    (project / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    (project / "generated.py").write_text("x = 1\n" * 500)
+    (project / ".srclight").mkdir()
+    project_db = Database(project / ".srclight" / "index.db")
+    project_db.open()
+    project_db.initialize()
+    Indexer(project_db, IndexConfig(root=project, max_file_size=100)).index()
+    project_db.close()
+
+    config = ws_mod.WorkspaceConfig(name="gaps")
+    config.add_project("alpha", str(project))
+    monkeypatch.setattr(server, "_workspace_name", "gaps")
+    monkeypatch.setattr(server, "_workspace_db", None)
+    monkeypatch.setattr(server, "_workspace_config_mtime", None)
+
+    res = json.loads(_run(server.index_status()))
+
+    assert res["projects"][0]["oversize_skipped"] == 1
+
+
+def test_a_document_format_this_install_cannot_read_is_a_gap(tmp_path, db, monkeypatch):
+    """`pip install srclight` without the extras still has to say so.
+
+    The extras are how PDF/DOCX/XLSX/HTML get read. Without them those
+    files are neither indexed nor — since their patterns stay in the ignore
+    list — counted, so the default install reported a whole-tree answer
+    over a repo whose documents it never opened.
+    """
+    from srclight import extractors
+
+    monkeypatch.delitem(extractors.DOCUMENT_EXTENSIONS, ".pdf", raising=False)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    (root / "manual.pdf").write_bytes(b"%PDF-1.4\n")
+
+    Indexer(db, IndexConfig(root=root)).index()
+
+    assert db.get_unindexed_extensions() == {".pdf": 1}

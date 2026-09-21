@@ -109,6 +109,9 @@ any result. `index_status()` names both sides: `indexed_extensions` (what it
 reads) and `unindexed_extensions` (`{{extension: file count}}` this repo holds
 that the last run walked past); `list_projects()` carries the same per project.
 - `oversize_skipped` counts files srclight recognised but refused on size.
+- The tally covers code that was never read: paths ignored on purpose and inert
+  suffixes (config, data, manifests, suffixless files) are left out, while a
+  document format missing its optional extra is counted.
 - `find_pattern` attaches both whenever either is non-zero.
   Its `truncated` field reports **pagination only** — never scan coverage — so
   `truncated: false` alongside a non-empty tally is a partial answer, not a
@@ -1282,12 +1285,19 @@ def check_freshness(paths: list[str] | None = None, project: str | None = None) 
 
 
 def _indexed_extensions(db: Database | None = None) -> list[str]:
-    """Every extension this index reads — source, documents, and declared extras."""
+    """Every extension this index reads — source, documents, and declared extras.
+
+    A suffix declared unreadable is removed, including a built-in one: this
+    is the answer to "what was read", and it cannot name an extension that
+    the same payload reports as a gap.
+    """
     from .extractors import DOCUMENT_EXTENSIONS
-    from .languages import code_extensions
+    from .languages import SKIP_LANGUAGE, code_extensions
     exts = set(code_extensions()) | set(DOCUMENT_EXTENSIONS)
     if db is not None:
-        exts |= set(db.get_extension_overrides())
+        overrides = db.get_extension_overrides()
+        exts |= {e for e, lang in overrides.items() if lang != SKIP_LANGUAGE}
+        exts -= {e for e, lang in overrides.items() if lang == SKIP_LANGUAGE}
     return sorted(exts)
 
 
@@ -1338,13 +1348,20 @@ def index_status() -> str:
         # Every project's declared extensions count as read, since a
         # workspace answer can come from any of them — and `find_pattern`'s
         # note sends the caller here in this mode too.
+        from .languages import SKIP_LANGUAGE
         declared: set[str] = set()
+        unreadable: set[str] = set()
         for p in projects:
-            declared |= set(p.get("extension_overrides") or {})
+            for ext, lang in (p.get("extension_overrides") or {}).items():
+                (unreadable if lang == SKIP_LANGUAGE else declared).add(ext)
         return json.dumps({
             "mode": "workspace",
             "workspace": _workspace_name,
-            "indexed_extensions": sorted(set(_indexed_extensions()) | declared),
+            # A suffix one project declares unreadable stays listed when
+            # another reads it — the answer can still come from that one.
+            "indexed_extensions": sorted(
+                (set(_indexed_extensions()) | declared) - (unreadable - declared)
+            ),
             "projects": projects,
         }, indent=2)
 

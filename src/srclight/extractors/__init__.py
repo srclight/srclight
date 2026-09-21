@@ -70,6 +70,24 @@ def _discover() -> None:
         logger.debug("Pillow not installed — image extraction disabled")
 
 
+# Text-bearing document formats that need an optional dependency, listed
+# here rather than read off the extractor classes — those classes are
+# exactly what fails to import when the dependency is missing, which is the
+# case this maps. Image formats are left out on purpose: OCR is opt-in and
+# an image holds no text srclight is expected to have read.
+OPTIONAL_TEXT_DOCUMENT_EXTENSIONS = (".pdf", ".docx", ".xlsx", ".xlsm", ".html", ".htm")
+
+
+def unreadable_document_extensions() -> tuple[str, ...]:
+    """Document suffixes this install cannot read for want of an extra.
+
+    Their ignore patterns stay in place when the extractor is missing, so
+    without this they would be skipped AND excluded from the gap report —
+    unread and unmentioned.
+    """
+    return tuple(e for e in OPTIONAL_TEXT_DOCUMENT_EXTENSIONS if e not in DOCUMENT_EXTENSIONS)
+
+
 def detect_document_language(suffix: str) -> str | None:
     """Return the language name for a document extension, or None."""
     return DOCUMENT_EXTENSIONS.get(suffix.lower())

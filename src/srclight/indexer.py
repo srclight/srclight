@@ -23,12 +23,18 @@ from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
 from . import __version__
 from .db import Database, EdgeRecord, FileRecord, SymbolRecord, content_hash
-from .extractors import DOCUMENT_EXTENSIONS, detect_document_language, get_registry
+from .extractors import (
+    DOCUMENT_EXTENSIONS,
+    detect_document_language,
+    get_registry,
+    unreadable_document_extensions,
+)
 from .languages import (
     LANGUAGES,
     SKIP_LANGUAGE,
     LanguageConfig,
     detect_language,
+    detect_language_by_filename,
     get_language,
     normalize_extension,
 )
@@ -193,9 +199,27 @@ def resolve_embed_model(db: Database, config: IndexConfig) -> str | None:
     return os.environ.get(EMBED_MODEL_ENV, "").strip() or None
 
 
+# Suffixes that never hold code srclight could index — configuration, data
+# and manifests. They are skipped like any unknown extension, but they are
+# not a GAP: every repo carries some, so counting them would leave the tally
+# non-empty everywhere, put the "not a whole-tree answer" warning on every
+# result, and bury the extensions that genuinely hold unread code. Files with
+# no suffix at all (LICENSE, Dockerfile, Makefile) are the same case.
+INERT_EXTENSIONS = frozenset({
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".lock",
+    ".txt", ".log", ".xml", ".properties", ".plist", ".editorconfig",
+})
+
+
 def _count_unindexed(counts: dict[str, int], path: Path) -> None:
-    """Tally one file the walk is about to skip, by extension."""
-    ext = path.suffix.lower() or "(no extension)"
+    """Tally one file the walk is about to skip, by extension.
+
+    Inert suffixes and suffixless files are not tallied — see
+    INERT_EXTENSIONS for why an over-eager tally is worse than none.
+    """
+    ext = path.suffix.lower()
+    if not ext or ext in INERT_EXTENSIONS:
+        return
     counts[ext] = counts.get(ext, 0) + 1
 
 
@@ -853,12 +877,31 @@ class Indexer:
         self.db.set_extension_overrides(overrides)
         return overrides
 
+    def _is_ignored(self, path: Path, root: Path) -> bool:
+        """True when a skipped file is excluded on purpose, not a gap.
+
+        A document format whose extractor is missing is NOT excluded on
+        purpose: its ignore pattern is still in place only because the
+        extra that would read it is not installed.
+        """
+        if path.suffix.lower() in unreadable_document_extensions():
+            return False
+        return _should_ignore(path, root, self.config.ignore_patterns)
+
     def _declared_unreadable(self, path: Path) -> bool:
         """True when this index was told to leave the extension unread."""
         return self._ext_overrides.get(path.suffix.lower()) == SKIP_LANGUAGE
 
     def _detect_language(self, path: Path) -> str | None:
-        """Detect a file's language, honouring this index's declared extensions."""
+        """Detect a file's language, honouring this index's declared extensions.
+
+        A declaration is scoped to an extension, so it never outranks a rule
+        keyed on the whole filename: `--ext .txt=markdown` must not turn
+        every CMakeLists.txt in the tree into markdown.
+        """
+        by_name = detect_language_by_filename(path)
+        if by_name:
+            return by_name
         override = self._ext_overrides.get(path.suffix.lower())
         if override:
             return override
@@ -944,7 +987,7 @@ class Indexer:
                     # vendored tree is excluded on purpose, and reporting it
                     # would leave the tally non-empty on every real repo —
                     # burying the extensions that are genuinely missing.
-                    if not _should_ignore(path, root, self.config.ignore_patterns):
+                    if not self._is_ignored(path, root):
                         _count_unindexed(unindexed_exts, path)
                     continue
 
@@ -967,6 +1010,8 @@ class Indexer:
                 if not path.is_file():
                     continue
                 if _should_ignore(path, root, self.config.ignore_patterns):
+                    if not self._is_ignored(path, root):
+                        _count_unindexed(unindexed_exts, path)
                     continue
 
                 if self._declared_unreadable(path):

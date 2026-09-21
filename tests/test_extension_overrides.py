@@ -143,3 +143,31 @@ def test_an_extension_can_be_declared_unreadable(tmp_path, db):
 
 def test_parse_extension_overrides_accepts_skip():
     assert parse_extension_overrides((".inc=skip",)) == {".inc": "skip"}
+
+
+def test_a_skipped_extension_is_not_listed_as_indexed(tmp_path, db, monkeypatch):
+    """The one tool that says what was read must not say both."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "rules.inc").write_text("include config.mk\nall: build\n")
+    Indexer(db, IndexConfig(root=root, extension_overrides={".inc": "skip"})).index()
+    monkeypatch.setattr(server, "_db", db)
+    monkeypatch.setattr(server, "_repo_root", root)
+    monkeypatch.setattr(server, "_workspace_name", None)
+
+    res = json.loads(_run(server.index_status()))
+
+    assert res["unindexed_extensions"] == {".inc": 1}
+    assert ".inc" not in res["indexed_extensions"]
+
+
+def test_an_override_does_not_outrank_an_exact_filename_rule(tmp_path, db):
+    """`--ext .txt=…` must not reclassify CMakeLists.txt."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "CMakeLists.txt").write_text('project(shapes)\nadd_library(shapes shapes.c)\n')
+
+    Indexer(db, IndexConfig(root=root, extension_overrides={".txt": "markdown"})).index()
+
+    row = db.conn.execute("SELECT language FROM files WHERE path = 'CMakeLists.txt'").fetchone()
+    assert row["language"] == "cmake"

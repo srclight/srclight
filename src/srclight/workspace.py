@@ -450,6 +450,14 @@ class WorkspaceDB:
         # And the extra extensions it was told to read, so a workspace answer
         # can name them as indexed.
         overrides = self._read_json_setting(schema, "extension_overrides")
+        oversize = 0
+        row = q(f"SELECT value FROM [{schema}].schema_info "
+                f"WHERE key = 'oversize_skipped'").fetchone()
+        if row:
+            try:
+                oversize = int(row["value"])
+            except (TypeError, ValueError):
+                oversize = 0
         embedded, model, dimensions = 0, None, None
         if q(f"SELECT name FROM [{schema}].sqlite_master "
               f"WHERE type='table' AND name='symbol_embeddings'").fetchone():
@@ -463,6 +471,7 @@ class WorkspaceDB:
             "languages": languages, "kinds": kinds, "last_indexed": last_indexed,
             "embedded": embedded, "model": model, "dimensions": dimensions,
             "unindexed_extensions": unindexed, "extension_overrides": overrides,
+            "oversize_skipped": oversize,
         }
 
     def _read_json_setting(self, schema: str, key: str) -> dict:
@@ -581,6 +590,8 @@ class WorkspaceDB:
                 "unindexed_extensions": st.get("unindexed_extensions", {}),
                 # Extra extensions declared for this project, {extension: language}.
                 "extension_overrides": st.get("extension_overrides", {}),
+                # Files this project's last run refused on size.
+                "oversize_skipped": st.get("oversize_skipped", 0),
             })
 
         # Also list unindexed projects

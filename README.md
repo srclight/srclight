@@ -71,11 +71,20 @@ that result, never that it is fresh.
 `index_status` reports both sides of what an index holds: `indexed_extensions`,
 every suffix it reads, and `unindexed_extensions`, the `{extension: file count}`
 this repo holds that the last run walked past, plus `oversize_skipped` for files
-srclight recognised but refused on size. Deliberately ignored paths (binaries,
-vendored trees, `.git`) are not counted, in both the `git ls-files` and
-directory-walk modes — only files that could have carried code and did not reach
-the index. `list_projects` carries the same per project, and `find_pattern`
-attaches the tally plus a note whenever it is non-empty.
+srclight recognised but refused on size. `list_projects` carries the same per
+project, and `find_pattern` attaches the tally plus a note whenever it is
+non-empty.
+
+A gap means code that was never read, so the tally deliberately leaves out
+what is skipped on purpose: ignored paths (binaries, vendored trees, `.git`)
+in both the `git ls-files` and directory-walk modes, and inert suffixes —
+config, data and manifests (`.json`, `.toml`, `.yml`, `.lock`, …) along with
+suffixless files like `LICENSE` or `Dockerfile`. Every repo carries some of
+those; counting them would leave the tally non-empty everywhere, put the
+warning on every result and bury the extensions that genuinely hold unread
+code. A document format this install cannot read for want of an extra
+(`.pdf`, `.docx`, `.xlsx`, `.html`) IS counted — it is unread, and one
+`pip install` away from being read.
 
 `truncated` on a `find_pattern` result means the page was cut short, and
 nothing else. It has never described scan coverage: the search runs over

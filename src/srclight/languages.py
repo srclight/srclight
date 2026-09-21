@@ -668,10 +668,19 @@ def _sniff_include_fragment(path: Path) -> str:
     return "c"
 
 
+def detect_language_by_filename(path: Path) -> str | None:
+    """Language for a whole-filename rule (e.g. CMakeLists.txt), or None.
+
+    Exposed so callers that layer their own rules on top can keep this one
+    ahead of anything keyed on the extension alone.
+    """
+    return _FILENAME_TO_LANG.get(path.name)
+
+
 def detect_language(path: Path) -> str | None:
     """Detect language from file extension or filename."""
     # Check exact filename first (e.g. CMakeLists.txt)
-    lang = _FILENAME_TO_LANG.get(path.name)
+    lang = detect_language_by_filename(path)
     if lang:
         return lang
 
