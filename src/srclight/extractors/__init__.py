@@ -70,22 +70,30 @@ def _discover() -> None:
         logger.debug("Pillow not installed — image extraction disabled")
 
 
-# Text-bearing document formats that need an optional dependency, listed
-# here rather than read off the extractor classes — those classes are
-# exactly what fails to import when the dependency is missing, which is the
-# case this maps. Image formats are left out on purpose: OCR is opt-in and
-# an image holds no text srclight is expected to have read.
-OPTIONAL_TEXT_DOCUMENT_EXTENSIONS = (".pdf", ".docx", ".xlsx", ".xlsm", ".html", ".htm")
+# Document formats whose ignore pattern is CONDITIONAL: `*.pdf` sits in the
+# indexer's default ignore list next to `*.zip` and `*.exe`, but unlike them
+# it is there only because the extractor that reads it may be missing — the
+# indexer drops the pattern when the extra is installed. Every other ignored
+# extension is excluded on purpose.
+#
+# Only formats carrying such a pattern belong here. A `.docx` or `.html` with
+# no extractor is already counted as a gap by the ordinary "no language for
+# this suffix" path, and listing it here would do nothing but confuse the two
+# cases. Hand-maintained because the classes that would name these suffixes
+# are exactly the ones that fail to import — see
+# tests/test_scan_gaps.py::test_every_conditionally_ignored_format_has_a_pattern.
+CONDITIONALLY_IGNORED_DOCUMENT_EXTENSIONS = (".pdf",)
 
 
 def unreadable_document_extensions() -> tuple[str, ...]:
-    """Document suffixes this install cannot read for want of an extra.
+    """Conditionally-ignored suffixes this install cannot read.
 
-    Their ignore patterns stay in place when the extractor is missing, so
-    without this they would be skipped AND excluded from the gap report —
-    unread and unmentioned.
+    A file ignored ONLY by one of these patterns is unread for want of an
+    extra, not by intent, so it counts as a gap.
     """
-    return tuple(e for e in OPTIONAL_TEXT_DOCUMENT_EXTENSIONS if e not in DOCUMENT_EXTENSIONS)
+    return tuple(
+        e for e in CONDITIONALLY_IGNORED_DOCUMENT_EXTENSIONS if e not in DOCUMENT_EXTENSIONS
+    )
 
 
 def detect_document_language(suffix: str) -> str | None:

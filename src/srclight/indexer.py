@@ -877,19 +877,44 @@ class Indexer:
         self.db.set_extension_overrides(overrides)
         return overrides
 
-    def _is_ignored(self, path: Path, root: Path) -> bool:
-        """True when a skipped file is excluded on purpose, not a gap.
+    def _ignored_only_by_its_own_extension(self, path: Path, root: Path,
+                                           patterns: list[str]) -> bool:
+        """True when a file is ignored solely by a conditional extension pattern.
 
-        A document format whose extractor is missing is NOT excluded on
-        purpose: its ignore pattern is still in place only because the
-        extra that would read it is not installed.
+        Such a file is unread for want of an extractor, not by intent, so it
+        counts as a gap — but only if nothing ELSE excludes it. A PDF inside
+        `node_modules` or a vendored tree is excluded on purpose whatever
+        srclight can read, and reporting it would put the warning back on
+        every result of a default install.
         """
-        if path.suffix.lower() in unreadable_document_extensions():
+        ext = path.suffix.lower()
+        if ext not in unreadable_document_extensions():
             return False
-        return _should_ignore(path, root, self.config.ignore_patterns)
+        return not _should_ignore(path, root, [p for p in patterns if p != f"*{ext}"])
+
+    def _effective_ignore_patterns(self) -> list[str]:
+        """Ignore patterns minus those a declaration overrides.
+
+        `--ext .cmake=cmake` has to reach files that `*.cmake` would hide,
+        the way an installed extractor makes `*.pdf` stop applying —
+        otherwise the declaration is a silent no-op in one walk and works in
+        the other.
+        """
+        declared = {
+            f"*{ext}" for ext, lang in self._ext_overrides.items() if lang != SKIP_LANGUAGE
+        }
+        if not declared:
+            return self.config.ignore_patterns
+        return [p for p in self.config.ignore_patterns if p not in declared]
 
     def _declared_unreadable(self, path: Path) -> bool:
-        """True when this index was told to leave the extension unread."""
+        """True when this index was told to leave the extension unread.
+
+        Scoped to the extension, so it never outranks a whole-filename rule:
+        `--ext .txt=skip` must not drop every CMakeLists.txt from the index.
+        """
+        if detect_language_by_filename(path):
+            return False
         return self._ext_overrides.get(path.suffix.lower()) == SKIP_LANGUAGE
 
     def _detect_language(self, path: Path) -> str | None:
@@ -950,6 +975,7 @@ class Indexer:
         logger.info("Indexing %s", root)
 
         self._ext_overrides = self._resolve_extension_overrides()
+        ignore_patterns = self._effective_ignore_patterns()
 
         # Try to use git ls-files for .gitignore-aware file listing
         git_files = _git_tracked_files(root)
@@ -971,23 +997,24 @@ class Indexer:
                 if not path.is_file():
                     continue
 
-                if self._declared_unreadable(path):
-                    _count_unindexed(unindexed_exts, path)
-                    continue
-
-                lang = self._detect_language(path)
-                is_doc = False
-                if lang is None:
-                    lang = detect_document_language(path.suffix)
-                    is_doc = True
-                if lang is None:
-                    # git ls-files has already applied .gitignore, so this
-                    # branch indexes what git tracks. The ignore patterns
-                    # still decide what counts as a GAP: a tracked font or a
-                    # vendored tree is excluded on purpose, and reporting it
-                    # would leave the tally non-empty on every real repo —
-                    # burying the extensions that are genuinely missing.
-                    if not self._is_ignored(path, root):
+                # git ls-files has already applied .gitignore, so this branch
+                # indexes what git tracks. The ignore patterns still decide
+                # what counts as a GAP: a tracked font or a vendored tree is
+                # excluded on purpose, and reporting it would leave the tally
+                # non-empty on every real repo — burying the extensions that
+                # are genuinely missing.
+                skipped = self._declared_unreadable(path)
+                if not skipped:
+                    lang = self._detect_language(path)
+                    is_doc = False
+                    if lang is None:
+                        lang = detect_document_language(path.suffix)
+                        is_doc = True
+                    skipped = lang is None
+                if skipped:
+                    if (not _should_ignore(path, root, ignore_patterns)
+                            or self._ignored_only_by_its_own_extension(
+                                path, root, ignore_patterns)):
                         _count_unindexed(unindexed_exts, path)
                     continue
 
@@ -1009,8 +1036,11 @@ class Indexer:
             for path in sorted(root.rglob("*")):
                 if not path.is_file():
                     continue
-                if _should_ignore(path, root, self.config.ignore_patterns):
-                    if not self._is_ignored(path, root):
+                if _should_ignore(path, root, ignore_patterns):
+                    # Excluded on purpose — a gap only if the sole reason is
+                    # a pattern that is itself conditional on a missing
+                    # extractor.
+                    if self._ignored_only_by_its_own_extension(path, root, ignore_patterns):
                         _count_unindexed(unindexed_exts, path)
                     continue
 

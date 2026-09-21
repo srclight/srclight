@@ -171,3 +171,29 @@ def test_an_override_does_not_outrank_an_exact_filename_rule(tmp_path, db):
 
     row = db.conn.execute("SELECT language FROM files WHERE path = 'CMakeLists.txt'").fetchone()
     assert row["language"] == "cmake"
+
+
+def test_skip_does_not_outrank_an_exact_filename_rule(tmp_path, db):
+    """`--ext .txt=skip` must not drop every CMakeLists.txt from the index."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "CMakeLists.txt").write_text("project(shapes)\nadd_library(shapes shapes.c)\n")
+    (root / "notes.txt").write_text("nothing to parse\n")
+
+    Indexer(db, IndexConfig(root=root, extension_overrides={".txt": "skip"})).index()
+
+    paths = {r["path"] for r in db.conn.execute("SELECT path FROM files")}
+    assert "CMakeLists.txt" in paths
+    assert "notes.txt" not in paths
+
+
+def test_a_declaration_re_enables_an_extension_the_ignore_list_blocks(tmp_path, db):
+    """Declaring an extension must work the same with or without git."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "FindZlib.cmake").write_text("find_package(ZLIB)\nfunction(use_zlib)\nendfunction()\n")
+
+    Indexer(db, IndexConfig(root=root, extension_overrides={".cmake": "cmake"})).index()
+
+    paths = {r["path"] for r in db.conn.execute("SELECT path FROM files")}
+    assert "FindZlib.cmake" in paths

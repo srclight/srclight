@@ -258,3 +258,65 @@ def test_a_document_format_this_install_cannot_read_is_a_gap(tmp_path, db, monke
     Indexer(db, IndexConfig(root=root)).index()
 
     assert db.get_unindexed_extensions() == {".pdf": 1}
+
+
+def test_an_unreadable_document_inside_an_ignored_tree_is_not_a_gap(tmp_path, db, monkeypatch):
+    """The extractor exemption must not defeat directory-level exclusions."""
+    from srclight import extractors
+
+    monkeypatch.delitem(extractors.DOCUMENT_EXTENSIONS, ".pdf", raising=False)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    vendored = root / "third_party" / "zlib"
+    vendored.mkdir(parents=True)
+    (vendored / "manual.pdf").write_bytes(b"%PDF-1.4\n")
+    (root / "own.pdf").write_bytes(b"%PDF-1.4\n")
+
+    Indexer(db, IndexConfig(root=root)).index()
+
+    assert db.get_unindexed_extensions() == {".pdf": 1}
+
+
+def test_a_skipped_extension_inside_an_ignored_tree_is_not_a_gap(tmp_path, db):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    vendored = root / "third_party" / "zlib"
+    vendored.mkdir(parents=True)
+    (vendored / "table.inc").write_text("0, 1, 2\n")
+
+    Indexer(db, IndexConfig(root=root, extension_overrides={".inc": "skip"})).index()
+
+    assert db.get_unindexed_extensions() == {}
+
+
+def test_every_conditionally_ignored_format_has_a_pattern():
+    """The list claims these suffixes carry an ignore pattern. Check it.
+
+    An entry with no pattern is never reached through the ignore path and
+    only muddles the two reasons a document goes unread.
+    """
+    from srclight.extractors import CONDITIONALLY_IGNORED_DOCUMENT_EXTENSIONS
+    from srclight.indexer import DEFAULT_IGNORE
+
+    for ext in CONDITIONALLY_IGNORED_DOCUMENT_EXTENSIONS:
+        assert f"*{ext}" in DEFAULT_IGNORE, f"{ext} is listed but nothing ignores it"
+
+
+def test_no_readable_document_format_is_left_ignored():
+    """An installed extractor's format must not stay hidden behind a pattern.
+
+    Catches the drift the hand-maintained list invites: a new extractor
+    whose extension sits in DEFAULT_IGNORE, with nothing to lift it.
+    """
+    from srclight.extractors import (
+        CONDITIONALLY_IGNORED_DOCUMENT_EXTENSIONS,
+        DOCUMENT_EXTENSIONS,
+    )
+    from srclight.indexer import DEFAULT_IGNORE, IndexConfig, Indexer
+
+    db_patterns = Indexer(None, IndexConfig()).config.ignore_patterns
+    for ext in DOCUMENT_EXTENSIONS:
+        if f"*{ext}" in DEFAULT_IGNORE:
+            assert f"*{ext}" not in db_patterns or ext in CONDITIONALLY_IGNORED_DOCUMENT_EXTENSIONS

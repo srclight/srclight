@@ -73,3 +73,30 @@ def test_a_clean_git_repo_reports_no_gap_at_all(git_repo, db):
     Indexer(db, IndexConfig(root=git_repo)).index()
 
     assert db.get_unindexed_extensions() == {}
+
+
+def test_a_skipped_extension_inside_a_vendored_tree_is_not_a_gap(git_repo, db):
+    (git_repo / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    vendored = git_repo / "third_party" / "zlib"
+    vendored.mkdir(parents=True)
+    (vendored / "table.inc").write_text("0, 1, 2\n")
+    _git(git_repo, "add", "-A")
+
+    Indexer(db, IndexConfig(root=git_repo, extension_overrides={".inc": "skip"})).index()
+
+    assert db.get_unindexed_extensions() == {}
+
+
+def test_an_unreadable_document_in_a_vendored_tree_is_not_a_gap(git_repo, db, monkeypatch):
+    from srclight import extractors
+
+    monkeypatch.delitem(extractors.DOCUMENT_EXTENSIONS, ".pdf", raising=False)
+    (git_repo / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    vendored = git_repo / "third_party" / "zlib"
+    vendored.mkdir(parents=True)
+    (vendored / "manual.pdf").write_bytes(b"%PDF-1.4\n")
+    _git(git_repo, "add", "-A")
+
+    Indexer(db, IndexConfig(root=git_repo)).index()
+
+    assert db.get_unindexed_extensions() == {}
