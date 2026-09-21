@@ -1267,11 +1267,14 @@ def check_freshness(paths: list[str] | None = None, project: str | None = None) 
     )
 
 
-def _indexed_extensions() -> list[str]:
-    """Every extension an index can hold — source plus document formats."""
+def _indexed_extensions(db: Database | None = None) -> list[str]:
+    """Every extension this index reads — source, documents, and declared extras."""
     from .extractors import DOCUMENT_EXTENSIONS
     from .languages import code_extensions
-    return sorted(set(code_extensions()) | set(DOCUMENT_EXTENSIONS))
+    exts = set(code_extensions()) | set(DOCUMENT_EXTENSIONS)
+    if db is not None:
+        exts |= set(db.get_extension_overrides())
+    return sorted(exts)
 
 
 def _unindexed_warning(unindexed: dict[str, int]) -> dict[str, object]:
@@ -1327,7 +1330,7 @@ def index_status() -> str:
         "edges": stats["edges"],
         "db_size_mb": stats["db_size_mb"],
         "languages": stats["languages"],
-        "indexed_extensions": _indexed_extensions(),
+        "indexed_extensions": _indexed_extensions(db),
         # What the last run walked past, as {extension: file count}. Empty
         # means the run indexed everything it saw — the one case where a
         # result may be read as covering the whole tree.

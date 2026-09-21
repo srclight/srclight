@@ -1438,6 +1438,36 @@ class Database:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def set_extension_overrides(self, overrides: dict[str, str]) -> None:
+        """Record the extra extensions this index reads, as {extension: language}.
+
+        Stored with the index because the git hooks reindex with no flags: an
+        override that lived only in the command line would be lost on the
+        next commit, and the files would quietly drop back out.
+        """
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('extension_overrides', ?)",
+            (json.dumps(overrides, sort_keys=True),),
+        )
+        self.conn.commit()
+
+    def get_extension_overrides(self) -> dict[str, str]:
+        """The extra extensions this index reads. Empty when none were declared."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'extension_overrides'"
+        ).fetchone()
+        if row is None:
+            return {}
+        try:
+            data = json.loads(row["value"])
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items()}
+
     # --- Index State ---
 
     def get_index_state(self, repo_root: str) -> dict | None:

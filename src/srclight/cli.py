@@ -75,6 +75,37 @@ def main(verbose: bool):
     )
 
 
+def parse_extension_overrides(values: tuple[str, ...]) -> dict[str, str]:
+    """Turn `--ext EXT=LANGUAGE` values into {extension: language}.
+
+    The extension is normalised (`INC` and `.inc` are the same thing) and the
+    language must be one srclight parses, so a typo fails here rather than
+    leaving the files silently unread. The single value `none` clears a
+    declaration an index already holds.
+    """
+    from .languages import LANGUAGES
+
+    if len(values) == 1 and values[0].strip().lower() == "none":
+        return {}
+
+    overrides: dict[str, str] = {}
+    for value in values:
+        ext, sep, lang = value.partition("=")
+        ext, lang = ext.strip(), lang.strip().lower()
+        if not sep or not ext or not lang:
+            raise ValueError(f"Malformed --ext value '{value}': expected EXT=LANGUAGE")
+        if lang not in LANGUAGES:
+            raise ValueError(
+                f"Unknown language '{lang}' in --ext value '{value}': "
+                f"expected one of {', '.join(sorted(LANGUAGES))}"
+            )
+        ext = ext.lower()
+        if not ext.startswith("."):
+            ext = "." + ext
+        overrides[ext] = lang
+    return overrides
+
+
 @main.command()
 @click.argument("path", default=".", type=click.Path(exists=True))
 @click.option("--db", "db_path", type=click.Path(), help="Database path (default: .srclight/index.db)")
@@ -88,8 +119,12 @@ def main(verbose: bool):
 @click.option("--forget-embed-model", is_flag=True, default=False,
               help="Stop embedding this index for good: later runs, git hooks included, "
                    "leave embeddings alone until --embed is passed again.")
+@click.option("--ext", "ext_overrides", multiple=True, metavar="EXT=LANGUAGE",
+              help="Read an extra extension as the given language (e.g. --ext .inc=cpp). "
+                   "Repeatable. Recorded in the index, so later runs and the git hooks "
+                   "keep reading those files; pass --ext none to clear.")
 def index(path: str, db_path: str | None, embed_model: str | None, no_embed: bool,
-          forget_embed_model: bool):
+          forget_embed_model: bool, ext_overrides: tuple[str, ...]):
     """Index a codebase for AI-powered search."""
     from .db import Database
     from .indexer import EMBED_MODEL_ENV, IndexConfig, Indexer, resolve_embed_model
@@ -125,10 +160,22 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
             note += f"; --embed {embed_model} ignored"
         click.echo(note)
 
+    try:
+        declared = parse_extension_overrides(ext_overrides) if ext_overrides else None
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
     config = IndexConfig(
         root=root, embed_model=embed_model,
         disable_embeddings=no_embed or forget_embed_model,
+        extension_overrides=declared,
     )
+    if declared:
+        click.echo("Extra extensions: "
+                   + ", ".join(f"{e} -> {lang}" for e, lang in sorted(declared.items())))
+    elif declared == {}:
+        click.echo("Extra extensions: cleared")
     # Resolve once and pin the result: resolving again inside the indexer, after
     # the file pass, can disagree with what we printed here — a checkout that
     # drops every embedded file cascade-deletes its embeddings mid-run.

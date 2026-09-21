@@ -143,6 +143,10 @@ class IndexConfig:
     max_file_size: int = MAX_FILE_SIZE
     max_doc_file_size: int = 50_000_000  # 50 MB for documents (PDF, DOCX, etc.)
     languages: list[str] | None = None  # None = all supported
+    # Extra extensions to read, as {extension: language}. None leaves the
+    # index's stored declaration alone (the flag-less reindex the git hooks
+    # run); an empty dict clears it.
+    extension_overrides: dict[str, str] | None = None
     embed_model: str | None = None  # e.g. "qwen3-embedding", "voyage-code-3"
     disable_embeddings: bool = False  # --no-embed: index without touching embeddings
 
@@ -825,12 +829,34 @@ class Indexer:
         self.config = config or IndexConfig()
         self._parsers: dict[str, Parser] = {}
         self._queries: dict[str, Query] = {}
+        self._ext_overrides: dict[str, str] = {}
 
         # Remove ignore patterns for extensions that have active extractors
         active_exts = _active_doc_extensions()
         self.config.ignore_patterns = [
             p for p in self.config.ignore_patterns if p not in active_exts
         ]
+
+    def _resolve_extension_overrides(self) -> dict[str, str]:
+        """Pick the extra-extension map for this run and keep it with the index.
+
+        An explicit map — including an empty one, which clears — wins and is
+        recorded; otherwise the recorded one is used, so a reindex that
+        passes no flags reads the same files as the run that declared them.
+        """
+        declared = self.config.extension_overrides
+        if declared is None:
+            return self.db.get_extension_overrides()
+        overrides = {str(k): str(v) for k, v in declared.items()}
+        self.db.set_extension_overrides(overrides)
+        return overrides
+
+    def _detect_language(self, path: Path) -> str | None:
+        """Detect a file's language, honouring this index's declared extensions."""
+        override = self._ext_overrides.get(path.suffix.lower())
+        if override:
+            return override
+        return detect_language(path)
 
     def _get_parser(self, lang_name: str) -> Parser | None:
         if lang_name in self._parsers:
@@ -874,6 +900,8 @@ class Indexer:
 
         logger.info("Indexing %s", root)
 
+        self._ext_overrides = self._resolve_extension_overrides()
+
         # Try to use git ls-files for .gitignore-aware file listing
         git_files = _git_tracked_files(root)
         use_git = git_files is not None
@@ -891,7 +919,7 @@ class Indexer:
                 if not path.is_file():
                     continue
 
-                lang = detect_language(path)
+                lang = self._detect_language(path)
                 is_doc = False
                 if lang is None:
                     lang = detect_document_language(path.suffix)
@@ -920,7 +948,7 @@ class Indexer:
                 if _should_ignore(path, root, self.config.ignore_patterns):
                     continue
 
-                lang = detect_language(path)
+                lang = self._detect_language(path)
                 is_doc = False
                 if lang is None:
                     lang = detect_document_language(path.suffix)
@@ -961,7 +989,7 @@ class Indexer:
                     stats.files_unchanged += 1
                     continue
 
-                lang = detect_language(path)
+                lang = self._detect_language(path)
                 if lang is None:
                     lang = detect_document_language(path.suffix)
                 if lang is None:
