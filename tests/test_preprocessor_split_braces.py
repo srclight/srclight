@@ -381,6 +381,77 @@ int afterSpace() {
     assert parent is None
 
 
+SPLIT_THEN_SPLIT_CPP = """\
+void Panel_c::firstState() {
+    mFlags = 0;
+#if PLATFORM_DESKTOP
+    Prompt_c* prompt = findPrompt();
+    if (!isPanelVisible() || (prompt != NULL && prompt->isOpen())) {
+#else
+    if (!isPanelVisible() || findPrompt()->isOpen()) {
+#endif
+        mFlags |= 0x1;
+    } else if (isBusy()) {
+        mFlags |= 0x2;
+    }
+}
+
+void Panel_c::resetNeedle() {
+    clearGauge(1);
+}
+
+void Panel_c::updateState() {
+    mFlags = 0;
+#if PLATFORM_DESKTOP
+    Prompt_c* prompt = findPrompt();
+    if (!isPanelVisible() || (prompt != NULL && prompt->isOpen())) {
+#else
+    if (!isPanelVisible() || findPrompt()->isOpen()) {
+#endif
+        mFlags |= 0x1;
+    } else if (isBusy()) {
+        mFlags |= 0x2;
+    }
+    switch (readDisplayMode()) {
+    case 0:
+        break;
+    }
+}
+
+void Panel_c::moveNeedle() {
+    clearGauge(2);
+}
+
+void Panel_c::runLoop(int count) {
+    for (int i = 0; i < count; i++) {
+#if PLATFORM_DESKTOP
+        if (count > 2) {
+#else
+        if (count > 3) {
+#endif
+            clearGauge(i);
+        }
+    }
+}
+"""
+
+
+def test_splits_the_parse_reports_no_error_around(tmp_path, db):
+    """Several splits in one file can leave tree-sitter reading a lost
+    function as loose top-level fragments that carry no error flag, with the
+    error surfacing somewhere else entirely. Locating the damage from the
+    error flags then misses it, so the recovery must not depend on them."""
+    _index(tmp_path, db, {"panel.cpp": SPLIT_THEN_SPLIT_CPP})
+
+    assert _symbols(db, "panel.cpp") == [
+        ("Panel_c::firstState", 1, 13),
+        ("Panel_c::resetNeedle", 15, 17),
+        ("Panel_c::updateState", 19, 35),
+        ("Panel_c::moveNeedle", 37, 39),
+        ("Panel_c::runLoop", 41, 51),
+    ]
+
+
 def test_a_recovered_signature_has_no_blanked_gaps(tmp_path, db):
     _index(tmp_path, db, {"gauge.cpp": """\
 void Gauge_c::setMode(

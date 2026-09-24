@@ -779,33 +779,6 @@ def _first_branch_only(source: bytes) -> bytes:
     return bytes(out)
 
 
-def _conditional_error_ranges(root: Node, source: bytes) -> list[tuple[int, int]]:
-    """Byte ranges of the top-level definitions whose parse broke around a
-    conditional directive.
-
-    tree-sitter reports the split as an ERROR node, or — deeper in, say
-    inside a loop — as MISSING nodes in an otherwise ordinary tree. Either
-    way what runs on is the enclosing top-level definition, a whole
-    namespace included, so that is the range to repair. One split can also
-    break several top-level nodes in a row — a parameter list cut by #ifdef
-    leaves `void f(` on its own — so consecutive broken nodes form one
-    range. Any other error is left as it is.
-    """
-    runs: list[list[int]] = []
-    previous_broken = False
-    for child in root.children:
-        if child.has_error:
-            if previous_broken:
-                runs[-1][1] = child.end_byte
-            else:
-                runs.append([child.start_byte, child.end_byte])
-        previous_broken = child.has_error
-    ranges = [(s, e) for s, e in runs if _CONDITIONAL_RE.search(source, s, e)]
-    if not ranges and root.has_error and _CONDITIONAL_RE.search(source):
-        ranges.append((root.start_byte, root.end_byte))
-    return ranges
-
-
 def _kind_from_capture(capture_name: str) -> str:
     """Map tree-sitter capture names to symbol kinds."""
     prefix = capture_name.split(".")[0]
@@ -1305,68 +1278,71 @@ class Indexer:
         raw_symbols = collect(root)
 
         # A conditional that splits a brace across its branches breaks the
-        # parse, and the definitions caught in the ERROR node are lost or run
-        # on over the ones after them. Reparse with only the first branch of
-        # each conditional and add what that parse finds inside the broken
-        # ranges. It completes the original parse and never replaces it: the
-        # reparse sees one branch, so a variant in an #else — one definition
-        # per platform, an alternative macro — exists only in the original.
-        # A definition both parses find keeps the reparse's extent, which is
-        # the one the braces actually give. They are the same definition when
-        # they share kind, name and start — or kind, name and end: a header
-        # written once per branch over one shared body starts the original
-        # parse's symbol at the last header and the reparse's at the first.
-        # A different name is never the same definition. When the name
-        # itself differs per branch, both names are real and both are kept;
-        # and an original that ran on to the end of another definition must
-        # not be taken for it when the reparse cannot read it at all.
+        # parse: the definitions it catches are lost, cut short, or run on
+        # over the ones after them. Where the damage shows up is not reliable
+        # — an ERROR node, MISSING nodes, or loose top-level fragments that
+        # carry no error flag at all while the error surfaces elsewhere — so
+        # it is not located. The file is parsed a second time with only the
+        # first branch of each conditional, and a definition that second
+        # parse reads cleanly (no error inside its node) is trusted.
+        #
+        # It completes the original parse and never replaces it wholesale:
+        # the reparse sees one branch, so a variant in an #else — one
+        # definition per platform, an alternative macro — exists only in the
+        # original. A definition both parses find keeps the reparse's extent
+        # when the two differ, since that is the one the braces give. They
+        # are the same definition when they share kind, name and start — or
+        # kind, name and end: a header written once per branch over one
+        # shared body starts the two symbols on different lines. A different
+        # name is never the same definition. When the name itself differs per
+        # branch, both names are real and both are kept; and an original that
+        # ran on to the end of another definition must not be taken for it.
         recovered_nodes: set[int] = set()
         shared_bodies: dict[int, int] = {}  # id(def_node) -> end byte of the shared body
-        if lang in _PREPROCESSED_LANGS and root.has_error:
-            broken = _conditional_error_ranges(root, source)
-            if broken:
-                def in_broken(node: Node) -> bool:
-                    return any(s <= node.start_byte and node.end_byte <= e for s, e in broken)
+        if (lang in _PREPROCESSED_LANGS and root.has_error
+                and _CONDITIONAL_RE.search(source)):
+            recovery_tree = parser.parse(_first_branch_only(source))
+            recovered = [sym for sym in collect(recovery_tree.root_node)
+                         if not sym[0].has_error]
+            by_start = {(k, n, node.start_byte): i for i, (node, k, n) in enumerate(recovered)}
+            by_end = {(k, n, node.end_byte): i for i, (node, k, n) in enumerate(recovered)}
+            used: set[int] = set()
+            merged = []
+            for sym in raw_symbols:
+                node, kind, name = sym
+                for key, index in (((kind, name, node.start_byte), by_start),
+                                   ((kind, name, node.end_byte), by_end)):
+                    i = index.get(key)
+                    if i is not None and i not in used:
+                        used.add(i)
+                        twin = recovered[i][0]
+                        if (twin.start_byte, twin.end_byte) != (node.start_byte, node.end_byte):
+                            sym = recovered[i]
+                            recovered_nodes.add(id(twin))
+                        break
+                merged.append(sym)
+            added = [sym for i, sym in enumerate(recovered) if i not in used]
+            recovered_nodes.update(id(sym[0]) for sym in added)
+            raw_symbols = merged + added
 
-                recovery_tree = parser.parse(_first_branch_only(source))
-                recovered = [sym for sym in collect(recovery_tree.root_node)
-                             if in_broken(sym[0])]
-                by_start = {(k, n, node.start_byte): i for i, (node, k, n) in enumerate(recovered)}
-                by_end = {(k, n, node.end_byte): i for i, (node, k, n) in enumerate(recovered)}
-                used: set[int] = set()
-                merged = []
-                for sym in raw_symbols:
-                    node, kind, name = sym
-                    if in_broken(node):
-                        for key, index in (((kind, name, node.start_byte), by_start),
-                                           ((kind, name, node.end_byte), by_end)):
-                            i = index.get(key)
-                            if i is not None and i not in used:
-                                used.add(i)
-                                sym = recovered[i]
-                                break
-                    merged.append(sym)
-                merged += [sym for i, sym in enumerate(recovered) if i not in used]
-                recovered_nodes = {id(sym[0]) for sym in recovered}
-                raw_symbols = merged
-
-                # Symbols of one kind that end on the same byte of a broken
-                # range, under different names, name one body: the name
-                # differs per branch, or an original ran on to the end of
-                # another definition. Each one's text holds the other's name,
-                # which the edge builder must not read as a call — so mark
-                # them here, where it is known, rather than guess later.
-                bodies: dict[tuple[str, int], list[tuple[Node, str, str | None]]] = {}
-                for sym in raw_symbols:
-                    if in_broken(sym[0]):
-                        bodies.setdefault((sym[1], sym[0].end_byte), []).append(sym)
-                shared_bodies = {
-                    id(sym[0]): end for (_kind, end), group in bodies.items()
-                    if len({sym[2] for sym in group}) > 1 for sym in group
-                }
-                # Containers before what they contain: the second pass finds
-                # a parent among the symbols already inserted.
-                raw_symbols.sort(key=lambda sym: (sym[0].start_byte, -sym[0].end_byte))
+            # Symbols of one kind that end on the same byte under different
+            # names, one of them from the reparse, name one body: the name
+            # differs per branch, or an original ran on to the end of another
+            # definition. Each one's text holds the other's name, which the
+            # edge builder must not read as a call — so mark them here, where
+            # it is known, rather than guess later.
+            bodies: dict[tuple[str, int], list[tuple[Node, str, str | None]]] = {}
+            for sym in raw_symbols:
+                bodies.setdefault((sym[1], sym[0].end_byte), []).append(sym)
+            shared_bodies = {
+                id(sym[0]): end for (_kind, end), group in bodies.items()
+                if len({s[2] for s in group}) > 1
+                and any(id(s[0]) in recovered_nodes for s in group)
+                for sym in group
+            }
+            # Containers before what they contain: the second pass finds a
+            # parent among the symbols already inserted.
+            raw_symbols.sort(key=lambda sym: (sym[0].start_byte, -sym[0].end_byte))
 
         # Second pass: insert symbols and track parent-child relationships
         # Track container symbols (classes, structs, namespaces) by their byte ranges
