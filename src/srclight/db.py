@@ -669,17 +669,25 @@ class Database:
         qualified name stands for every symbol it names — by name or by
         qualified name — and their edges together are the method's. A bare
         name resolves as get_symbol_by_name does.
+
+        A qualified name also matches the end of a longer qualified name:
+        every qualified name carries the enclosing namespace, while the
+        definition's own name is only class-qualified, so `C::f` must reach
+        `ns::C::f`. The same class in two namespaces then answers for both,
+        which callers see through `matched_symbols`.
         """
         assert self.conn is not None
         if "::" not in name:
             sym = self.get_symbol_by_name(name)
             return [sym] if sym is not None else []
+        tail = "::" + name
         rows = self.conn.execute(
             """SELECT s.*, f.path as file_path FROM symbols s
                JOIN files f ON s.file_id = f.id
                WHERE s.name = ? OR s.qualified_name = ?
+                  OR substr(s.qualified_name, -?) = ?
                ORDER BY s.id""",
-            (name, name),
+            (name, name, len(tail), tail),
         ).fetchall()
         return [self._row_to_symbol(r) for r in rows]
 
@@ -1171,9 +1179,12 @@ class Database:
                 "confidence": 0.7,
             })
 
-        # Also check for explicit 'tests' edges if any exist
-        sym = self.get_symbol_by_name(symbol_name)
-        if sym and sym.id:
+        # Also check for explicit 'tests' edges if any exist — on every symbol
+        # the name stands for, as the other graph queries do.
+        seen = {r["symbol"].id for r in results if r["symbol"].id}
+        for sym in self.get_graph_symbols(symbol_name):
+            if not sym.id:
+                continue
             edge_rows = self.conn.execute(
                 """SELECT s.*, f.path as file_path, e.edge_type, e.confidence
                    FROM symbol_edges e
@@ -1183,10 +1194,10 @@ class Database:
                    ORDER BY s.name""",
                 (sym.id,),
             ).fetchall()
-            seen = {r["symbol"].id for r in results if r["symbol"].id}
             for r in edge_rows:
                 s = self._row_to_symbol(r)
                 if s.id not in seen:
+                    seen.add(s.id)
                     results.append({
                         "symbol": s,
                         "edge_type": r["edge_type"],

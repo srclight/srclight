@@ -846,6 +846,34 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
 # --- Tier 2: Graph tools ---
 
 
+def _union_edges(syms, fetch) -> list[dict]:
+    """The edges of every symbol a graph query resolved to, each one once.
+
+    Overloads and a declaration/definition pair share their callers: name
+    resolution links one call to each of them, and listing it once per
+    symbol would repeat the same location.
+    """
+    seen: set[tuple] = set()
+    edges: list[dict] = []
+    for sym in syms:
+        for edge in fetch(sym.id):
+            key = (edge["symbol"].id, edge["edge_type"])
+            if key not in seen:
+                seen.add(key)
+                edges.append(edge)
+    return edges
+
+
+def _matched_symbols(syms) -> dict:
+    """Name what a qualified name was resolved to, when it was more than one.
+
+    `C::f` reaches `ns::C::f` — and the same class in another namespace. The
+    merged answer is only honest if it says what it merged.
+    """
+    names = sorted({sym.qualified_name or sym.name for sym in syms})
+    return {"matched_symbols": names} if len(names) > 1 else {}
+
+
 def _dedup_edges(edges: list[dict]) -> list[dict]:
     """Deduplicate edges by symbol name, keeping the highest-confidence entry."""
     by_name: dict[str, dict] = {}
@@ -914,7 +942,7 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
         if not syms:
             db.close()
             return _symbol_not_found_error(symbol_name, project)
-        callers = [edge for sym in syms for edge in db.get_callers(sym.id)]
+        callers = _union_edges(syms, db.get_callers)
         result = _dedup_edges(callers)
         db.close()
         return json.dumps({
@@ -922,6 +950,7 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
             "symbol": symbol_name,
             "caller_count": len(result),
             "callers": result,
+            **_matched_symbols(syms),
         }, indent=2)
 
     db = _get_db()
@@ -931,10 +960,11 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
     if not syms:
         return _symbol_not_found_error(symbol_name)
 
-    callers = [edge for sym in syms for edge in db.get_callers(sym.id)]
+    callers = _union_edges(syms, db.get_callers)
     result = _dedup_edges(callers)
 
-    payload = {"symbol": symbol_name, "caller_count": len(result), "callers": result}
+    payload = {"symbol": symbol_name, "caller_count": len(result), "callers": result,
+               **_matched_symbols(syms)}
     # A stale caller file makes the whole edge list suspect — stamp the union.
     _stamp_freshness(payload, (c.get("file") or c.get("file_path")
                                for c in result if isinstance(c, dict)))
@@ -969,7 +999,7 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
         if not syms:
             db.close()
             return _symbol_not_found_error(symbol_name, project)
-        callees = [edge for sym in syms for edge in db.get_callees(sym.id)]
+        callees = _union_edges(syms, db.get_callees)
         result = _dedup_edges(callees)
         db.close()
         return json.dumps({
@@ -977,6 +1007,7 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
             "symbol": symbol_name,
             "callee_count": len(result),
             "callees": result,
+            **_matched_symbols(syms),
         }, indent=2)
 
     db = _get_db()
@@ -984,10 +1015,11 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
     if not syms:
         return _symbol_not_found_error(symbol_name)
 
-    callees = [edge for sym in syms for edge in db.get_callees(sym.id)]
+    callees = _union_edges(syms, db.get_callees)
     result = _dedup_edges(callees)
 
-    payload = {"symbol": symbol_name, "callee_count": len(result), "callees": result}
+    payload = {"symbol": symbol_name, "callee_count": len(result), "callees": result,
+               **_matched_symbols(syms)}
     _stamp_freshness(payload, (c.get("file") or c.get("file_path")
                                for c in result if isinstance(c, dict)))
     return json.dumps(payload, indent=2)
@@ -1144,18 +1176,19 @@ def get_dependents(symbol_name: str, transitive: bool = False, project: str | No
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        syms = db.get_graph_symbols(symbol_name)
+        if not syms:
             db.close()
             return _symbol_not_found_error(symbol_name, project)
-        deps = db.get_dependents(sym.id, transitive=transitive)
+        deps = _union_edges(syms, lambda i: db.get_dependents(i, transitive=transitive))
         db.close()
     else:
         db = _get_db()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        # The same symbols get_callers answers for, or the two disagree.
+        syms = db.get_graph_symbols(symbol_name)
+        if not syms:
             return _symbol_not_found_error(symbol_name)
-        deps = db.get_dependents(sym.id, transitive=transitive)
+        deps = _union_edges(syms, lambda i: db.get_dependents(i, transitive=transitive))
 
     result = _dedup_edges(deps)
     return json.dumps({
@@ -1163,6 +1196,7 @@ def get_dependents(symbol_name: str, transitive: bool = False, project: str | No
         "transitive": transitive,
         "dependent_count": len(result),
         "dependents": result,
+        **_matched_symbols(syms),
     }, indent=2)
 
 
@@ -2938,7 +2972,7 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
+        sym = _impact_symbol(db, symbol_name)
         if sym is None:
             db.close()
             return _symbol_not_found_error(symbol_name, project)
@@ -2955,7 +2989,7 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
         db.close()
     else:
         db = _get_db()
-        sym = db.get_symbol_by_name(symbol_name)
+        sym = _impact_symbol(db, symbol_name)
         if sym is None:
             return _symbol_not_found_error(symbol_name)
         communities = db.get_communities()
@@ -2972,6 +3006,21 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
         "project": project,
         **result,
     }, indent=2)
+
+
+def _impact_symbol(db: Database, symbol_name: str):
+    """The one symbol impact analysis runs on.
+
+    Of the symbols the name stands for (see Database.get_graph_symbols), the
+    most depended on: impact is about dependents, and calls land on a
+    method's declaration rather than on its definition. Picking the
+    definition made get_impact call a method with callers an untouched entry
+    point while get_callers listed them.
+    """
+    syms = db.get_graph_symbols(symbol_name)
+    if not syms:
+        return None
+    return max(syms, key=lambda sym: len(db.get_callers(sym.id)))
 
 
 def _reconstruct_flows(db: Database, stored_flows: list[dict]) -> list[dict]:

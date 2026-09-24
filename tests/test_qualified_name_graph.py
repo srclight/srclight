@@ -14,14 +14,14 @@ import pytest
 from srclight.db import Database
 from srclight.indexer import IndexConfig, Indexer
 
-PANEL_H = """\
+PANEL = {
+    "panel.h": """\
 class Panel_c {
 public:
     void moveNeedle();
 };
-"""
-
-PANEL_CPP = """\
+""",
+    "panel.cpp": """\
 #include "panel.h"
 
 void Panel_c::moveNeedle() {
@@ -34,45 +34,166 @@ void clearGauge() {
 void runPanel(Panel_c* panel) {
     panel->moveNeedle();
 }
-"""
+""",
+}
+
+# The same class name in two namespaces. Every qualified name carries the
+# namespace, while the definition's name is only class-qualified.
+KNOBS = {
+    "knobs.h": """\
+namespace alpha {
+class Knob_c {
+public:
+    void turnKnob();
+};
+}
+
+namespace beta {
+class Knob_c {
+public:
+    void turnKnob();
+};
+}
+""",
+    "knobs.cpp": """\
+#include "knobs.h"
+
+namespace alpha {
+void Knob_c::turnKnob() {
+    alphaWork();
+}
+}
+
+namespace beta {
+void Knob_c::turnKnob() {
+    betaWork();
+}
+}
+
+void alphaWork() {
+}
+
+void betaWork() {
+}
+
+void useAlpha(alpha::Knob_c* knob) {
+    knob->turnKnob();
+}
+""",
+}
+
+GADGET = {
+    "gadget.h": """\
+class Gadget_c {
+public:
+    void spinGadget();
+    void spinGadget(int turns);
+};
+""",
+    "gadget.cpp": """\
+#include "gadget.h"
+
+void Gadget_c::spinGadget() {
+    helperTick();
+}
+
+void Gadget_c::spinGadget(int turns) {
+    helperTick();
+}
+
+void helperTick() {
+}
+
+void driveGadget(Gadget_c* gadget) {
+    gadget->spinGadget();
+}
+""",
+}
 
 
 @pytest.fixture
-def served(tmp_path, monkeypatch):
+def serve(tmp_path, monkeypatch):
     from srclight import server as server_mod
 
-    root = tmp_path / "repo"
-    root.mkdir()
-    (root / "panel.h").write_text(PANEL_H)
-    (root / "panel.cpp").write_text(PANEL_CPP)
-    db_path = root / ".srclight" / "index.db"
-    db_path.parent.mkdir()
-    db = Database(db_path)
-    db.open()
-    db.initialize()
-    Indexer(db, IndexConfig(root=root)).index()
-    db.close()
+    def _serve(files: dict[str, str]):
+        root = tmp_path / "repo"
+        root.mkdir()
+        for name, text in files.items():
+            (root / name).write_text(text)
+        db_path = root / ".srclight" / "index.db"
+        db_path.parent.mkdir()
+        db = Database(db_path)
+        db.open()
+        db.initialize()
+        Indexer(db, IndexConfig(root=root)).index()
+        db.close()
+        # _get_db() walks up from the CWD — never let a test reach a real index.
+        monkeypatch.chdir(root)
+        monkeypatch.setattr(server_mod, "_workspace_name", None)
+        server_mod.configure(db_path=db_path, repo_root=root)
+        return server_mod
 
-    # _get_db() walks up from the CWD — never let a test reach a real index.
-    monkeypatch.chdir(root)
-    monkeypatch.setattr(server_mod, "_workspace_name", None)
-    server_mod.configure(db_path=db_path, repo_root=root)
-    yield server_mod
+    yield _serve
     server_mod._close_databases()
     server_mod.configure(db_path=None, repo_root=None)
 
 
+def _entries(payload: str, key: str) -> list[dict]:
+    return json.loads(payload).get(key, [])
+
+
 def _names(payload: str, key: str) -> set[str]:
-    return {entry["name"] for entry in json.loads(payload).get(key, [])}
+    return {entry["name"] for entry in _entries(payload, key)}
 
 
-def test_get_callers_finds_callers_by_the_qualified_name(served):
-    assert "runPanel" in _names(served.get_callers("Panel_c::moveNeedle"), "callers")
+def test_get_callers_finds_callers_by_the_qualified_name(serve):
+    server = serve(PANEL)
+    assert "runPanel" in _names(server.get_callers("Panel_c::moveNeedle"), "callers")
 
 
-def test_get_callees_still_finds_callees_by_the_qualified_name(served):
-    assert "clearGauge" in _names(served.get_callees("Panel_c::moveNeedle"), "callees")
+def test_get_callees_still_finds_callees_by_the_qualified_name(serve):
+    server = serve(PANEL)
+    assert "clearGauge" in _names(server.get_callees("Panel_c::moveNeedle"), "callees")
 
 
-def test_the_bare_name_keeps_resolving_as_before(served):
-    assert "runPanel" in _names(served.get_callers("moveNeedle"), "callers")
+def test_the_bare_name_keeps_resolving_as_before(serve):
+    server = serve(PANEL)
+    assert "runPanel" in _names(server.get_callers("moveNeedle"), "callers")
+
+
+def test_dependents_and_impact_agree_with_callers(serve):
+    """Every graph tool must answer for the same symbols, or get_impact
+    calls a method with a caller an untouched entry point."""
+    server = serve(PANEL)
+
+    assert "runPanel" in _names(server.get_dependents("Panel_c::moveNeedle"), "dependents")
+    impact = json.loads(server.get_impact("Panel_c::moveNeedle"))
+    assert impact["direct_dependents"] >= 1
+
+
+def test_a_class_qualified_name_reaches_a_method_inside_a_namespace(serve):
+    server = serve(KNOBS)
+    assert "useAlpha" in _names(server.get_callers("Knob_c::turnKnob"), "callers")
+
+
+def test_a_fully_qualified_name_keeps_to_its_namespace(serve):
+    server = serve(KNOBS)
+    callees = _names(server.get_callees("alpha::Knob_c::turnKnob"), "callees")
+    assert "alphaWork" in callees
+    assert "betaWork" not in callees
+
+
+def test_a_name_that_matches_several_methods_says_so(serve):
+    """`Knob_c::turnKnob` names a method in each namespace. Merging them is
+    the honest answer to an ambiguous name — provided the answer names what
+    it merged."""
+    server = serve(KNOBS)
+    payload = json.loads(server.get_callees("Knob_c::turnKnob"))
+    assert {"alpha::Knob_c::turnKnob", "beta::Knob_c::turnKnob"} <= set(payload["matched_symbols"])
+
+
+def test_overloads_do_not_list_a_location_twice(serve):
+    server = serve(GADGET)
+    for entry in _entries(server.get_callers("Gadget_c::spinGadget"), "callers"):
+        locations = entry.get("locations", [])
+        assert len(locations) == len({(loc["file"], loc["line"]) for loc in locations})
