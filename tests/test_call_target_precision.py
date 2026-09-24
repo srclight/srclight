@@ -1137,3 +1137,52 @@ void spin(short v) {
     ctor_callers = {a for a, b, _ in edges if b == "Angle::Angle"}
     assert "spin" in ctor_callers
     assert not ctor_callers & {"Cam_c::readAngle", "~Angle", "Angle::~Angle"}
+
+
+def test_a_variable_constructed_with_arguments_calls_the_constructor(tmp_path):
+    edges = _edges({"vec.h": """\
+class Vec_c {
+public:
+    Vec_c(float x, float y, float z) {}
+};
+""", "use/use.cpp": """\
+Vec_c handOffset() {
+    Vec_c hand(0.0f, 1.0f, 2.0f);
+    Vec_c braced{0.0f, 1.0f, 2.0f};
+    return hand;
+}
+
+Vec_c copyOnly(const Vec_c& v) {
+    return v;
+}
+"""}, tmp_path)
+    ctor_callers = {a for a, b, _ in edges if b == "Vec_c::Vec_c"}
+    assert "handOffset" in ctor_callers
+    assert "copyOnly" not in ctor_callers
+
+
+def test_an_inline_destructor_names_nothing(tmp_path):
+    edges = _edges({"cap.cpp": """\
+class Capture_c {
+public:
+    Capture_c() {}
+    virtual ~Capture_c() {}
+};
+"""}, tmp_path)
+    assert not any(a in ("~Capture_c", "Capture_c::~Capture_c") for a, _, _ in edges)
+
+
+def test_a_macro_after_a_declarator_is_no_function_to_call(tmp_path):
+    edges = _edges({"cfg.h": """\
+#define WHEN_EXT(x) x
+""", "heap.cpp": """\
+#include "cfg.h"
+void* operator new(unsigned long n) WHEN_EXT(noexcept) {
+    return 0;
+}
+
+void release() {
+    WHEN_EXT(freeAll());
+}
+"""}, tmp_path)
+    assert not any(a == "release" and b == "WHEN_EXT" for a, b, _ in edges)

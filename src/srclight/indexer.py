@@ -896,9 +896,14 @@ def _reference_forms_all(content: str, names: set[str],
         if arities is not None:
             # The argument count of each call; None where the name is not
             # called there (a function pointer, a declaration).
+            declared = _CONSTRUCTED_VAR_RE.match(ahead)
             if after.startswith("("):
                 arities.setdefault(name, set()).add(
                     _call_arity(content, m.end() + len(ahead) - len(ahead.lstrip())))
+            elif declared and declared.group(1) not in _NOT_A_TYPE and not before.endswith(
+                    ("->", ".", "::")):
+                # `T x(args)` and `T x{args}` construct a T.
+                arities.setdefault(name, set()).add(_call_arity(content, m.end() + declared.end() - 1))
             elif (after[:1] in (",", ")", ";", "}", "]")
                   or (after.startswith("=") and not after.startswith("=="))
                   or before.endswith(("&", "=", "return"))):
@@ -934,6 +939,10 @@ def _reference_forms_all(content: str, names: set[str],
         else:
             forms.add("bare")
     return found
+
+
+# After a type's name: a variable constructed with arguments, `a(1, 2)` or `a{1}`.
+_CONSTRUCTED_VAR_RE = re.compile(r"\s+([A-Za-z_]\w*)\s*[({]")
 
 
 def _reference_forms(content: str, name: str) -> tuple[set[str], set[str]]:
@@ -1906,6 +1915,17 @@ class Indexer:
         # defined or declared in its class has no symbol named that way, so it
         # is listed under it; otherwise the text would read as the class
         # `Stack_c` and a separate `get`.
+        # A function-like macro written after a declarator, `f() MACRO(x) {`,
+        # can be read as the function's name: that "function" is the macro.
+        macro_names = {name for name, syms in name_to_symbols.items()
+                       if any(s["kind"] == "macro" for s in syms)}
+
+        def _macro_misread(t: dict) -> bool:
+            return (t["kind"] in ("function", "method", "prototype")
+                    and t.get("qualified", "").rsplit("::", 1)[-1] in macro_names
+                    and (t.get("signature") or "").lstrip().startswith(
+                        t.get("qualified", "").rsplit("::", 1)[-1] + "("))
+
         member_aliases: set[str] = set()
         for name, syms in name_to_symbols.items():
             for sym in syms:
@@ -2051,13 +2071,19 @@ class Indexer:
                     source_scope = unqualified.rsplit("::", 1)[0]
                 # An out-of-line definition opens with its own name, `C::f`:
                 # that is no call to the declaration `f`.
-                # A destructor's own name, `~C()`, is no call to `C` either.
-                # The name is overwritten with an identifier, not blanked: the
-                # return type before it, `C C::f(`, must not read as `C(`.
-                own_blanked = (re.sub(
-                    rf"(?<![\w:]){re.escape(source_name)}(?![\w])",
-                    "_" * len(source_name), content, count=1)
-                    if "::" in source_name or source_name.startswith("~") else content)
+                # A definition opens with its own name — `C::f`, or `f` and
+                # `~C` inside a class — which is no call. It is overwritten
+                # with a character no name holds: blanked, the return type
+                # before it, `C C::f(`, would read as `C(`; as an identifier,
+                # as a variable `C x(` constructed.
+                own_blanked = content
+                short_own = source_name.rsplit("::", 1)[-1]
+                for own in dict.fromkeys((source_name, short_own)):
+                    found = re.search(rf"(?<![\w:]){re.escape(own)}(?![\w])", own_blanked)
+                    if found:
+                        own_blanked = (own_blanked[:found.start()] + "#" * len(own)
+                                       + own_blanked[found.end():])
+                        break
                 receivers_of: dict[str, set] = {}
                 forms_of = _reference_forms_all(
                     own_blanked, {n for n in referenced_names if "::" not in n},
@@ -2095,7 +2121,8 @@ class Indexer:
                                (any(a is not None for a in arities_of.get(ref_name, ()))
                                 and t["kind"] in ("method", "prototype", "function", "template"))
                                if _is_constructor(t, ref_name)
-                               else t["kind"] in _EDGE_TARGET_KINDS)]
+                               else t["kind"] in _EDGE_TARGET_KINDS)
+                           and not _macro_misread(t)]
                 decided = None
                 if c_family and targets:
                     forms, qualifiers = forms_of.get(ref_name, (set(), set()))
