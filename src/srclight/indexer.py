@@ -779,6 +779,35 @@ def _first_branch_only(source: bytes) -> bytes:
     return bytes(out)
 
 
+def _extent_is_sound(node: Node) -> bool:
+    """Whether a definition from the #if/#else reparse can be trusted for its
+    extent.
+
+    A node without errors can. A long function nearly always holds something
+    tree-sitter cannot read — a call through a pointer to member function, a
+    macro — and such an error is local: it does not move the braces. So a
+    node with errors is trusted too, as long as it ends on a real closing
+    token, no closing brace inside it had to be made up, and no definition is
+    nested in its errors — the signs of braces that do not balance.
+    """
+    if not node.has_error:
+        return True
+    last = node
+    while last.child_count:
+        last = last.children[-1]
+    if last.is_missing or last.type not in ("}", ";"):
+        return False
+    stack = [child for child in node.children if child.has_error]
+    while stack:
+        child = stack.pop()
+        if child.type == "function_definition" or (child.is_missing and child.type == "}"):
+            return False
+        stack.extend(grandchild for grandchild in child.children
+                     if grandchild.has_error or grandchild.is_missing
+                     or grandchild.type == "function_definition")
+    return True
+
+
 def _kind_from_capture(capture_name: str) -> str:
     """Map tree-sitter capture names to symbol kinds."""
     prefix = capture_name.split(".")[0]
@@ -1283,8 +1312,8 @@ class Indexer:
         # — an ERROR node, MISSING nodes, or loose top-level fragments that
         # carry no error flag at all while the error surfaces elsewhere — so
         # it is not located. The file is parsed a second time with only the
-        # first branch of each conditional, and a definition that second
-        # parse reads cleanly (no error inside its node) is trusted.
+        # first branch of each conditional, and a definition whose extent
+        # that second parse reads soundly is trusted (see _extent_is_sound).
         #
         # It completes the original parse and never replaces it wholesale:
         # the reparse sees one branch, so a variant in an #else — one
@@ -1303,7 +1332,7 @@ class Indexer:
                 and _CONDITIONAL_RE.search(source)):
             recovery_tree = parser.parse(_first_branch_only(source))
             recovered = [sym for sym in collect(recovery_tree.root_node)
-                         if not sym[0].has_error]
+                         if _extent_is_sound(sym[0])]
             by_start = {(k, n, node.start_byte): i for i, (node, k, n) in enumerate(recovered)}
             by_end = {(k, n, node.end_byte): i for i, (node, k, n) in enumerate(recovered)}
             used: set[int] = set()

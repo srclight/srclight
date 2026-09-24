@@ -452,6 +452,19 @@ def test_splits_the_parse_reports_no_error_around(tmp_path, db):
     ]
 
 
+def test_a_recovered_function_with_an_unrelated_parse_error_inside(tmp_path, db):
+    """A long function nearly always holds something tree-sitter cannot read
+    — here a call through a pointer to member function. That error is local:
+    the braces still close where they should, so the recovered definition
+    must not be refused for it."""
+    _index(tmp_path, db, {"panel.cpp": SPLIT_THEN_SPLIT_CPP.replace(
+        "    switch (readDisplayMode()) {",
+        "    (this->*mHandler)();\n    switch (readDisplayMode()) {",
+    )})
+
+    assert ("Panel_c::updateState", 19, 36) in _symbols(db, "panel.cpp")
+
+
 def test_a_recovered_signature_has_no_blanked_gaps(tmp_path, db):
     _index(tmp_path, db, {"gauge.cpp": """\
 void Gauge_c::setMode(
