@@ -905,6 +905,85 @@ def _extent_is_sound(node: Node) -> bool:
     return True
 
 
+# Words a C or C++ symbol can never be named. Error recovery can still hand
+# one to the extractor: `if (a == b) { ... }` cut off from its chain reads as
+# a function `if` taking `(a == b)`. C++ reserves more than C, where `new`,
+# `delete` or `class` are ordinary identifiers.
+_C_KEYWORDS = frozenset({
+    "auto", "break", "case", "char", "const", "continue", "default", "do",
+    "double", "else", "enum", "extern", "float", "for", "goto", "if", "inline",
+    "int", "long", "register", "restrict", "return", "short", "signed",
+    "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned",
+    "void", "volatile", "while", "_Alignas", "_Alignof", "_Atomic", "_Bool",
+    "_Complex", "_Generic", "_Imaginary", "_Noreturn", "_Static_assert",
+    "_Thread_local",
+})
+_CPP_KEYWORDS = _C_KEYWORDS | frozenset({
+    "alignas", "alignof", "and", "and_eq", "asm", "bitand", "bitor", "bool",
+    "catch", "char8_t", "char16_t", "char32_t", "class", "co_await",
+    "co_return", "co_yield", "compl", "concept", "const_cast", "consteval",
+    "constexpr", "constinit", "decltype", "delete", "dynamic_cast", "explicit",
+    "export", "false", "friend", "mutable", "namespace", "new", "noexcept",
+    "not", "not_eq", "nullptr", "operator", "or", "or_eq", "private",
+    "protected", "public", "reinterpret_cast", "requires", "static_assert",
+    "static_cast", "template", "this", "thread_local", "throw", "true", "try",
+    "typeid", "typename", "using", "virtual", "wchar_t", "xor", "xor_eq",
+})
+_RESERVED_NAMES = {"c": _C_KEYWORDS, "cpp": _CPP_KEYWORDS}
+
+
+_AFTER_PARAMS_WORDS = frozenset({
+    "const", "volatile", "override", "final", "noexcept", "throw", "try", "requires",
+    "mutable", "__attribute__",
+})
+
+
+def _macro_typed_declaration(def_node: Node, name: str) -> bool:
+    """Whether a "function" is a variable declared with a macro as its type:
+    no return type before the name, and after the parentheses another name
+    closed by `;`, `=`, `,` or `[` — `MACRO(f32, s16) mField;`."""
+    if def_node.child_by_field_name("type") is not None:
+        return False
+    text = def_node.text.decode("utf-8", errors="replace")
+    m = re.match(
+        rf"\s*(?:(?:static|extern|inline|const|volatile)\s+)*{re.escape(name)}\s*\(",
+        text)
+    if m is None:
+        return False
+    depth, i = 1, m.end()
+    while i < len(text) and depth:
+        depth += {"(": 1, ")": -1}.get(text[i], 0)
+        i += 1
+    rest = text[i:]
+    if not rest.strip() and def_node.parent is not None:
+        # In a class body the parser may end the node at the parenthesis
+        # and leave the field's name to what follows.
+        parent = def_node.parent
+        rest = parent.text[def_node.end_byte - parent.start_byte:][:200].decode(
+            "utf-8", errors="replace")
+    after = re.match(r"\s*([A-Za-z_]\w*)\s*[;=,\[]", rest)
+    return after is not None and after.group(1) not in _AFTER_PARAMS_WORDS
+
+
+def _function_inside_a_function(node: Node, kind: str) -> bool:
+    """Whether a definition is a function read inside another function's
+    body, where C and C++ allow none: error recovery's work.
+
+    Only functions: a struct or an enum local to a function is legal C,
+    whatever its name. And nothing about errors: an export macro before a
+    real C function, or a stray token in an enum, puts an error in the C++
+    parse of perfectly real code.
+    """
+    if kind not in ("function", "method"):
+        return False
+    parent = node.parent
+    while parent is not None:
+        if parent.type == "compound_statement":
+            return True
+        parent = parent.parent
+    return False
+
+
 def _kind_from_capture(capture_name: str) -> str:
     """Map tree-sitter capture names to symbol kinds."""
     prefix = capture_name.split(".")[0]
@@ -1509,6 +1588,24 @@ class Indexer:
                     continue
 
                 if lang == "lua" and _lua_nameless_definition(def_node):
+                    continue
+
+                # A keyword-named definition is error recovery's work — a statement
+                # read as a definition — except for a macro, which may legally
+                # redefine a keyword. A C keyword names nothing in either language
+                # and is always dropped. A word only C++ reserves (`new`, `class`)
+                # is a valid C name, and C headers are often read as C++: it is
+                # dropped only as a function read inside another function's body
+                # (the `catch` of a try chain cut by #if).
+                if kind != "macro" and symbol_name in _RESERVED_NAMES.get(lang, ()) and (
+                        symbol_name in _C_KEYWORDS
+                        or _function_inside_a_function(def_node, kind)):
+                    continue
+
+                # `MACRO_TYPE(f32, s16) mField;` declares a variable whose type a
+                # macro spells; the parser reads the macro as a function.
+                if (lang in ("c", "cpp") and kind in ("function", "prototype")
+                        and symbol_name and _macro_typed_declaration(def_node, symbol_name)):
                     continue
 
                 found.append((def_node, kind, symbol_name))
