@@ -97,6 +97,88 @@ def test_a_class_still_references_the_types_of_its_members(panel_repo, db):
     assert "Renderer_c" in _callees(db, "Panel_c")
 
 
+def test_a_class_template_does_not_call_the_methods_it_declares(tmp_path, db):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "panel.h").write_text(
+        PANEL_H.replace("class Panel_c {", "template <typename T>\nclass Panel_c {")
+    )
+    (root / "panel.cpp").write_text(PANEL_CPP)
+
+    Indexer(db, IndexConfig(root=root)).index()
+
+    callees = _callees(db, "Panel_c")
+    assert "refreshLayout" not in callees
+    assert "computeMargins" not in callees
+
+
+def test_a_trait_does_not_repeat_the_calls_of_its_default_methods(tmp_path, db):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "shapes.rs").write_text("""\
+trait Drawable {
+    fn paint_all(&self) {
+        self.stroke_edges();
+    }
+
+    fn stroke_edges(&self) {
+        fill_region();
+    }
+}
+
+fn fill_region() {
+}
+""")
+
+    Indexer(db, IndexConfig(root=root)).index()
+
+    assert "fill_region" in _callees(db, "stroke_edges")
+    assert _callees(db, "Drawable") == set()
+
+
+def test_no_symbol_a_swift_class_yields_calls_its_methods(tmp_path, db):
+    """The Swift query reads each class declaration as a class, a struct and
+    an enum at once. Every one of those twins holds the methods."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "Panel.swift").write_text("""\
+class Panel {
+    func refreshLayout() {
+        computeMargins()
+    }
+
+    func computeMargins() {
+    }
+}
+""")
+
+    Indexer(db, IndexConfig(root=root)).index()
+
+    assert "computeMargins" in _callees(db, "refreshLayout")
+    assert _callees(db, "Panel") == set()
+
+
+def test_a_function_keeps_the_calls_of_a_function_nested_in_it(tmp_path, db):
+    """Only callables keep their whole body: an outer function does call
+    what the function it defines calls, and that edge must stay."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "jobs.py").write_text("""\
+def schedule_jobs():
+    def run_batch():
+        flush_queue()
+    return run_batch
+
+
+def flush_queue():
+    return 1
+""")
+
+    Indexer(db, IndexConfig(root=root)).index()
+
+    assert "flush_queue" in _callees(db, "schedule_jobs")
+
+
 def test_a_namespace_does_not_repeat_the_calls_of_its_functions(tmp_path, db):
     root = tmp_path / "repo"
     root.mkdir()

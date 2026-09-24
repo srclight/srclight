@@ -6,6 +6,7 @@ Incremental: only re-indexes files whose content hash has changed.
 
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import hashlib
 import json
@@ -651,19 +652,20 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
     return match
 
 
-# Symbols whose body holds other symbols. The extractor hangs members off
-# them, and the edge builder scans only the lines they own: their members are
-# scanned as symbols of their own.
-_CONTAINER_KINDS = frozenset({"class", "struct", "namespace", "impl", "module"})
+# The only symbols whose whole body is scanned for references. A function
+# does call what a function nested in it calls; anything else — a class, a
+# trait, a template, a namespace, in whatever language names them — only
+# holds its members, which are scanned as symbols of their own.
+_CALLABLE_KINDS = frozenset({"function", "method"})
 
 
 def _own_text(content: str, start_line: int, end_line: int,
               spans: Iterable[tuple[int, int]]) -> str:
-    """Blank the lines of a container's `content` that its members occupy.
+    """Blank the lines of `content` that symbols nested in it occupy.
 
     `content` starts on `start_line`, so its line i is file line
-    start_line + i. A span identical to the container's own is not a member:
-    a template and the class it wraps cover the same lines.
+    start_line + i. A span identical to the symbol's own is not nested in
+    it: a template and the class it wraps cover the same lines.
     """
     lines = content.split("\n")
     for start, end in spans:
@@ -1173,6 +1175,7 @@ class Indexer:
 
         # Second pass: insert symbols and track parent-child relationships
         # Track container symbols (classes, structs, namespaces) by their byte ranges
+        container_kinds = {"class", "struct", "namespace", "impl", "module"}
         # Map (start_byte, end_byte) -> symbol_id for containers
         inserted: list[tuple[int, int, int, str | None]] = []  # (start, end, sym_id, kind)
         count = 0
@@ -1189,7 +1192,7 @@ class Indexer:
             parent_id = None
             best_span = float("inf")
             for c_start, c_end, c_id, c_kind in inserted:
-                if c_kind not in _CONTAINER_KINDS:
+                if c_kind not in container_kinds:
                     continue
                 if c_start < def_node.start_byte and def_node.end_byte <= c_end:
                     span = c_end - c_start
@@ -1488,13 +1491,24 @@ class Indexer:
         # A container's body overlaps its members' bodies. Scanned whole, it
         # re-reports every call they make and "calls" each method it declares:
         # a class of a few thousand lines yields thousands of edges, nearly all
-        # noise. The members are scanned on their own, so the container keeps
-        # only the lines it owns — its bases, its fields' types.
+        # noise. The members are scanned on their own, so anything that is not
+        # a callable keeps only the lines it owns — its bases, its fields'
+        # types. Spans are sorted by first line, so the ones a symbol may hold
+        # are found by bisection rather than by walking the whole file.
         spans_by_file: dict[int, list[tuple[int, int]]] = {}
         for row in content_rows:
             spans_by_file.setdefault(row["file_id"], []).append(
                 (row["start_line"], row["end_line"])
             )
+        for spans in spans_by_file.values():
+            spans.sort()
+        span_starts = {fid: [s for s, _ in spans] for fid, spans in spans_by_file.items()}
+
+        def _nested_spans(file_id: int, start_line: int, end_line: int) -> list[tuple[int, int]]:
+            spans = spans_by_file.get(file_id, [])
+            starts = span_starts.get(file_id, [])
+            return spans[bisect.bisect_left(starts, start_line):
+                         bisect.bisect_right(starts, end_line)]
 
         from .imports import extract_imports
         from .refmask import mask_noncode
@@ -1553,9 +1567,11 @@ class Indexer:
             # Mask comments/strings BEFORE scanning: a name that appears only in
             # prose is not a reference (12.8% of sampled edges were this class).
             content = mask_noncode(row["content"], row["language"] or "")
-            if row["kind"] in _CONTAINER_KINDS:
-                content = _own_text(content, row["start_line"], row["end_line"],
-                                    spans_by_file.get(row["file_id"], ()))
+            if row["kind"] not in _CALLABLE_KINDS:
+                content = _own_text(
+                    content, row["start_line"], row["end_line"],
+                    _nested_spans(row["file_id"], row["start_line"], row["end_line"]),
+                )
 
             referenced_names = match_names(content)
             referenced_names.discard(source_name)
