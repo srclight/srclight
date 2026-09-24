@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
@@ -651,6 +651,28 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
     return match
 
 
+# Symbols whose body holds other symbols. The extractor hangs members off
+# them, and the edge builder scans only the lines they own: their members are
+# scanned as symbols of their own.
+_CONTAINER_KINDS = frozenset({"class", "struct", "namespace", "impl", "module"})
+
+
+def _own_text(content: str, start_line: int, end_line: int,
+              spans: Iterable[tuple[int, int]]) -> str:
+    """Blank the lines of a container's `content` that its members occupy.
+
+    `content` starts on `start_line`, so its line i is file line
+    start_line + i. A span identical to the container's own is not a member:
+    a template and the class it wraps cover the same lines.
+    """
+    lines = content.split("\n")
+    for start, end in spans:
+        if start_line <= start and end <= end_line and (start, end) != (start_line, end_line):
+            for i in range(max(0, start - start_line), min(len(lines), end - start_line + 1)):
+                lines[i] = ""
+    return "\n".join(lines)
+
+
 def _kind_from_capture(capture_name: str) -> str:
     """Map tree-sitter capture names to symbol kinds."""
     prefix = capture_name.split(".")[0]
@@ -1151,7 +1173,6 @@ class Indexer:
 
         # Second pass: insert symbols and track parent-child relationships
         # Track container symbols (classes, structs, namespaces) by their byte ranges
-        container_kinds = {"class", "struct", "namespace", "impl", "module"}
         # Map (start_byte, end_byte) -> symbol_id for containers
         inserted: list[tuple[int, int, int, str | None]] = []  # (start, end, sym_id, kind)
         count = 0
@@ -1168,7 +1189,7 @@ class Indexer:
             parent_id = None
             best_span = float("inf")
             for c_start, c_end, c_id, c_kind in inserted:
-                if c_kind not in container_kinds:
+                if c_kind not in _CONTAINER_KINDS:
                     continue
                 if c_start < def_node.start_byte and def_node.end_byte <= c_end:
                     span = c_end - c_start
@@ -1450,17 +1471,30 @@ class Indexer:
                 return 0.7
             return 0.5
 
-        # Scan each symbol's content for references
+        # Scan each symbol's content for references. Every reference is kept:
+        # a per-symbol cap once dropped calls from long functions, in whatever
+        # order the name set happened to iterate, so two runs disagreed.
         edge_count = 0
-        MAX_REFS_PER_SYMBOL = 30
 
         content_rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.content, f.path as file_path, f.language
+            f"""SELECT s.id, s.name, s.kind, s.content, s.file_id, s.start_line,
+                      s.end_line, f.path as file_path, f.language
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
         ).fetchall()
+
+        # A container's body overlaps its members' bodies. Scanned whole, it
+        # re-reports every call they make and "calls" each method it declares:
+        # a class of a few thousand lines yields thousands of edges, nearly all
+        # noise. The members are scanned on their own, so the container keeps
+        # only the lines it owns — its bases, its fields' types.
+        spans_by_file: dict[int, list[tuple[int, int]]] = {}
+        for row in content_rows:
+            spans_by_file.setdefault(row["file_id"], []).append(
+                (row["start_line"], row["end_line"])
+            )
 
         from .imports import extract_imports
         from .refmask import mask_noncode
@@ -1519,15 +1553,15 @@ class Indexer:
             # Mask comments/strings BEFORE scanning: a name that appears only in
             # prose is not a reference (12.8% of sampled edges were this class).
             content = mask_noncode(row["content"], row["language"] or "")
+            if row["kind"] in _CONTAINER_KINDS:
+                content = _own_text(content, row["start_line"], row["end_line"],
+                                    spans_by_file.get(row["file_id"], ()))
 
             referenced_names = match_names(content)
             referenced_names.discard(source_name)
 
             imported = _imports_for(source_file, row["language"])
-            refs_for_this = 0
             for ref_name in referenced_names:
-                if refs_for_this >= MAX_REFS_PER_SYMBOL:
-                    break
                 targets = [t for t in filtered_names.get(ref_name, [])
                            if t["id"] != source_id and t["kind"] in EDGE_TARGET_KINDS]
                 if not targets:
@@ -1546,7 +1580,6 @@ class Indexer:
                         resolution=resolution,
                     ))
                     edge_count += 1
-                    refs_for_this += 1
 
         return edge_count
 
