@@ -1158,11 +1158,14 @@ class Indexer:
                 )
                 file_id = self.db.upsert_file(file_rec)
 
-                # Clear old symbols for this file
+                # Clear old symbols for this file, keeping the embeddings of
+                # those that come back unchanged
+                kept_embeddings = self.db.take_embeddings_for_file(file_id)
                 self.db.delete_symbols_for_file(file_id)
 
                 # Parse and extract symbols
                 n_symbols = self._extract_symbols(file_id, rel_path, raw, lang)
+                self.db.restore_embeddings_for_file(file_id, kept_embeddings)
                 stats.symbols_extracted += n_symbols
                 stats.files_indexed += 1
 

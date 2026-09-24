@@ -646,6 +646,59 @@ class Database:
                 f"DELETE FROM {table} WHERE rowid = ?", (symbol_id,)
             )
 
+    def take_embeddings_for_file(self, file_id: int) -> dict[str, list[tuple]]:
+        """The embeddings of a file's symbols, keyed by the text they embed.
+
+        Reparsing a file deletes its symbols, and their embeddings go with
+        them. A symbol that comes back with the same text to embed — name,
+        signature, documentation, content — has the same embedding; kept
+        here, it is given back instead of computed again.
+        """
+        from .embeddings import prepare_embedding_text
+
+        assert self.conn is not None
+        kept: dict[str, list[tuple]] = {}
+        for row in self.conn.execute(
+                """SELECT s.name, s.qualified_name, s.signature, s.doc_comment, s.content,
+                          e.model, e.dimensions, e.embedding, e.body_hash
+                   FROM symbols s JOIN symbol_embeddings e ON e.symbol_id = s.id
+                   WHERE s.file_id = ?""", (file_id,)):
+            text = prepare_embedding_text(dict(row))
+            kept.setdefault(text, []).append(
+                (row["model"], row["dimensions"], row["embedding"], row["body_hash"]))
+        return kept
+
+    def restore_embeddings_for_file(self, file_id: int, kept: dict[str, list[tuple]]) -> int:
+        """Give a reparsed file's symbols the embeddings of the symbols they
+        were, where the text to embed is unchanged. Returns how many."""
+        from .embeddings import prepare_embedding_text
+
+        assert self.conn is not None
+        if not kept:
+            return 0
+        restored = 0
+        rows = self.conn.execute(
+            """SELECT id, name, qualified_name, signature, doc_comment, content, body_hash
+               FROM symbols WHERE file_id = ?""", (file_id,)).fetchall()
+        for row in rows:
+            waiting = kept.get(prepare_embedding_text(dict(row)))
+            if not waiting:
+                continue
+            model, dimensions, embedding, _old_hash = waiting.pop()
+            self.conn.execute(
+                """INSERT OR REPLACE INTO symbol_embeddings
+                   (symbol_id, model, dimensions, embedding, body_hash)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (row["id"], model, dimensions, embedding, row["body_hash"]))
+            restored += 1
+        if restored:
+            # Symbol ids changed: a vector cache keyed on them must reload.
+            self.conn.execute(
+                """INSERT INTO schema_info (key, value) VALUES ('embedding_cache_version', '1')
+                   ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)""",
+            )
+        return restored
+
     def delete_symbols_for_file(self, file_id: int) -> None:
         """Delete all symbols for a file (edges, FTS entries, then symbols)."""
         assert self.conn is not None
