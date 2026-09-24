@@ -702,3 +702,69 @@ int useStack() {
 }
 """}, tmp_path)
     assert {("useStack", "Stack_c::copy"), ("useStack", "Stack_c::get")} <= _pairs(edges)
+
+
+def test_a_member_call_split_over_lines_or_through_a_pointer_is_kept(tmp_path):
+    edges = _edges({"irq.c": """\
+struct ops { void (*handleIrq)(int); };
+
+void handleIrq(int v) {
+}
+
+#define CALL(f) f(1)
+
+void viaSpace(struct ops *o) {
+    o->handleIrq
+            (2);
+}
+
+void viaDeref(struct ops *o) {
+    (*o->handleIrq)(1);
+}
+
+void viaMacro(struct ops *o) {
+    CALL(o->handleIrq);
+}
+"""}, tmp_path)
+    for caller in ("viaSpace", "viaDeref", "viaMacro"):
+        assert (caller, "handleIrq") in _pairs(edges)
+
+
+def test_the_own_name_is_blanked_only_as_a_whole_name(tmp_path):
+    edges = _edges({"knob.h": """\
+class Knob_c {
+public:
+    typedef int turnMode;
+    int turn();
+};
+""", "knob.cpp": """\
+#include "knob.h"
+
+Knob_c::turnMode Knob_c::turn() {
+    int turn = 1;
+    return turn;
+}
+"""}, tmp_path)
+    assert not any(a == "Knob_c::turn" and b == "Knob_c::turn" for a, b, _ in edges)
+
+
+def test_callee_note_skips_declarations_and_initializers(serve):
+    files = _lamps(12)
+    files["timer/timer.h"] = """\
+class Timer_c {
+public:
+    Timer_c(int v);
+};
+"""
+    files["far/far.cpp"] = """\
+void setupFar(Timer_c* t) {
+    Timer_c blinkLamp(5);
+}
+
+void resetFar(void* lamp) {
+    lamp->blinkLamp();
+}
+"""
+    server = serve(files)
+    assert "graph_note" not in json.loads(server.get_callees("setupFar"))
+    assert "`blinkLamp`" in json.loads(server.get_callees("resetFar"))["graph_note"]

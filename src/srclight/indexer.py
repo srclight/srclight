@@ -717,9 +717,10 @@ def _reference_forms_all(content: str, names: set[str]) -> dict[str, tuple[set[s
             continue
         forms, qualifiers = found.setdefault(name, (set(), set()))
         before = content[max(0, m.start() - 200):m.start()].rstrip()
-        after = content[m.end():m.end() + 8].lstrip()
+        after = content[m.end():m.end() + 200].lstrip()[:3]
         member_access = before.endswith(("->", ".")) and not before.endswith("..")
-        if member_access and not after.startswith(("(", "<")):
+        # `(*o->fn)(1)` and `CALL(o->fn)` call what the parenthesis closes on.
+        if member_access and not after.startswith(("(", "<", ")")):
             forms.add("field")  # `x.flags & mask`: a member read, no call
         elif after.startswith(("->", ".")) and not after.startswith("..."):
             forms.add("object")  # `current.pos`: a value, whatever else it names
@@ -1801,8 +1802,10 @@ class Indexer:
                     source_scope = unqualified.rsplit("::", 1)[0]
                 # An out-of-line definition opens with its own name, `C::f`:
                 # that is no call to the declaration `f`.
-                own_blanked = (content.replace(source_name, " " * len(source_name), 1)
-                               if "::" in source_name else content)
+                own_blanked = (re.sub(
+                    rf"(?<![\w:]){re.escape(source_name)}(?![\w])",
+                    " " * len(source_name), content, count=1)
+                    if "::" in source_name else content)
                 forms_of = _reference_forms_all(
                     own_blanked, {n for n in referenced_names if "::" not in n})
                 # A parameter or local hides the name written bare only:

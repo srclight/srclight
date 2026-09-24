@@ -922,25 +922,43 @@ def _callee_coverage(db: Database, syms, result: list[dict]) -> dict:
 
     A callee list that silently skips `update()` and `calc()` reads as a
     body that never calls them. The names it calls but the graph excludes —
-    too common, or defined too often to tell which one — are listed.
+    too common, or defined too often to tell which one — are listed. Only
+    a callable's body is read, and in C/C++ what reads as a declaration
+    (`Timer refresh(5)`) or a member initializer (`: refresh(0)`) is no call.
     """
-    from .indexer import GRAPH_MAX_FANOUT, graph_name_excluded
+    from .indexer import _NOT_A_TYPE, GRAPH_MAX_FANOUT, graph_name_excluded
     from .refmask import mask_noncode
 
     listed = {e["name"].rsplit("::", 1)[-1] for e in result}
-    own = {sym.name.rsplit("::", 1)[-1] for sym in syms}
     called: set[str] = set()
     for sym in syms:
-        if not sym.content:
+        if not sym.content or sym.kind not in ("function", "method", "template", "macro"):
             continue
         row = db.conn.execute(
             "SELECT language FROM files WHERE path = ?", (sym.file_path,)).fetchone()
-        text = mask_noncode(sym.content, (row[0] if row else "") or "")
-        called.update(m.group(1) for m in _CALL_SITE_RE.finditer(text))
-    missing = sorted(
-        name for name in called - listed - own
-        if (graph_name_excluded(name) or db.count_graph_targets(name) > GRAPH_MAX_FANOUT)
-        and db.count_graph_targets(name) > 0)
+        language = (row[0] if row else "") or ""
+        text = mask_noncode(sym.content, language)
+        own = sym.name.rsplit("::", 1)[-1]
+        head_seen = False
+        for m in _CALL_SITE_RE.finditer(text):
+            name = m.group(1)
+            if name == own and not head_seen:
+                head_seen = True  # the definition's own name, not a call
+                continue
+            if language in ("c", "cpp"):
+                before = text[max(0, m.start() - 80):m.start()].rstrip()
+                word = re.search(r"([A-Za-z_]\w*)$", before)
+                if before.endswith(":") and not before.endswith("::"):
+                    continue  # a member initializer
+                if (before.endswith(("*", "&", ">")) and not before.endswith("->")) or (
+                        word and word.group(1) not in _NOT_A_TYPE):
+                    continue  # `Type name(...)`: a declaration
+            called.add(name)
+    missing = []
+    for name in sorted(called - listed):
+        defined = db.count_graph_targets(name)
+        if defined and (graph_name_excluded(name) or defined > GRAPH_MAX_FANOUT):
+            missing.append(name)
     if not missing:
         return {}
     shown = ", ".join(f"`{n}`" for n in missing[:15]) + (" …" if len(missing) > 15 else "")
