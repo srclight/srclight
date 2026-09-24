@@ -326,6 +326,13 @@ _CPP_QUERY = """
         declarator: (reference_declarator
             (function_declarator
                 declarator: (qualified_identifier) @ptrrefmethod.name)))) @ptrrefmethod.def
+
+; Macros, as in C: a header read as C++ holds as many as one read as C.
+(preproc_function_def
+    name: (identifier) @macro.name) @macro.def
+
+(preproc_def
+    name: (identifier) @define.name) @define.def
 """
 
 _JS_QUERY = """
