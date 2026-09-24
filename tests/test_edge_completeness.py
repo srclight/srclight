@@ -199,3 +199,26 @@ void fillInterior() {
 
     assert "fillInterior" in _callees(db, "traceOutline")
     assert _callees(db, "shapes") == set()
+
+
+def test_a_define_in_a_container_hides_only_its_own_line(tmp_path):
+    """A `#define` node takes its trailing newline, so its recorded end is
+    the next line; blanking that span in its container hid the line after
+    it."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "w.c").write_text(
+        "int helper_value(void) { return 1; }\n"
+        "struct Levels {\n"
+        "#define IN_STRUCT_MACRO 1\n"
+        "    char buf[helper_value()];\n"
+        "};\n")
+    db = Database(root / "index.db")
+    db.open()
+    db.initialize()
+    Indexer(db, IndexConfig(root=root)).index()
+    edges = {tuple(r) for r in db.conn.execute(
+        """SELECT a.name, b.name FROM symbol_edges e JOIN symbols a ON a.id = e.source_id
+           JOIN symbols b ON b.id = e.target_id""")}
+    db.close()
+    assert ("Levels", "helper_value") in edges

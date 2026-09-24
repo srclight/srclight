@@ -1497,8 +1497,11 @@ class Indexer:
         # are found by bisection rather than by walking the whole file.
         spans_by_file: dict[int, list[tuple[int, int]]] = {}
         for row in content_rows:
+            # The lines a symbol's text spans: a `#define` node takes its
+            # trailing newline, and its recorded end is the line after it.
+            text_lines = len((row["content"] or "").rstrip("\r\n").split("\n"))
             spans_by_file.setdefault(row["file_id"], []).append(
-                (row["start_line"], row["end_line"])
+                (row["start_line"], min(row["end_line"], row["start_line"] + text_lines - 1))
             )
         for spans in spans_by_file.values():
             spans.sort()
