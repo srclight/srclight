@@ -810,6 +810,8 @@ def _accepts(t: dict, name: str, arities: set[int]) -> bool:
     if t["kind"] not in ("function", "method", "template"):
         return True
     accepted = _param_range(t.get("signature"), name)
+    if accepted is None and "::" in name:
+        accepted = _param_range(t.get("signature"), name.rsplit("::", 1)[-1])
     return accepted is None or any(accepted[0] <= a <= accepted[1] for a in arities)
 
 
@@ -909,18 +911,17 @@ def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
     forms = forms - values
     if values and not forms:
         return [], None  # only ever a value, never called or named as a function
-    if "::" in name or not forms:
-        return targets, None  # the reference is qualified already: `C::f`
-
-    def qualified(t: dict) -> str:
-        return t.get("qualified") or name
-
     # A call passing two arguments reaches no `f(int)`. Only when every use
     # is a call: a function pointer names every overload.
     if arities and None not in arities:
         fitting = [t for t in targets if _accepts(t, name, arities)]
         if fitting:
             targets = fitting
+    if "::" in name or not forms:
+        return targets, None  # the reference is qualified already: `C::f`
+
+    def qualified(t: dict) -> str:
+        return t.get("qualified") or name
 
     # `lamp->f()` with `Lamp_c* lamp` declared in the symbol reaches `Lamp_c::f`.
     if forms == {"member"} and receiver_types and None not in receiver_types:
@@ -1966,6 +1967,13 @@ class Indexer:
                     own_blanked, {n for n in referenced_names if "::" not in n},
                     arities_of, receivers_of)
                 var_types = _declared_types(content, source_name, row["kind"])
+                # A qualified name, `C::f(...)`, is one token to the matcher:
+                # its argument counts are read here.
+                for qualified_ref in (n for n in referenced_names if "::" in n):
+                    for m in re.finditer(
+                            rf"(?<![\w:]){re.escape(qualified_ref)}(?![\w])\s*(\()?", own_blanked):
+                        arities_of.setdefault(qualified_ref, set()).add(
+                            _call_arity(own_blanked, m.start(1)) if m.group(1) else None)
                 # A parameter or local hides the name written bare only:
                 # `x.name()`, `::name()` and `C::name()` still call.
                 for declared in _declared_names(content, source_name, row["kind"]):

@@ -852,3 +852,31 @@ int fromChain(Holder* h) {
     assert {(b, r) for a, b, r in edges if a == "fromLocal" and "readSlot" in b} == {
         ("Save_c::readSlot", "typed")}
     assert {r for a, b, r in edges if a == "fromChain" and "readSlot" in b} == {"name_only"}
+
+
+def test_a_qualified_call_reaches_the_overload_its_arguments_fit(serve):
+    server = serve({"stack.h": """\
+class Stack_c {
+public:
+    static void shift(int v);
+    static void shift(int x, int y, int z);
+};
+""", "stack.cpp": """\
+#include "stack.h"
+
+void Stack_c::shift(int v) {
+}
+
+void Stack_c::shift(int x, int y, int z) {
+}
+""", "use/use.cpp": """\
+void moveOne() {
+    Stack_c::shift(1);
+}
+"""})
+    callees = json.loads(server.get_callees("moveOne"))["callees"]
+    shifts = [e for e in callees if e["name"].endswith("shift")]
+    signatures = {e.get("signature") for e in shifts} | {
+        loc.get("signature") for e in shifts for loc in e.get("locations", [])}
+    assert any("int v" in (s or "") for s in signatures)
+    assert not any("int z" in (s or "") for s in signatures)

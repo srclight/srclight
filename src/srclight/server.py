@@ -983,15 +983,18 @@ def _dedup_edges(edges: list[dict]) -> list[dict]:
             "edge_type": c["edge_type"],
             "confidence": confidence,
         }
+        # Which overload the edge reaches: its line alone does not say.
+        if s.signature:
+            entry["signature"] = s.signature
         # name_only: the call names a symbol of this name, and nothing tells
         # which of its homonyms it is — the receiver's type is not known.
         if c.get("resolution"):
             entry["resolution"] = c["resolution"]
         if name not in by_name:
             by_name[name] = entry
-            by_name[name]["_locations"] = [(s.file_path, s.start_line)]
+            by_name[name]["_locations"] = [(s.file_path, s.start_line, s.signature)]
         else:
-            by_name[name]["_locations"].append((s.file_path, s.start_line))
+            by_name[name]["_locations"].append((s.file_path, s.start_line, s.signature))
             if confidence > by_name[name]["confidence"]:
                 by_name[name].pop("resolution", None)
                 by_name[name].update(entry)
@@ -1001,7 +1004,8 @@ def _dedup_edges(edges: list[dict]) -> list[dict]:
     for entry in by_name.values():
         locations = entry.pop("_locations")
         if len(locations) > 1:
-            entry["locations"] = [{"file": f, "line": l} for f, l in locations]
+            entry["locations"] = [{"file": f, "line": l, **({"signature": g} if g else {})}
+                                  for f, l, g in locations]
         result.append(entry)
 
     result.sort(key=lambda r: (
