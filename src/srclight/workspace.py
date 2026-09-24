@@ -625,7 +625,8 @@ class WorkspaceDB:
         """
         assert self.conn is not None
         from .db import (
-            _IDENT_RE, RUNG_NONE, is_vendored_path, match_rung, split_identifier,
+            _IDENT_RE, RUNG_NONE, add_symbol_lines, is_vendored_path, match_rung,
+            split_identifier,
         )
 
         results: list[dict[str, Any]] = []
@@ -821,6 +822,14 @@ class WorkspaceDB:
             except sqlite3.OperationalError as e:
                 self._fts_leg_failed(schema, "docs", e)
 
+            # Lines are read now, while the schema is attached: past
+            # MAX_ATTACH projects a later pass would attach them all again.
+            try:
+                add_symbol_lines(
+                    self.conn, [r for r in results if r["project"] == project_name], schema)
+            except sqlite3.DatabaseError:
+                pass  # a project that cannot be read keeps its hits, lineless
+
         # Collapse repeats. One row per (project, name, kind), carrying how many
         # it stands for. A human's eye skips a duplicate; an agent reads it as
         # corroboration -- `id` returned 20 rows with 2 distinct names, 15 of
@@ -852,26 +861,10 @@ class WorkspaceDB:
             matched = match_rung(query, r.get("name", "") or "") < RUNG_NONE
             r["name_match"] = matched
             any_name_match = any_name_match or matched
-        results = results[:min(limit, NAMELESS_RESULT_CAP) if not any_name_match else limit]
-        self._add_lines(results)
-        return results
+        if not any_name_match:
+            return results[:min(limit, NAMELESS_RESULT_CAP)]
 
-    def _add_lines(self, results: list[dict[str, Any]]) -> None:
-        """Give each hit the lines its symbol spans, read from its project."""
-        from .db import add_symbol_lines
-
-        by_project: dict[str, list[dict[str, Any]]] = {}
-        for r in results:
-            by_project.setdefault(r.get("project"), []).append(r)
-        entries = [e for e in self._all_indexable if e.name in by_project]
-        if not entries:
-            return
-        for batch in self._iter_batches(entries=entries):
-            for schema, project_name in batch:
-                try:
-                    add_symbol_lines(self.conn, by_project.get(project_name, []), schema)
-                except sqlite3.OperationalError:
-                    pass  # a project that cannot be read keeps its hits, lineless
+        return results[:limit]
 
     def codebase_map(self, project: str | None = None) -> dict[str, Any]:
         """Get aggregated stats across all projects (or a single one)."""

@@ -392,23 +392,26 @@ def add_symbol_lines(conn: sqlite3.Connection, results: list[dict[str, Any]],
                      schema: str | None = None) -> None:
     """Set `line` and `end_line` on search hits, looked up by `symbol_id`.
 
-    ``schema`` names an attached database; hits whose symbol has since gone
-    are left without lines.
+    ``schema`` names an attached database. A hit whose symbol has since gone
+    is left without lines — and so is one whose id a reindex gave to another
+    symbol meanwhile: the name must still agree. Hits that have lines keep
+    them.
     """
-    ids = [r["symbol_id"] for r in results if "symbol_id" in r]
+    ids = [r["symbol_id"] for r in results if "symbol_id" in r and "line" not in r]
     table = f"[{schema}].symbols" if schema else "symbols"
-    lines: dict[int, tuple[int, int]] = {}
+    lines: dict[int, tuple[str, int, int]] = {}
     for start in range(0, len(ids), 500):
         batch = ids[start:start + 500]
         placeholders = ",".join("?" * len(batch))
         for row in conn.execute(
-                f"SELECT id, start_line, end_line FROM {table} WHERE id IN ({placeholders})",
+                f"SELECT id, name, start_line, end_line FROM {table}"
+                f" WHERE id IN ({placeholders})",
                 batch):
-            lines[row[0]] = (row[1], row[2])
+            lines[row[0]] = (row[1], row[2], row[3])
     for r in results:
         found = lines.get(r.get("symbol_id"))
-        if found is not None:
-            r["line"], r["end_line"] = found
+        if found is not None and found[0] == r.get("name"):
+            r["line"], r["end_line"] = found[1], found[2]
 
 
 class Database:

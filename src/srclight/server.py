@@ -1976,6 +1976,13 @@ def hybrid_search(
     if embedding_results:
         merged = rrf_merge(fts_results, embedding_results)
         final = merged[:limit]
+        # A keyword hit says `line`, an embedding hit `start_line`: give every
+        # merged hit both, so neither kind reads as having no position.
+        for hit in final:
+            if "start_line" in hit:
+                hit.setdefault("line", hit["start_line"])
+            elif "line" in hit:
+                hit["start_line"] = hit["line"]
         payload: dict[str, object] = {
             "query": query,
             "mode": "hybrid (FTS5 + embeddings)",

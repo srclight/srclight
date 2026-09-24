@@ -1085,3 +1085,49 @@ def test_single_project_search_hits_say_where_the_symbol_is(tmp_path, ws_dir):
         assert (hit["line"], hit["end_line"]) == (11, 18)
     finally:
         db.close()
+
+
+def test_search_lines_do_not_attach_a_project_twice(tmp_path, ws_dir):
+    """Past MAX_ATTACH projects, lines are read during the walk, not in a
+    second walk that attaches every hit project again."""
+    import srclight.workspace as ws_mod
+    orig_limit = ws_mod.MAX_ATTACH
+    ws_mod.MAX_ATTACH = 2
+    try:
+        config = WorkspaceConfig(name="attach-count")
+        for i in range(5):
+            proj = _create_indexed_project(tmp_path, f"proj{i}", [(f"Valve{i}", "class")])
+            config.add_project(f"proj{i}", str(proj))
+        with WorkspaceDB(config) as wdb:
+            attached: list[str] = []
+            real = wdb._attach_batch
+
+            def spy(entries):
+                attached.extend(e.name for e in entries)
+                return real(entries)
+
+            wdb._attach_batch = spy
+            results = wdb.search_symbols("Valve")
+            assert all("line" in r for r in results)
+            assert sorted(attached) == [f"proj{i}" for i in range(5)]
+    finally:
+        ws_mod.MAX_ATTACH = orig_limit
+
+
+def test_search_lines_skip_an_id_given_to_another_symbol(tmp_path, ws_dir):
+    """A reindex between the search and the line lookup can hand the hit's
+    id to another symbol; its lines must not be passed off as the hit's."""
+    from srclight.db import add_symbol_lines
+
+    proj = _create_indexed_project(tmp_path, "reused", [("Target", "class")])
+    db = Database(proj / ".srclight" / "index.db")
+    db.open()
+    try:
+        sid = db.conn.execute("SELECT id FROM symbols WHERE name = 'Target'").fetchone()[0]
+        db.conn.execute("UPDATE symbols SET name = 'Unrelated', start_line = 900 WHERE id = ?",
+                        (sid,))
+        hit = {"symbol_id": sid, "name": "Target"}
+        add_symbol_lines(db.conn, [hit])
+        assert "line" not in hit
+    finally:
+        db.close()
