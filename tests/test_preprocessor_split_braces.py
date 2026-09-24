@@ -177,6 +177,179 @@ void openSerialPort() {
     ]
 
 
+def test_a_header_that_differs_per_branch_gives_one_symbol(tmp_path, db):
+    """Each branch opens the same body with its own header. The original
+    parse starts the function at the #else header, the reparse at the first
+    one: they are one definition, and must be stored once."""
+    _index(tmp_path, db, {"scale.cpp": """\
+#ifdef WIDE_INPUT
+void scaleValue(long amount) {
+#else
+void scaleValue(int amount) {
+#endif
+    clampValue(amount);
+}
+
+void clampValue(int v) {
+}
+"""})
+
+    assert _symbols(db, "scale.cpp") == [
+        ("scaleValue", 2, 7),
+        ("clampValue", 9, 10),
+    ]
+
+
+def test_a_name_that_differs_per_branch_gives_one_symbol(tmp_path, db):
+    _index(tmp_path, db, {"scale.cpp": """\
+#ifdef WIDE_INPUT
+long scaleWide(long v) {
+#else
+int scaleNarrow(int v) {
+#endif
+    return v;
+}
+"""})
+
+    assert _symbols(db, "scale.cpp") == [("scaleWide", 2, 7)]
+
+
+def test_a_comment_opened_on_a_directive_line_stays_a_comment(tmp_path, db):
+    """Blanking the whole directive line would cut the comment in two, and
+    the reparse would read its second half as code."""
+    _index(tmp_path, db, {"gauge.cpp": """\
+void Gauge_c::checkFlags(int mode) {
+#ifdef PLATFORM_DESKTOP   /* the PC build checks
+                      both flags */
+    if (mode) {
+#else
+    if (!mode) {
+#endif
+        refreshGauge();
+    }
+}
+"""})
+
+    assert _symbols(db, "gauge.cpp") == [("Gauge_c::checkFlags", 1, 10)]
+
+
+def test_a_directive_inside_a_comment_is_not_a_directive(tmp_path, db):
+    """A commented-out #else inside a first branch would flip that branch to
+    inactive: the first branch's code after it would be blanked, and the
+    recovered function would end at the wrong brace."""
+    _index(tmp_path, db, {"gauge.cpp": """\
+void Gauge_c::checkFlags() {
+#ifdef PLATFORM_DESKTOP
+    /* was:
+#else
+    */
+    if (isPanelVisible()) {
+#else
+    if (isPromptOpen()) {
+#endif
+        refreshGauge();
+    }
+}
+
+void Gauge_c::refreshGauge() {
+}
+"""})
+
+    assert _symbols(db, "gauge.cpp") == [
+        ("Gauge_c::checkFlags", 1, 12),
+        ("Gauge_c::refreshGauge", 14, 15),
+    ]
+
+
+def test_a_split_nested_deep_enough_to_leave_no_error_node(tmp_path, db):
+    """Deeper in, tree-sitter repairs the split with MISSING nodes rather
+    than an ERROR node — and the function still runs on over the next one,
+    and the namespace over what follows it."""
+    _index(tmp_path, db, {"worker.cpp": """\
+namespace app {
+
+void Worker_c::runLoop(int count) {
+    for (int i = 0; i < count; i++) {
+#ifdef PLATFORM_DESKTOP
+        if (count > 2) {
+#else
+        if (count > 3) {
+#endif
+            stepOnce();
+        }
+    }
+}
+
+void Worker_c::stepOnce() {
+}
+
+}
+
+int afterSpace() {
+    return 1;
+}
+"""})
+
+    assert _symbols(db, "worker.cpp") == [
+        ("app", 1, 18),
+        ("Worker_c::runLoop", 3, 13),
+        ("Worker_c::stepOnce", 15, 16),
+        ("afterSpace", 20, 22),
+    ]
+    parent = db.conn.execute(
+        "SELECT parent_symbol_id FROM symbols WHERE name = 'afterSpace'"
+    ).fetchone()["parent_symbol_id"]
+    assert parent is None
+
+
+def test_a_recovered_signature_has_no_blanked_gaps(tmp_path, db):
+    _index(tmp_path, db, {"gauge.cpp": """\
+void Gauge_c::setMode(
+#ifdef PLATFORM_DESKTOP
+    int mode, int extra) {
+#else
+    int mode) {
+#endif
+    applyMode(mode);
+}
+"""})
+
+    sig = db.conn.execute(
+        "SELECT signature FROM symbols WHERE name = 'Gauge_c::setMode'"
+    ).fetchone()["signature"]
+
+    assert "int mode, int extra" in sig
+    assert "  " not in sig
+
+
+def test_a_comment_across_a_directive_is_not_a_doc_comment(tmp_path, db):
+    """In the reparse the directives are gone, so a comment from a preceding
+    conditional block ends up right above the next definition."""
+    _index(tmp_path, db, {"gauge.cpp": """\
+#ifdef PLATFORM_DESKTOP
+/* PC-only helpers follow */
+#else
+int legacyMode;
+#endif
+void Gauge_c::drawGauge() {
+#ifdef PLATFORM_DESKTOP
+    if (isPanelVisible()) {
+#else
+    if (isPromptOpen()) {
+#endif
+        refreshGauge();
+    }
+}
+"""})
+
+    row = db.conn.execute(
+        "SELECT start_line, doc_comment FROM symbols WHERE name = 'Gauge_c::drawGauge'"
+    ).fetchone()
+
+    assert row["start_line"] == 6
+    assert row["doc_comment"] is None
+
+
 def test_platform_variants_in_a_file_that_parses_are_all_kept(tmp_path, db):
     """One definition per platform is the common case and parses fine; the
     reparse must not trade those variants for the ones it recovers."""

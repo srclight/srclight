@@ -247,10 +247,17 @@ def _extract_doc_comment(source_bytes: bytes, node: Node) -> str | None:
         # Look at previous unnamed siblings too
         prev_sib = node.prev_sibling
         if prev_sib and prev_sib.type == "comment":
+            if _CONDITIONAL_RE.search(source_bytes, prev_sib.end_byte, node.start_byte):
+                return None
             return prev_sib.text.decode("utf-8", errors="replace").strip()
         return None
 
     if prev.type == "comment":
+        # A conditional directive in between means the comment belongs to
+        # another branch, not to this definition. Only a reparse with the
+        # directives blanked out can make such a comment the node's neighbor.
+        if _CONDITIONAL_RE.search(source_bytes, prev.end_byte, node.start_byte):
+            return None
         return prev.text.decode("utf-8", errors="replace").strip()
 
     # Python: check for docstring (first child expression_statement with string)
@@ -672,7 +679,18 @@ def _first_branch_only(source: bytes) -> bytes:
     Blanked bytes become spaces and newlines stay, so offsets and line
     numbers are those of the original: a node found in this text points at
     the same bytes in the file.
+
+    Comments are never blanked. One that opens on a directive line, or in a
+    dropped branch, and closes elsewhere keeps both of its ends — blanking
+    one would leave the other half to be read as code. And a directive
+    written inside a comment is not a directive.
     """
+    from .refmask import mask_noncode
+
+    # latin-1 maps each byte to one character, so offsets carry over.
+    text = source.decode("latin-1")
+    in_comment = [a != b for a, b in zip(text, mask_noncode(text, "cpp", mask_strings=False))]
+
     out = bytearray(source)
     first_branch: list[bool] = []  # per open conditional: still in its first branch
     continued = False  # the previous directive line ended with a backslash
@@ -681,6 +699,8 @@ def _first_branch_only(source: bytes) -> bytes:
         end = pos + len(line)
         body = line.rstrip(b"\r\n")
         directive = None if continued else _CONDITIONAL_RE.match(body)
+        if directive and in_comment[pos + len(body) - len(body.lstrip(b" \t"))]:
+            directive = None
         if directive:
             word = directive.group(1)
             if word in (b"if", b"ifdef", b"ifndef"):
@@ -692,7 +712,7 @@ def _first_branch_only(source: bytes) -> bytes:
                 first_branch[-1] = False
         if continued or directive or not all(first_branch):
             for i in range(pos, end):
-                if out[i] not in (0x0A, 0x0D):
+                if out[i] not in (0x0A, 0x0D) and not in_comment[i]:
                     out[i] = 0x20
         continued = bool(continued or directive) and body.endswith(b"\\")
         pos = end
@@ -700,21 +720,29 @@ def _first_branch_only(source: bytes) -> bytes:
 
 
 def _conditional_error_ranges(root: Node, source: bytes) -> list[tuple[int, int]]:
-    """Byte ranges of the ERROR nodes that hold a conditional directive.
+    """Byte ranges of the top-level definitions whose parse broke around a
+    conditional directive.
 
-    Those are the parse failures _first_branch_only can repair. Any other
-    error is left as it is.
+    tree-sitter reports the split as an ERROR node, or — deeper in, say
+    inside a loop — as MISSING nodes in an otherwise ordinary tree. Either
+    way what runs on is the enclosing top-level definition, a whole
+    namespace included, so that is the range to repair. One split can also
+    break several top-level nodes in a row — a parameter list cut by #ifdef
+    leaves `void f(` on its own — so consecutive broken nodes form one
+    range. Any other error is left as it is.
     """
-    ranges: list[tuple[int, int]] = []
-    stack = [root]
-    while stack:
-        node = stack.pop()
-        if node.type == "ERROR":
-            if _CONDITIONAL_RE.search(source, node.start_byte, node.end_byte):
-                ranges.append((node.start_byte, node.end_byte))
-            continue
-        if node.has_error:
-            stack.extend(node.children)
+    runs: list[list[int]] = []
+    previous_broken = False
+    for child in root.children:
+        if child.has_error:
+            if previous_broken:
+                runs[-1][1] = child.end_byte
+            else:
+                runs.append([child.start_byte, child.end_byte])
+        previous_broken = child.has_error
+    ranges = [(s, e) for s, e in runs if _CONDITIONAL_RE.search(source, s, e)]
+    if not ranges and root.has_error and _CONDITIONAL_RE.search(source):
+        ranges.append((root.start_byte, root.end_byte))
     return ranges
 
 
@@ -1223,8 +1251,13 @@ class Indexer:
         # ranges. It completes the original parse and never replaces it: the
         # reparse sees one branch, so a variant in an #else — one definition
         # per platform, an alternative macro — exists only in the original.
-        # A definition both parses find (same kind, name and start) keeps the
-        # reparse's extent, which is the one the braces actually give.
+        # A definition both parses find keeps the reparse's extent, which is
+        # the one the braces actually give. They are the same definition when
+        # they share kind, name and start — or kind and end: a header written
+        # once per branch over one shared body starts the original parse's
+        # symbol at the last header and the reparse's at the first, and a
+        # name that differs per branch differs between the two parses too.
+        recovered_nodes: set[int] = set()
         if lang in _PREPROCESSED_LANGS and root.has_error:
             broken = _conditional_error_ranges(root, source)
             if broken:
@@ -1232,15 +1265,26 @@ class Indexer:
                     return any(s <= node.start_byte and node.end_byte <= e for s, e in broken)
 
                 recovery_tree = parser.parse(_first_branch_only(source))
-                recovered = {
-                    (sym[1], sym[2], sym[0].start_byte): sym
-                    for sym in collect(recovery_tree.root_node) if in_broken(sym[0])
-                }
+                recovered = [sym for sym in collect(recovery_tree.root_node)
+                             if in_broken(sym[0])]
+                by_start = {(k, n, node.start_byte): i for i, (node, k, n) in enumerate(recovered)}
+                by_end = {(k, node.end_byte): i for i, (node, k, n) in enumerate(recovered)}
+                used: set[int] = set()
                 merged = []
                 for sym in raw_symbols:
-                    key = (sym[1], sym[2], sym[0].start_byte)
-                    merged.append(recovered.pop(key, sym) if in_broken(sym[0]) else sym)
-                raw_symbols = merged + list(recovered.values())
+                    node, kind, name = sym
+                    if in_broken(node):
+                        for key, index in (((kind, name, node.start_byte), by_start),
+                                           ((kind, node.end_byte), by_end)):
+                            i = index.get(key)
+                            if i is not None and i not in used:
+                                used.add(i)
+                                sym = recovered[i]
+                                break
+                    merged.append(sym)
+                merged += [sym for i, sym in enumerate(recovered) if i not in used]
+                recovered_nodes = {id(sym[0]) for sym in recovered}
+                raw_symbols = merged
                 # Containers before what they contain: the second pass finds
                 # a parent among the symbols already inserted.
                 raw_symbols.sort(key=lambda sym: (sym[0].start_byte, -sym[0].end_byte))
@@ -1260,6 +1304,10 @@ class Indexer:
             content_text = body_bytes.decode("utf-8", errors="replace")
             doc = _extract_doc_comment(source, def_node)
             sig = _extract_signature(source, def_node, lang)
+            if sig and id(def_node) in recovered_nodes:
+                # Read from the reparse, where the directives and the other
+                # branches left runs of blanks.
+                sig = " ".join(sig.split())
 
             body_h = hashlib.sha256(body_bytes).hexdigest()[:16]
 
