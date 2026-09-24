@@ -704,3 +704,109 @@ def test_a_string_continued_across_a_crlf_line_stays_a_string():
     comment = source.index(b"/*")
     assert all(marks[comment:source.index(b"*/") + 2])
     assert not any(marks[source.index(b"live"):])
+
+
+SPLIT_ELSEWHERE_CPP = """
+void Gauge_c::updateState() {
+#ifdef PLATFORM_DESKTOP
+    if (isPanelVisible()) {
+#else
+    if (isPromptOpen()) {
+#endif
+        refreshGauge();
+    }
+}
+"""
+
+
+def _parents(db, path: str) -> dict[str, str | None]:
+    rows = db.conn.execute(
+        """SELECT s.name, p.name AS parent FROM symbols s
+           JOIN files f ON s.file_id = f.id
+           LEFT JOIN symbols p ON s.parent_symbol_id = p.id
+           WHERE f.path = ?""",
+        (path,),
+    ).fetchall()
+    return {r["name"]: r["parent"] for r in rows}
+
+
+def test_a_namespace_is_not_cut_short_by_its_own_functions(tmp_path, db):
+    """A container's members sit in its tail by definition: they prove no
+    run-on. Only a function's dropped tail can hold such proof."""
+    _index(tmp_path, db, {"app.cpp": """\
+namespace app {
+void refreshAll(int mode) {
+#if 0
+    if (mode) {
+        clearGauge(0);
+    }
+#else
+    if (mode > 1) {
+#endif
+        clearGauge(1);
+    }
+    applyMode(mode);
+}
+
+void applyMode(int mode) {
+}
+}
+""" + SPLIT_ELSEWHERE_CPP})
+
+    symbols = _symbols(db, "app.cpp")
+    assert ("app", 1, 17) in symbols
+    assert ("refreshAll", 2, 13) in symbols
+    assert _parents(db, "app.cpp")["applyMode"] == "app"
+
+
+def test_a_loop_macro_in_the_tail_is_not_a_swallowed_function(tmp_path, db):
+    """Read at file scope, `FOR_EACH_ITEM(x) { ... }` looks like a function
+    without a return type — which no real top-level definition is."""
+    _index(tmp_path, db, {"walk.cpp": """\
+void refreshAll(int mode) {
+#if 0
+    if (mode) {
+        clearGauge(0);
+    }
+#else
+    if (mode > 1) {
+#endif
+        clearGauge(1);
+    }
+    FOR_EACH_ITEM(item, mode) {
+        applyMode(item);
+    }
+}
+
+void applyMode(int mode) {
+}
+"""})
+
+    assert ("refreshAll", 1, 14) in _symbols(db, "walk.cpp")
+
+
+def test_a_class_is_not_the_return_type_of_the_function_after_it(tmp_path, db):
+    """When the reparse closes a class at a stray brace, `class X {...} f() {...}`
+    reads as one function returning the class. No definition returns a type
+    it defines on the spot, so that extent is refused."""
+    _index(tmp_path, db, {"panel.cpp": """\
+class Panel_c {
+    void refreshAll(int mode) {
+#if 0
+        if (mode) {
+            clearGauge(0);
+        }
+#else
+        if (mode > 1) {
+#endif
+            clearGauge(1);
+        }
+    }
+    void applyMode(int mode) {
+        clearGauge(mode);
+    }
+};
+""" + SPLIT_ELSEWHERE_CPP})
+
+    starts = {start for name, start, end in _symbols(db, "panel.cpp") if name == "applyMode"}
+    assert 1 not in starts

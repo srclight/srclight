@@ -832,6 +832,37 @@ def _at_top_level(node: Node) -> bool:
     return parent is not None and parent.type in _TOP_LEVEL_PARENTS
 
 
+def _looks_like_a_function(node: Node) -> bool:
+    """Whether a top-level function definition has the shape of a real one: a
+    return type, or a qualified name (a constructor or destructor defined
+    outside its class). A loop macro read at file scope —
+    `FOR_EACH_ITEM(x) { ... }` — has neither."""
+    if node.type == "template_declaration":
+        node = next((c for c in node.named_children if c.type == "function_definition"), node)
+    if node.child_by_field_name("type") is not None:
+        return True
+    declarator = node.child_by_field_name("declarator")
+    while declarator is not None and declarator.type not in (
+            "identifier", "field_identifier", "qualified_identifier",
+            "destructor_name", "operator_name"):
+        inner = declarator.child_by_field_name("declarator")
+        if inner is None:
+            inner = next((c for c in declarator.named_children
+                          if c.type.endswith("declarator") or c.type.endswith("identifier")), None)
+        declarator = inner
+    return declarator is not None and declarator.type == "qualified_identifier"
+
+
+def _returns_a_type_it_defines(node: Node) -> bool:
+    """Whether a function definition's return type is a class, struct, union
+    or enum defined on the spot — `class X {...} f() {...}`, which is what a
+    reparse makes of a class closed at a stray brace and the function after
+    it."""
+    ret = node.child_by_field_name("type")
+    return ret is not None and ret.type.endswith("_specifier") and ret.child_by_field_name(
+        "body") is not None
+
+
 def _closes_for_real(node: Node) -> bool:
     """Whether a definition ends on a closing token that is in the source,
     rather than one tree-sitter made up because the braces never closed."""
@@ -852,6 +883,10 @@ def _extent_is_sound(node: Node) -> bool:
     token, no closing brace inside it had to be made up, and no definition is
     nested in its errors — the signs of braces that do not balance.
     """
+    if node.type == "function_definition" and (
+            _returns_a_type_it_defines(node)
+            or (_at_top_level(node) and not _looks_like_a_function(node))):
+        return False
     if not node.has_error:
         return True
     last = node
@@ -1401,7 +1436,8 @@ class Indexer:
             # reads at top level. A struct, an enum or a macro local to a function
             # sits in its tail in both parses and proves nothing.
             recovered_starts = sorted(node.start_byte for node, kind, _name in recovered
-                                      if kind in _CALLABLE_KINDS_CPP and _at_top_level(node))
+                                      if kind in _CALLABLE_KINDS_CPP and _at_top_level(node)
+                                      and _looks_like_a_function(node))
             used: set[int] = set()
             merged = []
             for sym in raw_symbols:
@@ -1428,7 +1464,8 @@ class Indexer:
                             first = bisect.bisect_left(recovered_starts, twin.end_byte)
                             swallowed = (first < len(recovered_starts)
                                          and recovered_starts[first] < node.end_byte)
-                            if grows or swallowed or not _closes_for_real(node):
+                            if (grows or not _closes_for_real(node)
+                                    or (swallowed and kind in _CALLABLE_KINDS_CPP)):
                                 sym = recovered[i]
                                 recovered_nodes.add(id(twin))
                         break
