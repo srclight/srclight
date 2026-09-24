@@ -968,6 +968,14 @@ def _callee_coverage(db: Database, syms, result: list[dict]) -> dict:
         f"find_pattern can locate the call sites.")}
 
 
+def _short_signature(signature: str | None) -> str | None:
+    """A signature on one line, cut at 200 characters."""
+    if not signature:
+        return None
+    flat = " ".join(signature.split())
+    return flat if len(flat) <= 200 else flat[:197] + "..."
+
+
 def _dedup_edges(edges: list[dict]) -> list[dict]:
     """Deduplicate edges by symbol name, keeping the highest-confidence entry."""
     by_name: dict[str, dict] = {}
@@ -984,19 +992,22 @@ def _dedup_edges(edges: list[dict]) -> list[dict]:
             "confidence": confidence,
         }
         # Which overload the edge reaches: its line alone does not say.
-        if s.signature:
-            entry["signature"] = s.signature
+        signature = _short_signature(s.signature)
+        if signature:
+            entry["signature"] = signature
         # name_only: the call names a symbol of this name, and nothing tells
         # which of its homonyms it is — the receiver's type is not known.
         if c.get("resolution"):
             entry["resolution"] = c["resolution"]
         if name not in by_name:
             by_name[name] = entry
-            by_name[name]["_locations"] = [(s.file_path, s.start_line, s.signature)]
+            by_name[name]["_locations"] = [(s.file_path, s.start_line, signature)]
         else:
-            by_name[name]["_locations"].append((s.file_path, s.start_line, s.signature))
+            if (s.file_path, s.start_line, signature) not in by_name[name]["_locations"]:
+                by_name[name]["_locations"].append((s.file_path, s.start_line, signature))
             if confidence > by_name[name]["confidence"]:
                 by_name[name].pop("resolution", None)
+                by_name[name].pop("signature", None)
                 by_name[name].update(entry)
                 by_name[name]["_locations"] = by_name[name]["_locations"]
 

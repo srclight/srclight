@@ -17,6 +17,7 @@ from srclight.indexer import (
     _declared_names,
     _parameter_names,
     _reference_forms,
+    _reference_forms_all,
 )
 
 SHAPES = {
@@ -880,3 +881,117 @@ void moveOne() {
         loc.get("signature") for e in shifts for loc in e.get("locations", [])}
     assert any("int v" in (s or "") for s in signatures)
     assert not any("int z" in (s or "") for s in signatures)
+
+
+def test_default_arguments_in_the_header_prototype_count(tmp_path):
+    edges = _edges({"log/log.h": """\
+class Sink;
+void logLine(int level, const char* text = 0);
+""", "log/log.cpp": """\
+void logLine(int level, const char* text) {
+}
+""", "other/o.cpp": """\
+static void logLine(const char* s) {
+}
+""", "log/use.cpp": """\
+void report() {
+    logLine(3);
+}
+"""}, tmp_path)
+    reached = {b for a, b, _ in edges if a == "report"}
+    db = Database(tmp_path / "edges" / "index.db")
+    db.open()
+    files = {r[0] for r in db.conn.execute(
+        """SELECT f.path FROM symbol_edges e JOIN symbols a ON a.id = e.source_id
+           JOIN symbols b ON b.id = e.target_id JOIN files f ON f.id = b.file_id
+           WHERE a.name = 'report'""")}
+    db.close()
+    assert "logLine" in reached
+    assert any(f.replace(chr(92), "/").endswith("log/log.cpp") for f in files)
+
+
+def test_arity_reads_template_arguments_and_arrows():
+    from srclight.indexer import _call_arity, _param_range
+
+    text = "place(std::pair<int, int>(1, 2), 3);"
+    assert _call_arity(text, text.index("(")) == 2
+    assert _param_range("void fill(int a, bool b = X > 0, int c = 1, int d = 2)", "fill") == (1, 4)
+    assert _param_range("void walk(Node* n = root->next, int k = 0, int j = 0)", "walk") == (0, 3)
+
+
+def test_a_class_name_matches_whole(tmp_path):
+    edges = _edges({"lamp.h": """\
+class Lamp {
+public:
+    void glow();
+};
+class FlashLamp {
+public:
+    void glow();
+};
+""", "use/use.cpp": """\
+void shine(Lamp* l) {
+    l->glow();
+}
+"""}, tmp_path)
+    assert {b for a, b, _ in edges if a == "shine" and b.endswith("glow")} == {"Lamp::glow"}
+
+
+def test_a_shadowed_variable_has_no_known_type(tmp_path):
+    edges = _edges({"a/lamp.h": """\
+class Lamp {
+public:
+    void glow();
+};
+""", "b/mat.h": """\
+class Mat {
+public:
+    void glow();
+};
+""", "use/use.cpp": """\
+void shine(Lamp* x) {
+    {
+        Mat* x = 0;
+        x->glow();
+    }
+}
+
+void flash() {
+    Lamp* x = 0;
+    auto g = [](Mat* x) { x->glow(); };
+}
+"""}, tmp_path)
+    for fn in ("shine", "flash"):
+        assert not any(a == fn and r == "typed" for a, _, r in edges)
+
+
+def test_a_class_used_as_a_type_keeps_its_constructor_arity():
+    """`Angle a(v)` and `Angle* p` use the name as a type: they say nothing
+    of which constructor a call reaches, so they must not switch the
+    argument-count filter off as a function pointer would."""
+    arities: dict = {}
+    _reference_forms_all("Angle a(v);\nAngle* p = 0;\nAngle(v);\n", {"Angle"}, arities)
+    assert arities["Angle"] == {1}
+    arities = {}
+    _reference_forms_all("Angle(v);\nrun(Angle);\n", {"Angle"}, arities)
+    assert arities["Angle"] == {1, None}
+
+
+def test_a_signature_is_shortened_and_never_stale():
+    from srclight.server import _dedup_edges
+
+    class S:
+        def __init__(self, i, name, kind, path, line, signature):
+            self.id, self.name, self.kind, self.file_path = i, name, kind, path
+            self.start_line, self.signature = line, signature
+
+    edges = [
+        {"symbol": S(1, "stat", "function", "a.c", 3, "int stat(const char *path,\r\n   int x)"),
+         "edge_type": "calls", "confidence": 0.5},
+        {"symbol": S(2, "stat", "struct", "b.h", 9, None), "edge_type": "calls", "confidence": 0.9},
+        {"symbol": S(2, "stat", "struct", "b.h", 9, None), "edge_type": "calls", "confidence": 0.9},
+    ]
+    (entry,) = _dedup_edges(edges)
+    assert entry["kind"] == "struct" and "signature" not in entry
+    assert len(entry["locations"]) == 2
+    assert entry["locations"][0]["signature"] == "int stat(const char *path, int x)"

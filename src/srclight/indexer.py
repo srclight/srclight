@@ -7,6 +7,7 @@ Incremental: only re-indexes files whose content hash has changed.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import hashlib
 import json
 import logging
@@ -685,6 +686,15 @@ def _parameter_names(content: str, name: str, kind: str) -> set[str]:
     return found
 
 
+_INNER_PARAM_RE = re.compile(
+    r"[(,]\s*(?:const\s+)?([A-Za-z_]\w*)(?:\s*<[^;{}()<>]*>)?[\s*&]+([A-Za-z_]\w*)\s*(?=[,):])")
+
+
+# A qualified name as written, `A::B::f`, and the `(` of its call if any.
+_QUALIFIED_CALL_RE = re.compile(
+    r"(?<![\w:])([A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)+)(?![\w:])\s*(\()?")
+
+
 def _type_of_declaration(text: str, declared: str) -> str | None:
     """The class a declaration `const ns::Type<int>* name` gives `name`."""
     text = text.split("=", 1)[0]
@@ -728,11 +738,23 @@ def _declared_types(content: str, name: str, kind: str) -> dict[str, str]:
                     part = []
                 else:
                     part.append(ch)
-    for m in _LOCAL_DECL_RE.finditer(content):
-        if (m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
-                and m.group(1) not in _TYPE_WORDS and _opens_a_declaration(content, m.start())):
-            types.setdefault(m.group(2), m.group(1))
-    return types
+    declared: list[tuple[str, str]] = [
+        (m.group(2), m.group(1)) for m in _LOCAL_DECL_RE.finditer(content)
+        if m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
+        and _opens_a_declaration(content, m.start())]
+    # A lambda's or a range-for's parameters: `[](Mat* x)`, `for (Mat* x : v)`.
+    declared += [(m.group(2), m.group(1)) for m in _INNER_PARAM_RE.finditer(content)
+                 if m.group(1) not in _NOT_A_TYPE and m.group(1) not in _TYPE_WORDS]
+    # Blocks are not tracked: a name declared twice with two types may mean
+    # either one at a given call, so it has no known type.
+    for var, kind_ in declared:
+        if kind_ in _TYPE_WORDS:
+            kind_ = None
+        if var in types and types[var] != kind_:
+            types[var] = None
+        else:
+            types.setdefault(var, kind_)
+    return {var: kind_ for var, kind_ in types.items() if kind_}
 
 
 def _declared_names(content: str, name: str, kind: str) -> set[str]:
@@ -754,11 +776,25 @@ _THIS_ARROW_RE = re.compile(r"(?<![\w$])this\s*->$")
 _IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
 
 
+_TEMPLATE_ARGS_RE = re.compile(r"<[^<>(){};|&]*(?:<[^<>(){};|&]*>[^<>(){};|&]*)*>")
+
+
 def _call_arity(content: str, paren: int) -> int:
-    """How many arguments the call whose `(` sits at `paren` passes."""
+    """How many arguments the call whose `(` sits at `paren` passes.
+
+    `pair<int, int>(1, 2)` is one argument: a `<` right after a name opens
+    template arguments when a matching `>` follows with nothing that only
+    an expression holds in between.
+    """
     depth, commas, i, empty = 0, 0, paren, True
     while i < len(content):
         ch = content[i]
+        if ch == "<" and depth >= 1 and i and (content[i - 1].isalnum() or content[i - 1] == "_"):
+            template = _TEMPLATE_ARGS_RE.match(content, i)
+            if template:
+                empty = False
+                i = template.end()
+                continue
         if ch in "([{":
             depth += 1
         elif ch in ")]}":
@@ -773,6 +809,7 @@ def _call_arity(content: str, paren: int) -> int:
     return 0 if empty else commas + 1
 
 
+@functools.lru_cache(maxsize=65536)
 def _param_range(signature: str | None, name: str) -> tuple[int, float] | None:
     """How many arguments a function's signature accepts, defaults and `...`
     counted — or None when the signature cannot say."""
@@ -788,14 +825,20 @@ def _param_range(signature: str | None, name: str) -> tuple[int, float] | None:
     params = signature[m.end():i - 1].strip()
     if params in ("", "void"):
         return (0, 0)
-    parts, depth, part = [], 0, []
-    # In a declaration `<` opens template arguments: `map<int, int> m` is one.
-    for ch in params + ",":
-        if ch in "([{<":
+    parts, depth, angle, part = [], 0, 0, []
+    # `<` opens template arguments (`map<int, int> m` is one parameter); a
+    # `>` closes one only when one is open — `x > 0` and `p->next` in a
+    # default argument close nothing.
+    for j, ch in enumerate(params + ","):
+        if ch in "([{":
             depth += 1
-        elif ch in ")]}>":
+        elif ch in ")]}":
             depth -= 1
-        if ch == "," and depth == 0:
+        elif ch == "<" and j and (params[j - 1].isalnum() or params[j - 1] in "_: "):
+            angle += 1
+        elif ch == ">" and angle and not (j and params[j - 1] == "-"):
+            angle -= 1
+        if ch == "," and depth == 0 and angle == 0:
             parts.append("".join(part).strip())
             part = []
         else:
@@ -807,12 +850,23 @@ def _param_range(signature: str | None, name: str) -> tuple[int, float] | None:
 
 
 def _accepts(t: dict, name: str, arities: set[int]) -> bool:
+    """Whether a target takes one of the argument counts seen. Every
+    signature of the function counts: default arguments are often written
+    in the header prototype only, not in the definition."""
     if t["kind"] not in ("function", "method", "template"):
         return True
-    accepted = _param_range(t.get("signature"), name)
-    if accepted is None and "::" in name:
-        accepted = _param_range(t.get("signature"), name.rsplit("::", 1)[-1])
-    return accepted is None or any(accepted[0] <= a <= accepted[1] for a in arities)
+    short = name.rsplit("::", 1)[-1]
+    ranges = []
+    for signature in (t.get("signature"), *t.get("other_signatures", ())):
+        accepted = _param_range(signature, name)
+        if accepted is None and short != name:
+            accepted = _param_range(signature, short)
+        if accepted is None:
+            return True
+        ranges.append(accepted)
+    lowest = min(r[0] for r in ranges)
+    highest = max(r[1] for r in ranges)
+    return any(lowest <= a <= highest for a in arities)
 
 
 def _reference_forms_all(content: str, names: set[str],
@@ -836,9 +890,15 @@ def _reference_forms_all(content: str, names: set[str],
         if arities is not None:
             # The argument count of each call; None where the name is not
             # called there (a function pointer, a declaration).
-            arities.setdefault(name, set()).add(
-                _call_arity(content, m.end() + len(ahead) - len(ahead.lstrip()))
-                if after.startswith("(") else None)
+            if after.startswith("("):
+                arities.setdefault(name, set()).add(
+                    _call_arity(content, m.end() + len(ahead) - len(ahead.lstrip())))
+            elif (after[:1] in (",", ")", ";", "}", "]")
+                  or (after.startswith("=") and not after.startswith("=="))
+                  or before.endswith(("&", "=", "return"))):
+                # Used as a value — a function pointer names every overload.
+                # Used as a type (`Angle a(1)`, `Angle* p`) it says nothing.
+                arities.setdefault(name, set()).add(None)
         member_access = before.endswith(("->", ".")) and not before.endswith("..")
         # `(*o->fn)(1)` and `CALL(o->fn)` call what the parenthesis closes on.
         if member_access and not after.startswith(("(", "<", ")")):
@@ -926,7 +986,8 @@ def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
     # `lamp->f()` with `Lamp_c* lamp` declared in the symbol reaches `Lamp_c::f`.
     if forms == {"member"} and receiver_types and None not in receiver_types:
         typed = [t for t in targets if t["kind"] in _MEMBER_KINDS and any(
-            _without_template_args(qualified(t)).endswith(f"{c}::{name}")
+            _without_template_args(qualified(t)) == f"{c}::{name}"
+            or _without_template_args(qualified(t)).endswith(f"::{c}::{name}")
             for c in receiver_types)]
         if typed:
             return typed, "typed"
@@ -1822,6 +1883,18 @@ class Indexer:
             name: syms for name, syms in name_to_symbols.items()
             if not graph_name_excluded(name)
         }
+        # A prototype is no target, but its signature is the function's too:
+        # default arguments are often written there only.
+        prototype_signatures: dict[str, list[str]] = {}
+        for syms in name_to_symbols.values():
+            for sym in syms:
+                if sym["kind"] == "prototype" and sym.get("signature"):
+                    prototype_signatures.setdefault(
+                        sym.get("qualified") or "", []).append(sym["signature"])
+        for syms in name_to_symbols.values():
+            for sym in syms:
+                if sym["kind"] in ("function", "method") and sym.get("qualified") in prototype_signatures:
+                    sym["other_signatures"] = prototype_signatures[sym["qualified"]]
         # A name too common to follow alone is unambiguous written with its
         # class: `Stack_c::get()` names one method. A member defined in its
         # class has no symbol named that way, so it is listed under it.
@@ -1969,11 +2042,12 @@ class Indexer:
                 var_types = _declared_types(content, source_name, row["kind"])
                 # A qualified name, `C::f(...)`, is one token to the matcher:
                 # its argument counts are read here.
-                for qualified_ref in (n for n in referenced_names if "::" in n):
-                    for m in re.finditer(
-                            rf"(?<![\w:]){re.escape(qualified_ref)}(?![\w])\s*(\()?", own_blanked):
-                        arities_of.setdefault(qualified_ref, set()).add(
-                            _call_arity(own_blanked, m.start(1)) if m.group(1) else None)
+                wanted = {n for n in referenced_names if "::" in n}
+                if wanted:
+                    for m in _QUALIFIED_CALL_RE.finditer(own_blanked):
+                        if m.group(1) in wanted:
+                            arities_of.setdefault(m.group(1), set()).add(
+                                _call_arity(own_blanked, m.start(2)) if m.group(2) else None)
                 # A parameter or local hides the name written bare only:
                 # `x.name()`, `::name()` and `C::name()` still call.
                 for declared in _declared_names(content, source_name, row["kind"]):
