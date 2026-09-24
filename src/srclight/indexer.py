@@ -651,6 +651,73 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
     return match
 
 
+# Languages whose parse can break on a conditional that splits a brace across
+# its branches (see _first_branch_only).
+_PREPROCESSED_LANGS = frozenset({"c", "cpp"})
+
+_CONDITIONAL_RE = re.compile(
+    rb"^[ \t]*#[ \t]*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b", re.MULTILINE
+)
+
+
+def _first_branch_only(source: bytes) -> bytes:
+    """Keep the first branch of every #if chain and blank everything else.
+
+    tree-sitter does not run the preprocessor, so a function whose #if and
+    #else branches each open a brace — closed once, after #endif — reads as
+    two opening braces for one closing brace, and the parse gives up on it.
+    With the directives and the later branches blanked, the braces balance
+    again.
+
+    Blanked bytes become spaces and newlines stay, so offsets and line
+    numbers are those of the original: a node found in this text points at
+    the same bytes in the file.
+    """
+    out = bytearray(source)
+    first_branch: list[bool] = []  # per open conditional: still in its first branch
+    continued = False  # the previous directive line ended with a backslash
+    pos = 0
+    for line in source.splitlines(keepends=True):
+        end = pos + len(line)
+        body = line.rstrip(b"\r\n")
+        directive = None if continued else _CONDITIONAL_RE.match(body)
+        if directive:
+            word = directive.group(1)
+            if word in (b"if", b"ifdef", b"ifndef"):
+                first_branch.append(True)
+            elif word == b"endif":
+                if first_branch:
+                    first_branch.pop()
+            elif first_branch:
+                first_branch[-1] = False
+        if continued or directive or not all(first_branch):
+            for i in range(pos, end):
+                if out[i] not in (0x0A, 0x0D):
+                    out[i] = 0x20
+        continued = bool(continued or directive) and body.endswith(b"\\")
+        pos = end
+    return bytes(out)
+
+
+def _conditional_error_ranges(root: Node, source: bytes) -> list[tuple[int, int]]:
+    """Byte ranges of the ERROR nodes that hold a conditional directive.
+
+    Those are the parse failures _first_branch_only can repair. Any other
+    error is left as it is.
+    """
+    ranges: list[tuple[int, int]] = []
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "ERROR":
+            if _CONDITIONAL_RE.search(source, node.start_byte, node.end_byte):
+                ranges.append((node.start_byte, node.end_byte))
+            continue
+        if node.has_error:
+            stack.extend(node.children)
+    return ranges
+
+
 def _kind_from_capture(capture_name: str) -> str:
     """Map tree-sitter capture names to symbol kinds."""
     prefix = capture_name.split(".")[0]
@@ -1112,42 +1179,62 @@ class Indexer:
         tree = parser.parse(source)
         root = tree.root_node
 
-        cursor = QueryCursor(query)
-        matches = cursor.matches(root)
-
         # First pass: collect all symbol info
-        raw_symbols: list[tuple[Node, str, str | None]] = []  # (def_node, kind, name)
+        def collect(node: Node) -> list[tuple[Node, str, str | None]]:
+            found: list[tuple[Node, str, str | None]] = []  # (def_node, kind, name)
+            for _pattern_idx, match_captures in QueryCursor(query).matches(node):
+                def_node = None
+                symbol_name = None
+                kind = "unknown"
 
-        for _pattern_idx, match_captures in matches:
-            def_node = None
-            symbol_name = None
-            kind = "unknown"
+                for capture_name, nodes in match_captures.items():
+                    if capture_name.endswith(".def") and nodes:
+                        def_node = nodes[0]
+                        kind = _kind_from_capture(capture_name)
+                    elif capture_name.endswith(".name") and nodes:
+                        symbol_name = nodes[0].text.decode("utf-8", errors="replace")
 
-            for capture_name, nodes in match_captures.items():
-                if capture_name.endswith(".def") and nodes:
-                    def_node = nodes[0]
-                    kind = _kind_from_capture(capture_name)
-                elif capture_name.endswith(".name") and nodes:
-                    symbol_name = nodes[0].text.decode("utf-8", errors="replace")
+                if def_node is None:
+                    continue
 
-            if def_node is None:
-                continue
+                # For templates without a name, extract from the inner declaration
+                if symbol_name is None and kind == "template":
+                    symbol_name = _extract_template_name(def_node)
 
-            # For templates without a name, extract from the inner declaration
-            if symbol_name is None and kind == "template":
-                symbol_name = _extract_template_name(def_node)
+                # Error recovery inserts MISSING nodes whose text is empty, and a
+                # path left dangling by one — `M. = function() end` — ends on its
+                # separator. An empty name is not NULL, so it would slip past every
+                # IS NOT NULL filter and reach the name index.
+                if symbol_name == "" or (symbol_name or "").endswith((".", ":")):
+                    continue
 
-            # Error recovery inserts MISSING nodes whose text is empty, and a
-            # path left dangling by one — `M. = function() end` — ends on its
-            # separator. An empty name is not NULL, so it would slip past every
-            # IS NOT NULL filter and reach the name index.
-            if symbol_name == "" or (symbol_name or "").endswith((".", ":")):
-                continue
+                if lang == "lua" and _lua_nameless_definition(def_node):
+                    continue
 
-            if lang == "lua" and _lua_nameless_definition(def_node):
-                continue
+                found.append((def_node, kind, symbol_name))
+            return found
 
-            raw_symbols.append((def_node, kind, symbol_name))
+        raw_symbols = collect(root)
+
+        # A conditional that splits a brace across its branches breaks the
+        # parse, and the definitions caught in the ERROR node are lost or cut
+        # short. Reparse with only the first branch of each conditional, and
+        # take the definitions inside the broken ranges from that parse. The
+        # rest of the file keeps the original parse: there, a definition in
+        # each branch — one per platform — is still extracted.
+        if lang in _PREPROCESSED_LANGS and root.has_error:
+            broken = _conditional_error_ranges(root, source)
+            if broken:
+                def in_broken(node: Node) -> bool:
+                    return any(s <= node.start_byte and node.end_byte <= e for s, e in broken)
+
+                recovery_tree = parser.parse(_first_branch_only(source))
+                raw_symbols = [sym for sym in raw_symbols if not in_broken(sym[0])]
+                raw_symbols += [sym for sym in collect(recovery_tree.root_node)
+                                if in_broken(sym[0])]
+                # Containers before what they contain: the second pass finds
+                # a parent among the symbols already inserted.
+                raw_symbols.sort(key=lambda sym: (sym[0].start_byte, -sym[0].end_byte))
 
         # Second pass: insert symbols and track parent-child relationships
         # Track container symbols (classes, structs, namespaces) by their byte ranges
@@ -1157,11 +1244,14 @@ class Indexer:
         count = 0
 
         for def_node, kind, symbol_name in raw_symbols:
-            content_text = def_node.text.decode("utf-8", errors="replace")
+            # From the file, not from the node: a node recovered from the
+            # reparse would otherwise store its body with the later branches
+            # blanked out.
+            body_bytes = source[def_node.start_byte:def_node.end_byte]
+            content_text = body_bytes.decode("utf-8", errors="replace")
             doc = _extract_doc_comment(source, def_node)
             sig = _extract_signature(source, def_node, lang)
 
-            body_bytes = def_node.text
             body_h = hashlib.sha256(body_bytes).hexdigest()[:16]
 
             # Find parent: look for the tightest container that encloses this symbol
