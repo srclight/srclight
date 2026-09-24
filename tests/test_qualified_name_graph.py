@@ -197,3 +197,87 @@ def test_overloads_do_not_list_a_location_twice(serve):
     for entry in _entries(server.get_callers("Gadget_c::spinGadget"), "callers"):
         locations = entry.get("locations", [])
         assert len(locations) == len({(loc["file"], loc["line"]) for loc in locations})
+
+
+MILL = {
+    "mill.h": """\
+class Mill_c {
+public:
+    static void grindGrain();
+    void firstStep();
+    void secondStep();
+};
+""",
+    "mill.cpp": """\
+#include "mill.h"
+
+void Mill_c::grindGrain() {
+}
+
+void Mill_c::firstStep() {
+    grindGrain();
+}
+
+void Mill_c::secondStep() {
+    grindGrain();
+}
+
+void freeOne() {
+    Mill_c::grindGrain();
+}
+
+void freeTwo() {
+    Mill_c::grindGrain();
+}
+""",
+}
+
+COG = {
+    "cog.h": """\
+namespace gear {
+class Cog_c {
+public:
+    void spinCog();
+};
+}
+""",
+    "cog.cpp": """\
+#include "cog.h"
+
+using namespace gear;
+
+void Cog_c::spinCog() {
+    helperTurn();
+}
+
+void helperTurn() {
+}
+
+void runCog(gear::Cog_c* cog) {
+    cog->spinCog();
+}
+""",
+}
+
+
+def test_impact_counts_the_callers_of_both_halves(serve):
+    """Unqualified calls land on the declaration and `C::f()` calls on the
+    definition: impact must count both, as get_callers does."""
+    server = serve(MILL)
+    callers = _names(server.get_callers("Mill_c::grindGrain"), "callers")
+    assert {"firstStep", "secondStep", "freeOne", "freeTwo"} <= {
+        name.split("::")[-1] for name in callers
+    }
+
+    impact = json.loads(server.get_impact("Mill_c::grindGrain"))
+    assert impact["direct_dependents"] >= 4
+
+
+def test_a_namespace_qualified_name_reaches_a_definition_written_under_using(serve):
+    """Under `using namespace gear;` the definition is stored as `Cog_c::f`
+    while its declaration is `gear::Cog_c::f`: one method either way."""
+    server = serve(COG)
+    for name in ("gear::Cog_c::spinCog", "Cog_c::spinCog"):
+        payload = json.loads(server.get_callees(name))
+        assert "helperTurn" in {e["name"] for e in payload["callees"]}, name
+        assert "matched_symbols" not in payload, name

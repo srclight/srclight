@@ -870,7 +870,11 @@ def _matched_symbols(syms) -> dict:
     `C::f` reaches `ns::C::f` — and the same class in another namespace. The
     merged answer is only honest if it says what it merged.
     """
-    names = sorted({sym.qualified_name or sym.name for sym in syms})
+    names = {sym.qualified_name or sym.name for sym in syms}
+    # `C::f` and `ns::C::f` are one method written two ways (a definition
+    # under `using namespace ns;`): keep only names no other one ends with.
+    names = sorted(n for n in names
+                   if not any(other != n and other.endswith("::" + n) for other in names))
     return {"matched_symbols": names} if len(names) > 1 else {}
 
 
@@ -2972,8 +2976,8 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = _impact_symbol(db, symbol_name)
-        if sym is None:
+        syms = db.get_graph_symbols(symbol_name)
+        if not syms:
             db.close()
             return _symbol_not_found_error(symbol_name, project)
         # Build sym_to_community map from stored data
@@ -2985,12 +2989,13 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
         flows = db.get_execution_flows()
         # Reconstruct flow step dicts for compute_impact
         flow_dicts = _reconstruct_flows(db, flows)
-        result = compute_impact(db, sym.id, sym_to_comm, flow_dicts)
+        result = compute_impact(db, syms[0].id, sym_to_comm, flow_dicts,
+                                also=[s.id for s in syms[1:]])
         db.close()
     else:
         db = _get_db()
-        sym = _impact_symbol(db, symbol_name)
-        if sym is None:
+        syms = db.get_graph_symbols(symbol_name)
+        if not syms:
             return _symbol_not_found_error(symbol_name)
         communities = db.get_communities()
         sym_to_comm = {}
@@ -2999,28 +3004,15 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
                 sym_to_comm[m["id"]] = c["id"]
         flows = db.get_execution_flows()
         flow_dicts = _reconstruct_flows(db, flows)
-        result = compute_impact(db, sym.id, sym_to_comm, flow_dicts)
+        result = compute_impact(db, syms[0].id, sym_to_comm, flow_dicts,
+                                also=[s.id for s in syms[1:]])
 
     return json.dumps({
         "symbol": symbol_name,
         "project": project,
         **result,
+        **_matched_symbols(syms),
     }, indent=2)
-
-
-def _impact_symbol(db: Database, symbol_name: str):
-    """The one symbol impact analysis runs on.
-
-    Of the symbols the name stands for (see Database.get_graph_symbols), the
-    most depended on: impact is about dependents, and calls land on a
-    method's declaration rather than on its definition. Picking the
-    definition made get_impact call a method with callers an untouched entry
-    point while get_callers listed them.
-    """
-    syms = db.get_graph_symbols(symbol_name)
-    if not syms:
-        return None
-    return max(syms, key=lambda sym: len(db.get_callers(sym.id)))
 
 
 def _reconstruct_flows(db: Database, stored_flows: list[dict]) -> list[dict]:

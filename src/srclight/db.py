@@ -680,14 +680,23 @@ class Database:
         if "::" not in name:
             sym = self.get_symbol_by_name(name)
             return [sym] if sym is not None else []
+        # And the reverse: under `using namespace ns;` a definition's
+        # qualified name is `C::f` while its declaration's is `ns::C::f`, so
+        # `ns::C::f` must reach a qualified name equal to one of its tails.
+        # Only the qualified name: the plain name of a definition is `C::f`
+        # in every namespace, and matching it would pull in `other::C::f`.
+        parts = name.split("::")
+        tails = ["::".join(parts[i:]) for i in range(1, len(parts) - 1)]
         tail = "::" + name
+        marks = ",".join("?" * len(tails)) or "NULL"
         rows = self.conn.execute(
-            """SELECT s.*, f.path as file_path FROM symbols s
+            f"""SELECT s.*, f.path as file_path FROM symbols s
                JOIN files f ON s.file_id = f.id
                WHERE s.name = ? OR s.qualified_name = ?
                   OR substr(s.qualified_name, -?) = ?
+                  OR s.qualified_name IN ({marks})
                ORDER BY s.id""",
-            (name, name, len(tail), tail),
+            (name, name, len(tail), tail, *tails),
         ).fetchall()
         return [self._row_to_symbol(r) for r in rows]
 

@@ -15,7 +15,7 @@ import logging
 import math
 import re
 from collections import Counter
-from typing import Any
+from typing import Any, Iterable
 
 from .db import Database
 
@@ -431,8 +431,13 @@ def compute_impact(
     sym_to_community: dict[int, int],
     flows: list[dict[str, Any]],
     max_depth: int = 3,
+    also: Iterable[int] = (),
 ) -> dict[str, Any]:
     """Compute blast radius and risk for modifying a symbol.
+
+    `also` names other symbols that are the same entity — a C++ method's
+    declaration and definition: calls land on either, so the impact is that
+    of all of them together.
 
     Returns dict with keys:
         risk (LOW/MEDIUM/HIGH/CRITICAL),
@@ -440,20 +445,23 @@ def compute_impact(
         affected_communities, affected_flows,
         is_entry_point, details
     """
+    ids = {symbol_id, *also}
+
     # Get direct callers (returns list of {"symbol": SymbolRecord, "edge_type": ...})
-    direct = db.get_callers(symbol_id)
-    direct_ids = {d["symbol"].id for d in direct}
+    direct_ids = {d["symbol"].id for i in ids for d in db.get_callers(i)} - ids
 
     # Get transitive dependents (same format)
-    transitive = db.get_dependents(symbol_id, transitive=True, max_depth=max_depth)
-    transitive_ids = {d["symbol"].id for d in transitive}
+    transitive_ids = {
+        d["symbol"].id for i in ids
+        for d in db.get_dependents(i, transitive=True, max_depth=max_depth)
+    } - ids
 
     # Affected communities
-    my_comm = sym_to_community.get(symbol_id)
+    my_comms = {sym_to_community.get(i) for i in ids}
     affected_comms = set()
     for dep_id in transitive_ids:
         comm = sym_to_community.get(dep_id)
-        if comm is not None and comm != my_comm:
+        if comm is not None and comm not in my_comms:
             affected_comms.add(comm)
 
     # Affected flows
@@ -461,9 +469,9 @@ def compute_impact(
     is_entry_point = False
     for flow in flows:
         step_ids = {s["symbol_id"] for s in flow["steps"]}
-        if symbol_id in step_ids:
+        if ids & step_ids:
             affected_flow_labels.append(flow["label"])
-            if flow["entry_symbol_id"] == symbol_id:
+            if flow["entry_symbol_id"] in ids:
                 is_entry_point = True
 
     # Risk scoring
