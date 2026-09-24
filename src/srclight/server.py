@@ -864,17 +864,14 @@ def _union_edges(syms, fetch) -> list[dict]:
     return edges
 
 
-def _matched_symbols(syms) -> dict:
+def _matched_symbols(db: Database, syms) -> dict:
     """Name what a qualified name was resolved to, when it was more than one.
 
-    `C::f` reaches `ns::C::f` — and the same class in another namespace. The
-    merged answer is only honest if it says what it merged.
+    `C::f` reaches `ns::C::f` — and the same class in another namespace, or a
+    global class of that name. The merged answer is only honest if it says
+    what it merged.
     """
-    names = {sym.qualified_name or sym.name for sym in syms}
-    # `C::f` and `ns::C::f` are one method written two ways (a definition
-    # under `using namespace ns;`): keep only names no other one ends with.
-    names = sorted(n for n in names
-                   if not any(other != n and other.endswith("::" + n) for other in names))
+    names = db.graph_entity_names(syms)
     return {"matched_symbols": names} if len(names) > 1 else {}
 
 
@@ -948,13 +945,14 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
             return _symbol_not_found_error(symbol_name, project)
         callers = _union_edges(syms, db.get_callers)
         result = _dedup_edges(callers)
+        matched = _matched_symbols(db, syms)
         db.close()
         return json.dumps({
             "project": project,
             "symbol": symbol_name,
             "caller_count": len(result),
             "callers": result,
-            **_matched_symbols(syms),
+            **matched,
         }, indent=2)
 
     db = _get_db()
@@ -968,7 +966,7 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
     result = _dedup_edges(callers)
 
     payload = {"symbol": symbol_name, "caller_count": len(result), "callers": result,
-               **_matched_symbols(syms)}
+               **_matched_symbols(db, syms)}
     # A stale caller file makes the whole edge list suspect — stamp the union.
     _stamp_freshness(payload, (c.get("file") or c.get("file_path")
                                for c in result if isinstance(c, dict)))
@@ -1005,13 +1003,14 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
             return _symbol_not_found_error(symbol_name, project)
         callees = _union_edges(syms, db.get_callees)
         result = _dedup_edges(callees)
+        matched = _matched_symbols(db, syms)
         db.close()
         return json.dumps({
             "project": project,
             "symbol": symbol_name,
             "callee_count": len(result),
             "callees": result,
-            **_matched_symbols(syms),
+            **matched,
         }, indent=2)
 
     db = _get_db()
@@ -1023,7 +1022,7 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
     result = _dedup_edges(callees)
 
     payload = {"symbol": symbol_name, "callee_count": len(result), "callees": result,
-               **_matched_symbols(syms)}
+               **_matched_symbols(db, syms)}
     _stamp_freshness(payload, (c.get("file") or c.get("file_path")
                                for c in result if isinstance(c, dict)))
     return json.dumps(payload, indent=2)
@@ -1185,6 +1184,7 @@ def get_dependents(symbol_name: str, transitive: bool = False, project: str | No
             db.close()
             return _symbol_not_found_error(symbol_name, project)
         deps = _union_edges(syms, lambda i: db.get_dependents(i, transitive=transitive))
+        matched = _matched_symbols(db, syms)
         db.close()
     else:
         db = _get_db()
@@ -1193,6 +1193,7 @@ def get_dependents(symbol_name: str, transitive: bool = False, project: str | No
         if not syms:
             return _symbol_not_found_error(symbol_name)
         deps = _union_edges(syms, lambda i: db.get_dependents(i, transitive=transitive))
+        matched = _matched_symbols(db, syms)
 
     result = _dedup_edges(deps)
     return json.dumps({
@@ -1200,7 +1201,7 @@ def get_dependents(symbol_name: str, transitive: bool = False, project: str | No
         "transitive": transitive,
         "dependent_count": len(result),
         "dependents": result,
-        **_matched_symbols(syms),
+        **matched,
     }, indent=2)
 
 
@@ -2991,6 +2992,7 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
         flow_dicts = _reconstruct_flows(db, flows)
         result = compute_impact(db, syms[0].id, sym_to_comm, flow_dicts,
                                 also=[s.id for s in syms[1:]])
+        matched = _matched_symbols(db, syms)
         db.close()
     else:
         db = _get_db()
@@ -3006,12 +3008,13 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
         flow_dicts = _reconstruct_flows(db, flows)
         result = compute_impact(db, syms[0].id, sym_to_comm, flow_dicts,
                                 also=[s.id for s in syms[1:]])
+        matched = _matched_symbols(db, syms)
 
     return json.dumps({
         "symbol": symbol_name,
         "project": project,
         **result,
-        **_matched_symbols(syms),
+        **matched,
     }, indent=2)
 
 

@@ -685,8 +685,12 @@ class Database:
         # `ns::C::f` must reach a qualified name equal to one of its tails.
         # Only the qualified name: the plain name of a definition is `C::f`
         # in every namespace, and matching it would pull in `other::C::f`.
+        # A tail is that short form only when its scope is no type of its
+        # own: with a global `C` in the index, `C::f` is another class's
+        # method, not `ns::C::f` written under `using namespace ns`.
         parts = name.split("::")
-        tails = ["::".join(parts[i:]) for i in range(1, len(parts) - 1)]
+        tails = [t for t in ("::".join(parts[i:]) for i in range(1, len(parts) - 1))
+                 if not self._names_a_type(t.rsplit("::", 1)[0])]
         tail = "::" + name
         marks = ",".join("?" * len(tails)) or "NULL"
         rows = self.conn.execute(
@@ -699,6 +703,33 @@ class Database:
             (name, name, len(tail), tail, *tails),
         ).fetchall()
         return [self._row_to_symbol(r) for r in rows]
+
+    def _names_a_type(self, qualified_name: str) -> bool:
+        """Whether a class, struct or union is indexed under exactly this
+        qualified name."""
+        assert self.conn is not None
+        return self.conn.execute(
+            """SELECT 1 FROM symbols
+               WHERE qualified_name = ? AND kind IN ('class', 'struct', 'union', 'template')
+               LIMIT 1""",
+            (qualified_name,),
+        ).fetchone() is not None
+
+    def graph_entity_names(self, syms: list[SymbolRecord]) -> list[str]:
+        """The distinct entities a set of graph symbols stands for, by name.
+
+        `C::f` beside `ns::C::f` is one method written two ways — a definition
+        under `using namespace ns` — unless a type `C` exists of its own, in
+        which case they are two methods of two classes and both are named.
+        """
+        names = {sym.qualified_name or sym.name for sym in syms}
+
+        def short_form(n: str) -> bool:
+            return ("::" in n
+                    and any(o != n and o.endswith("::" + n) for o in names)
+                    and not self._names_a_type(n.rsplit("::", 1)[0]))
+
+        return sorted(n for n in names if not short_form(n))
 
     def get_symbols_by_name(self, name: str, limit: int = 20) -> list[SymbolRecord]:
         """Get all symbols matching exact name, with LIKE fallback."""

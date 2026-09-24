@@ -446,15 +446,19 @@ def compute_impact(
         is_entry_point, details
     """
     ids = {symbol_id, *also}
+    # Edges between the halves of one entity (a definition calling its own
+    # declaration) are not dependents. With a single symbol nothing is taken
+    # away, so a recursive call still counts, as it always has.
+    internal = ids if also else set()
 
     # Get direct callers (returns list of {"symbol": SymbolRecord, "edge_type": ...})
-    direct_ids = {d["symbol"].id for i in ids for d in db.get_callers(i)} - ids
+    direct_ids = {d["symbol"].id for i in ids for d in db.get_callers(i)} - internal
 
     # Get transitive dependents (same format)
     transitive_ids = {
         d["symbol"].id for i in ids
         for d in db.get_dependents(i, transitive=True, max_depth=max_depth)
-    } - ids
+    } - internal
 
     # Affected communities
     my_comms = {sym_to_community.get(i) for i in ids}
@@ -469,7 +473,8 @@ def compute_impact(
     is_entry_point = False
     for flow in flows:
         step_ids = {s["symbol_id"] for s in flow["steps"]}
-        if ids & step_ids:
+        # Several ids can sit in one flow, and flows can share a label.
+        if ids & step_ids and flow["label"] not in affected_flow_labels:
             affected_flow_labels.append(flow["label"])
             if flow["entry_symbol_id"] in ids:
                 is_entry_point = True

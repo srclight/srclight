@@ -281,3 +281,64 @@ def test_a_namespace_qualified_name_reaches_a_definition_written_under_using(ser
         payload = json.loads(server.get_callees(name))
         assert "helperTurn" in {e["name"] for e in payload["callees"]}, name
         assert "matched_symbols" not in payload, name
+
+
+GATES = {
+    "gate.h": """\
+class Gate_c {
+public:
+    void openGate();
+};
+
+namespace yard {
+class Gate_c {
+public:
+    void openGate();
+};
+}
+""",
+    "gate.cpp": """\
+#include "gate.h"
+
+void Gate_c::openGate() {
+    globalWork();
+}
+
+namespace yard {
+void Gate_c::openGate() {
+    yardWork();
+}
+}
+
+void globalWork() {
+}
+
+void yardWork() {
+}
+
+void globalCaller(Gate_c* gate) {
+    gate->openGate();
+}
+""",
+}
+
+
+def test_a_namespaced_name_does_not_reach_a_global_class_of_the_same_name(serve):
+    """`Gate_c::openGate` is the short form of `yard::Gate_c::openGate` only
+    when no global `Gate_c` exists; here one does, and it is another class."""
+    server = serve(GATES)
+    callees = _names(server.get_callees("yard::Gate_c::openGate"), "callees")
+    assert "yardWork" in callees
+    assert "globalWork" not in callees
+
+
+def test_merging_two_classes_is_reported(serve):
+    server = serve(GATES)
+    payload = json.loads(server.get_callees("Gate_c::openGate"))
+    assert {"Gate_c::openGate", "yard::Gate_c::openGate"} <= set(payload["matched_symbols"])
+
+
+def test_impact_lists_each_flow_once(serve):
+    server = serve(GATES)
+    flows = json.loads(server.get_impact("Gate_c::openGate"))["affected_flows"]
+    assert len(flows) == len(set(flows))
