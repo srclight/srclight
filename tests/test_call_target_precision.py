@@ -460,3 +460,49 @@ int drive(Car* car) {
            WHERE a.name = 'drive' AND b.name = 'readSpeed'""")}
     db.close()
     assert "lost.cpp" in reached and "legacy.c" not in reached
+
+
+def test_a_bare_call_reaches_a_free_function_template(tmp_path):
+    edges = _edges({"bits.h": """\
+template <typename T>
+void raiseFlag(T* bits, T mask) {
+    *bits |= mask;
+}
+""", "shop/shop.cpp": """\
+void openShop(unsigned* bits) {
+    raiseFlag(bits, 4u);
+}
+"""}, tmp_path)
+    assert ("openShop", "raiseFlag") in _pairs(edges)
+
+
+def test_a_class_of_the_own_namespace_keeps_its_constructor(tmp_path):
+    edges = _edges({"menu.cpp": """\
+namespace ui {
+class Option {
+public:
+    Option(int v) {}
+};
+
+void pickOption() {
+    Option(3);
+}
+}
+"""}, tmp_path)
+    assert ("ui::pickOption", "ui::Option::Option") in _pairs(edges)
+
+
+def test_a_member_call_keeps_a_header_function(tmp_path):
+    """Headers are read as C or C++; a function in one may be a lost method."""
+    edges = _edges({"hub.h": """\
+int fetchSlot(int i) {
+    return i;
+}
+""", "cls/hub_c.h": """\
+class Hub_c { public: int fetchSlot(int i); };
+""", "use/use.cpp": """\
+int peek(Hub_c* hub) {
+    return hub->fetchSlot(1);
+}
+"""}, tmp_path)
+    assert ("peek", "fetchSlot") in _pairs(edges)

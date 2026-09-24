@@ -723,8 +723,16 @@ def _reference_forms(content: str, name: str) -> tuple[set[str], set[str]]:
 _MEMBER_KINDS = frozenset({"method", "template"})
 
 
+def _without_template_args(qualified: str) -> str:
+    while True:
+        stripped = re.sub(r"<[^<>]*>", "", qualified)
+        if stripped == qualified:
+            return qualified
+        qualified = stripped
+
+
 def _is_constructor(t: dict, name: str) -> bool:
-    return (t.get("qualified") or "").endswith(f"{name}::{name}")
+    return _without_template_args(t.get("qualified") or "").endswith(f"{name}::{name}")
 
 
 def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
@@ -753,7 +761,11 @@ def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
 
     own_class = source_scope and source_scope.rsplit("::", 1)[-1] != name
     if own_class and forms <= {"bare", "this"}:
-        own = [t for t in targets if qualified(t) == f"{source_scope}::{name}"]
+        # The class or function of that name in the own scope — and a
+        # class's constructor with it.
+        own = [t for t in targets
+               if _without_template_args(qualified(t)) in (
+                   f"{source_scope}::{name}", f"{source_scope}::{name}::{name}")]
         if own:
             return own, "same_class"
     if forms == {"qualified"}:
@@ -764,15 +776,17 @@ def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
             return named, "qualified" if len(named) == 1 else None
     preferred = targets
     if forms <= {"member", "this"}:
-        # A C function is never a method. A C++ one may be: an inline method
-        # in a class body the parser could not follow is stored as one.
+        # A function in a `.c` file is never a method. One in C++ — or in a
+        # header, which is C or C++ — may be: an inline method in a class
+        # body the parser could not follow is stored as one.
         preferred = [t for t in targets
                      if t["kind"] in _MEMBER_KINDS
-                     or (t["kind"] == "function" and t.get("language") != "c")]
+                     or (t["kind"] == "function" and not t["file"].endswith(".c"))]
     elif forms == {"global"} or (
             source_kind == "function" and not source_scope and forms <= {"bare", "global"}):
+        # A template may be a free function template; only a method is out.
         preferred = [t for t in targets
-                     if t["kind"] not in _MEMBER_KINDS or _is_constructor(t, name)]
+                     if t["kind"] != "method" or _is_constructor(t, name)]
     return (preferred or targets), None
 
 
@@ -1598,7 +1612,7 @@ class Indexer:
         excluded = _doc_languages()
         placeholders = ",".join("?" * len(excluded))
         rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.qualified_name, s.kind, f.path as file_path, f.language
+            f"""SELECT s.id, s.name, s.qualified_name, s.kind, f.path as file_path
                FROM symbols s JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
@@ -1609,8 +1623,7 @@ class Indexer:
         for row in rows:
             name = row["name"]
             info = {"id": row["id"], "file": row["file_path"].replace("\\", "/"),
-                    "kind": row["kind"], "qualified": row["qualified_name"],
-                    "language": row["language"]}
+                    "kind": row["kind"], "qualified": row["qualified_name"]}
             symbol_info[row["id"]] = info
             if name not in name_to_symbols:
                 name_to_symbols[name] = []
