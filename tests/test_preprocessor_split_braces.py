@@ -532,3 +532,97 @@ void openSerialPort() {
         ("openSerialPort", 2, 4),
         ("openSerialPort", 6, 8),
     ]
+
+
+def test_a_dead_first_branch_does_not_cut_a_function_short(tmp_path, db):
+    """The reparse keeps the first branch of each conditional, which is not
+    always the live one: here `#if 0` is dead, closes its own brace, and the
+    live `#else` opens one closed after `#endif`. The reparse then ends the
+    function early — the original parse, which read it cleanly, must stand."""
+    _index(tmp_path, db, {"legacy.cpp": """\
+void refreshAll(int mode) {
+#if 0
+    if (mode) {
+        clearGauge(0);
+    }
+#else
+    if (mode > 1) {
+#endif
+        clearGauge(1);
+    }
+    clearGauge(2);
+    applyMode(mode);
+}
+
+void applyMode(int mode) {
+}
+"""})
+
+    assert ("refreshAll", 1, 13) in _symbols(db, "legacy.cpp")
+    callees = {r["name"] for r in db.conn.execute(
+        """SELECT t.name FROM symbol_edges e
+           JOIN symbols s ON e.source_id = s.id
+           JOIN symbols t ON e.target_id = t.id
+           WHERE s.name = 'refreshAll'"""
+    )}
+    assert "applyMode" in callees
+
+
+def test_complementary_conditionals_do_not_cut_a_function_short(tmp_path, db):
+    """`#ifdef X` and `#ifndef X` each close a brace; the reparse keeps both
+    first branches, one closing brace too many."""
+    _index(tmp_path, db, {"opt.cpp": """\
+void configureOptions(int flags) {
+    if (flags) {
+        clearGauge(1);
+#ifdef OPTION_A
+    }
+#endif
+#ifndef OPTION_A
+    }
+#endif
+    clearGauge(2);
+    applyMode(flags);
+}
+
+void applyMode(int mode) {
+}
+"""})
+
+    assert ("configureOptions", 1, 12) in _symbols(db, "opt.cpp")
+
+
+def test_a_raw_string_does_not_hide_the_directives_after_it(tmp_path, db):
+    """A raw string can hold a quote and a `/*` without ending or opening
+    anything. Read as an ordinary string, it opened a comment that hid every
+    directive after it, and the recovery found nothing to repair."""
+    _index(tmp_path, db, {"gauge.cpp": 'const char* kPattern = R"(a " /* b)";\n\n'
+                                       + GAUGE_CPP})
+
+    assert ("Gauge_c::updateState", 7, 22) in _symbols(db, "gauge.cpp")
+
+
+def test_a_line_comment_continued_by_a_backslash_hides_the_next_line(tmp_path, db):
+    """A `//` comment ending in a backslash runs on into the next line, so a
+    `#else` there is commented out — not a branch switch."""
+    _index(tmp_path, db, {"gauge.cpp": """\
+void Gauge_c::checkFlags() {
+#ifdef PLATFORM_DESKTOP
+    // the old code path was here \\
+#else
+    if (isPanelVisible()) {
+#else
+    if (isPromptOpen()) {
+#endif
+        refreshGauge();
+    }
+}
+
+void Gauge_c::refreshGauge() {
+}
+"""})
+
+    assert _symbols(db, "gauge.cpp") == [
+        ("Gauge_c::checkFlags", 1, 11),
+        ("Gauge_c::refreshGauge", 13, 14),
+    ]

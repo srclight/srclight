@@ -6,6 +6,7 @@ Incremental: only re-indexes files whose content hash has changed.
 
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import hashlib
 import json
@@ -696,14 +697,34 @@ _BRANCH_END_RE = re.compile(
 _CHAR_LITERAL_RE = re.compile(rb"'(?:\\[^\n]{1,8}?|[^'\\\n]{1,4})'")
 
 
+# What follows the quote of a C++ raw string: its delimiter, then `(`.
+_RAW_DELIMITER_RE = re.compile(rb'([^()\\\s]{0,16})\(')
+
+
+def _raw_string_prefix(source: bytes, quote: int) -> bool:
+    """Whether the quote at `quote` opens a C++ raw string: R, u8R, uR, UR or
+    LR right before it, not ending a longer identifier."""
+    if quote == 0 or source[quote - 1] != 0x52:  # R
+        return False
+    start = quote - 1
+    if source[start - 2:start] == b"u8":
+        start -= 2
+    elif start > 0 and source[start - 1] in (0x75, 0x55, 0x4C):  # u U L
+        start -= 1
+    before = source[start - 1] if start > 0 else 0x20
+    return not (chr(before).isalnum() or before == 0x5F)
+
+
 def _c_comment_bytes(source: bytes) -> bytearray:
     """Mark the bytes of C/C++ comments with 1, everything else with 0.
 
-    Strings are stepped over, so a `/*` inside one opens nothing. A quote
-    opens a character literal only when one closes it shortly after on the
-    same line: a digit separator (1'000) or the apostrophe of an #error
-    message is a lone quote, and taking it for an opening one would hide
-    every comment after it.
+    Strings are stepped over, so a `/*` inside one opens nothing — raw
+    strings included, which may hold quotes and newlines. A quote opens a
+    character literal only when one closes it shortly after on the same
+    line: a digit separator (1'000) or the apostrophe of an #error message
+    is a lone quote, and taking it for an opening one would hide every
+    comment after it. A `//` comment ending in a backslash runs on into the
+    next line, as the preprocessor splices the two.
     """
     marks = bytearray(len(source))
     i, n = 0, len(source)
@@ -715,9 +736,19 @@ def _c_comment_bytes(source: bytes) -> bytearray:
                 end = n if end == -1 else end + 2
             else:
                 end = source.find(b"\n", i + 2)
+                while end != -1 and source[:end].rstrip(b"\r").endswith(b"\\"):
+                    end = source.find(b"\n", end + 1)
                 end = n if end == -1 else end
             marks[i:end] = b"\x01" * (end - i)
             i = end
+        elif c == 0x22 and _raw_string_prefix(source, i):  # R"delim( ... )delim"
+            opening = _RAW_DELIMITER_RE.match(source, i + 1)
+            if opening is None:
+                i += 1
+                continue
+            closing = b")" + opening.group(1) + b'"'
+            end = source.find(closing, opening.end())
+            i = n if end == -1 else end + len(closing)
         elif c == 0x22:  # "
             i += 1
             while i < n and source[i] not in (0x22, 0x0A):
@@ -1335,6 +1366,7 @@ class Indexer:
                          if _extent_is_sound(sym[0])]
             by_start = {(k, n, node.start_byte): i for i, (node, k, n) in enumerate(recovered)}
             by_end = {(k, n, node.end_byte): i for i, (node, k, n) in enumerate(recovered)}
+            recovered_starts = sorted(node.start_byte for node, _kind, _name in recovered)
             used: set[int] = set()
             merged = []
             for sym in raw_symbols:
@@ -1345,9 +1377,23 @@ class Indexer:
                     if i is not None and i not in used:
                         used.add(i)
                         twin = recovered[i][0]
+                        # The reparse keeps each conditional's FIRST branch,
+                        # which is not always the live one (`#if 0`), and
+                        # can close one brace more than the real code. So it
+                        # may extend a definition the original parse cut
+                        # short, but it shortens one only when the part it
+                        # drops holds another definition the reparse reads
+                        # on its own — the original ran on over it. A tail of
+                        # mere statements means the reparse ended too early.
                         if (twin.start_byte, twin.end_byte) != (node.start_byte, node.end_byte):
-                            sym = recovered[i]
-                            recovered_nodes.add(id(twin))
+                            grows = (twin.start_byte <= node.start_byte
+                                     and twin.end_byte >= node.end_byte)
+                            first = bisect.bisect_left(recovered_starts, twin.end_byte)
+                            swallowed = (first < len(recovered_starts)
+                                         and recovered_starts[first] < node.end_byte)
+                            if grows or swallowed:
+                                sym = recovered[i]
+                                recovered_nodes.add(id(twin))
                         break
                 merged.append(sym)
             added = [sym for i, sym in enumerate(recovered) if i not in used]
