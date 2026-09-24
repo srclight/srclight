@@ -133,3 +133,23 @@ def test_a_c_keyword_never_names_a_symbol(tmp_path, db, filename, text):
     as a function `switch`. No symbol in C or C++ can be named `switch`,
     `while` or `if`, wherever it sits."""
     assert _names(tmp_path, db, filename, text) == []
+
+
+@pytest.mark.parametrize("text, expected", [
+    # An error inside an enum's body says nothing about its name.
+    ("// namespace probe\nenum new { ALPHA = 1, BETA = FLAG(2) GAMMA };\n", ["new"]),
+    # An export macro reads as a type in the C++ grammar and errs the head.
+    ("// namespace probe\nAPI_EXPORT int new(int size) { return size; }\n", ["new"]),
+    # A struct local to a function is legal C, whatever its name.
+    ("// namespace probe\n"
+     "void outerPool(void) {\n"
+     "    struct new { int size; } slot;\n"
+     "    slot.size = 1;\n"
+     "}\n",
+     ["outerPool", "new"]),
+])
+def test_real_c_names_that_cpp_reserves_survive(tmp_path, db, text, expected):
+    """A `.h` file with `namespace ` near its top is read as C++, and C code
+    may name things `new`, `delete` or `class`. Only a function read inside
+    another function's body is error recovery's work."""
+    assert _names(tmp_path, db, "pool.h", text) == expected

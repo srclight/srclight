@@ -678,28 +678,23 @@ _CPP_KEYWORDS = _C_KEYWORDS | frozenset({
 _RESERVED_NAMES = {"c": _C_KEYWORDS, "cpp": _CPP_KEYWORDS}
 
 
-def _only_error_recovery_puts_it_here(node: Node) -> bool:
-    """Whether a definition sits where only error recovery could have made
-    one: its head (everything but its body) holds an error, or it lies inside
-    a function body, where C and C++ allow no function definition.
+def _function_inside_a_function(node: Node, kind: str) -> bool:
+    """Whether a definition is a function read inside another function's
+    body, where C and C++ allow none: error recovery's work.
 
-    An error inside the body says nothing — a macro used without its
-    semicolon puts one there in perfectly real code. A keyword-named
-    definition at file scope with a clean head is real: `new` or `delete` in
-    a C header that happens to be read as C++.
+    Only functions: a struct or an enum local to a function is legal C,
+    whatever its name. And nothing about errors: an export macro before a
+    real C function, or a stray token in an enum, puts an error in the C++
+    parse of perfectly real code.
     """
-    if any(child.has_error for child in node.children if child.type not in _BODY_TYPES):
-        return True
+    if kind not in ("function", "method"):
+        return False
     parent = node.parent
     while parent is not None:
         if parent.type == "compound_statement":
             return True
         parent = parent.parent
     return False
-
-
-# The children of a definition that are its body rather than its head.
-_BODY_TYPES = frozenset({"compound_statement", "field_declaration_list", "declaration_list"})
 
 
 def _kind_from_capture(capture_name: str) -> str:
@@ -1198,12 +1193,13 @@ class Indexer:
             # A keyword-named definition is error recovery's work — a statement
             # read as a definition — except for a macro, which may legally
             # redefine a keyword. A C keyword names nothing in either language
-            # and is always dropped; a word only C++ reserves (`new`, `class`)
-            # is a valid C name, so it is dropped only where error recovery put
-            # it (a C header read as C++ keeps its clean `new`).
+            # and is always dropped. A word only C++ reserves (`new`, `class`)
+            # is a valid C name, and C headers are often read as C++: it is
+            # dropped only as a function read inside another function's body
+            # (the `catch` of a try chain cut by #if).
             if kind != "macro" and symbol_name in _RESERVED_NAMES.get(lang, ()) and (
                     symbol_name in _C_KEYWORDS
-                    or _only_error_recovery_puts_it_here(def_node)):
+                    or _function_inside_a_function(def_node, kind)):
                 continue
 
             if lang == "lua" and _lua_nameless_definition(def_node):
