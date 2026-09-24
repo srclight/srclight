@@ -2051,10 +2051,13 @@ class Indexer:
                     source_scope = unqualified.rsplit("::", 1)[0]
                 # An out-of-line definition opens with its own name, `C::f`:
                 # that is no call to the declaration `f`.
+                # A destructor's own name, `~C()`, is no call to `C` either.
+                # The name is overwritten with an identifier, not blanked: the
+                # return type before it, `C C::f(`, must not read as `C(`.
                 own_blanked = (re.sub(
                     rf"(?<![\w:]){re.escape(source_name)}(?![\w])",
-                    " " * len(source_name), content, count=1)
-                    if "::" in source_name else content)
+                    "_" * len(source_name), content, count=1)
+                    if "::" in source_name or source_name.startswith("~") else content)
                 receivers_of: dict[str, set] = {}
                 forms_of = _reference_forms_all(
                     own_blanked, {n for n in referenced_names if "::" not in n},

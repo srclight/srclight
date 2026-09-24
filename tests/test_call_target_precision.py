@@ -1108,3 +1108,32 @@ void spin(short v) {
     assert "spin" in ctor_callers
     assert not ctor_callers & {"readAngle", "Lock_c"}
     assert ("readAngle", "Angle") in _pairs(edges)
+
+
+def test_returning_a_class_or_destroying_it_constructs_nothing(tmp_path):
+    edges = _edges({"angle.h": """\
+class Angle {
+public:
+    Angle(short v) {}
+    ~Angle() {}
+};
+
+class Cam_c {
+public:
+    Angle readAngle(Angle hint);
+    Angle mStored;
+};
+""", "cam.cpp": """\
+#include "angle.h"
+
+Angle Cam_c::readAngle(Angle hint) {
+    return mStored;
+}
+
+void spin(short v) {
+    Angle(v);
+}
+"""}, tmp_path)
+    ctor_callers = {a for a, b, _ in edges if b == "Angle::Angle"}
+    assert "spin" in ctor_callers
+    assert not ctor_callers & {"Cam_c::readAngle", "~Angle", "Angle::~Angle"}
