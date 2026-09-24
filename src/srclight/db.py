@@ -731,6 +731,15 @@ class Database:
 
         return sorted(n for n in names if not short_form(n))
 
+    def count_graph_targets(self, name: str) -> int:
+        """How many symbols a call written `name` could land on."""
+        assert self.conn is not None
+        return self.conn.execute(
+            """SELECT COUNT(*) FROM symbols WHERE name = ? AND kind IN
+               ('function','method','class','struct','enum','interface','template')""",
+            (name,),
+        ).fetchone()[0]
+
     def get_symbols_by_name(self, name: str, limit: int = 20) -> list[SymbolRecord]:
         """Get all symbols matching exact name, with LIKE fallback."""
         assert self.conn is not None

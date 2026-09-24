@@ -864,15 +864,43 @@ def _union_edges(syms, fetch) -> list[dict]:
     return edges
 
 
-def _matched_symbols(db: Database, syms) -> dict:
+def _matched_symbols(db: Database, syms, incoming: bool = True) -> dict:
     """Name what a qualified name was resolved to, when it was more than one.
 
     `C::f` reaches `ns::C::f` — and the same class in another namespace, or a
     global class of that name. The merged answer is only honest if it says
-    what it merged.
+    what it merged. For the calls into a symbol, it also says when the graph
+    cannot hold them all.
     """
     names = db.graph_entity_names(syms)
-    return {"matched_symbols": names} if len(names) > 1 else {}
+    context = {"matched_symbols": names} if len(names) > 1 else {}
+    if incoming:
+        context.update(_graph_coverage(db, syms))
+    return context
+
+
+def _graph_coverage(db: Database, syms) -> dict:
+    """Say when calls to a name are missing from the graph by design.
+
+    An empty caller list reads as "nobody calls this". For a name the graph
+    leaves out, or keeps only the calls the evidence decides, it means no
+    such thing — and the answer has to say so.
+    """
+    from .indexer import GRAPH_MAX_FANOUT, graph_name_excluded
+
+    for name in sorted({sym.name.rsplit("::", 1)[-1] for sym in syms}):
+        search = f"find_pattern(r'\\b{name}\\s*\\(') lists the call sites."
+        if graph_name_excluded(name):
+            return {"graph_note": (
+                f"Calls to `{name}` are not in the graph: the name is too short or "
+                f"too common to tell a call from a variable. {search}")}
+        defined = db.count_graph_targets(name)
+        if defined > GRAPH_MAX_FANOUT:
+            return {"graph_note": (
+                f"`{name}` is defined {defined} times. A call that only the name "
+                f"could resolve — `p->{name}()` with the type of `p` unknown — is "
+                f"left out, so callers may be missing. {search}")}
+    return {}
 
 
 def _dedup_edges(edges: list[dict]) -> list[dict]:
@@ -890,6 +918,10 @@ def _dedup_edges(edges: list[dict]) -> list[dict]:
             "edge_type": c["edge_type"],
             "confidence": confidence,
         }
+        # name_only: the call names a symbol of this name, and nothing tells
+        # which of its homonyms it is — the receiver's type is not known.
+        if c.get("resolution"):
+            entry["resolution"] = c["resolution"]
         if name not in by_name:
             by_name[name] = entry
             by_name[name]["_locations"] = [(s.file_path, s.start_line)]
@@ -1003,7 +1035,7 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
             return _symbol_not_found_error(symbol_name, project)
         callees = _union_edges(syms, db.get_callees)
         result = _dedup_edges(callees)
-        matched = _matched_symbols(db, syms)
+        matched = _matched_symbols(db, syms, incoming=False)
         db.close()
         return json.dumps({
             "project": project,
@@ -1022,7 +1054,7 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
     result = _dedup_edges(callees)
 
     payload = {"symbol": symbol_name, "callee_count": len(result), "callees": result,
-               **_matched_symbols(db, syms)}
+               **_matched_symbols(db, syms, incoming=False)}
     _stamp_freshness(payload, (c.get("file") or c.get("file_path")
                                for c in result if isinstance(c, dict)))
     return json.dumps(payload, indent=2)

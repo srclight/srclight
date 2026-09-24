@@ -543,6 +543,177 @@ def _on_boundary(content: str, index: int) -> bool:
     return before != after
 
 
+# Names left out of the call graph. A short or everyday word is more often a
+# variable than a call, and a name defined in many places links each call to
+# all of them when nothing but the name resolves it.
+GRAPH_MIN_NAME_LEN = 4
+GRAPH_NOISE_NAMES = frozenset({
+    # Common short identifiers
+    "get", "set", "run", "new", "end", "add", "put", "pop", "top",
+    "map", "key", "val", "len", "str", "int", "err", "log", "max",
+    "min", "abs", "all", "any", "for", "not", "and", "the",
+    "def", "var", "let", "con", "ret", "gen", "ptr", "pos",
+    # Common C/C++ names
+    "init", "main", "next", "prev", "data", "size", "type", "name",
+    "node", "list", "info", "item", "test", "self", "this", "true",
+    "false", "none", "null", "void", "char", "bool", "auto",
+    "file", "path", "text", "line", "args", "argv", "argc",
+    "read", "open", "send", "recv", "copy", "move", "swap",
+    "push", "find", "sort", "hash", "lock", "call", "bind",
+    "from", "into", "with", "each", "then", "done", "fail",
+    "pass", "skip", "stop", "wait", "save", "load",
+    "value", "begin", "close", "clear", "reset", "write",
+    "check", "parse", "print", "state", "count", "index",
+    "start", "empty", "erase", "front", "apply",
+    # Common variable names that create cross-file noise
+    "result", "output", "input", "buffer", "config", "params",
+    "status", "error", "offset", "length", "width", "height",
+    "tensor", "image", "model", "layer", "batch", "channel",
+    # Catch2/test framework internals
+    "Clara", "Detail", "Catch", "Matchers",
+})
+GRAPH_MAX_FANOUT = 10
+
+
+def graph_name_excluded(name: str) -> bool:
+    """Whether calls to `name` are never put in the graph."""
+    return len(name) < GRAPH_MIN_NAME_LEN or name in GRAPH_NOISE_NAMES
+
+
+# Words that can precede a name in a statement without declaring it.
+_NOT_A_TYPE = frozenset({
+    "return", "else", "case", "goto", "throw", "delete", "new", "sizeof",
+    "co_return", "co_yield", "co_await", "class", "struct", "union", "enum",
+    "friend", "typename", "using", "namespace", "template", "public", "private",
+    "protected", "operator", "do", "if", "while", "for", "switch", "typedef",
+    "alignof", "decltype", "static_assert", "defined",
+})
+_LOCAL_DECL_RE = re.compile(
+    r"(?<![\w.>:])([A-Za-z_]\w*)(?:\s*<[^;{}()<>]*>)?[\s*&]+([A-Za-z_]\w*)\s*(?=[=;,\[]|\{)")
+_MACRO_PARAMS_RE = re.compile(r"#\s*define\s+\w+\(([^)]*)\)")
+
+
+def _parameter_names(content: str, name: str, kind: str) -> set[str]:
+    """The parameter names of a C/C++ function or function-like macro, read
+    from its text: the first parenthesised list after its own name."""
+    if kind == "macro":
+        m = _MACRO_PARAMS_RE.search(content)
+        params = m.group(1) if m else ""
+    else:
+        short = name.rsplit("::", 1)[-1]
+        m = re.search(rf"(?<![\w$]){re.escape(short)}\s*\(", content)
+        if m is None:
+            return set()
+        depth, i = 1, m.end()
+        while i < len(content) and depth:
+            depth += {"(": 1, ")": -1}.get(content[i], 0)
+            i += 1
+        params = content[m.end():i - 1]
+    found: set[str] = set()
+    depth, part = 0, []
+    for ch in params + ",":
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            text = "".join(part).split("=", 1)[0]
+            pointer = re.search(r"\(\s*[*&^]\s*(\w+)\s*\)", text)
+            text = pointer.group(1) if pointer else re.sub(r"\[[^\]]*\]", "", text)
+            ident = re.findall(r"[A-Za-z_]\w*", text)
+            if ident:
+                found.add(ident[-1])
+            part = []
+        else:
+            part.append(ch)
+    return found
+
+
+def _declared_names(content: str, name: str, kind: str) -> set[str]:
+    """Names a C/C++ symbol declares for itself — its parameters, its locals,
+    a class's fields. Inside the symbol they name that variable, not the
+    function of the same name elsewhere: `int blendColor` is no call to
+    `blendColor()`."""
+    names = set() if kind in ("class", "struct", "union", "enum") else _parameter_names(
+        content, name, kind)
+    for m in _LOCAL_DECL_RE.finditer(content):
+        if m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE:
+            names.add(m.group(2))
+    return names
+
+
+_QUALIFIER_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:<[^;{}()]*>)?\s*::\s*$")
+
+
+def _reference_forms(content: str, name: str) -> tuple[set[str], set[str]]:
+    """How a C/C++ symbol's text refers to `name`: `member` (`x.name`,
+    `p->name`), `this` (`this->name`), `qualified` (`X::name`, with each `X`
+    returned) or `bare`."""
+    forms: set[str] = set()
+    qualifiers: set[str] = set()
+    for m in re.finditer(rf"(?<![\w$]){re.escape(name)}(?![\w$])", content):
+        before = content[max(0, m.start() - 200):m.start()].rstrip()
+        if before.endswith("->") and before[:-2].rstrip().endswith("this"):
+            forms.add("this")
+        elif before.endswith((".", "->")) and not before.endswith(".."):
+            forms.add("member")
+        elif before.endswith("::"):
+            q = _QUALIFIER_RE.search(before)
+            if q is None:
+                forms.add("bare")  # `::name`, the global one
+            else:
+                forms.add("qualified")
+                qualifiers.add(q.group(1))
+        else:
+            forms.add("bare")
+    return forms, qualifiers
+
+
+_MEMBER_KINDS = frozenset({"method", "template"})
+
+
+def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
+                      qualifiers: set[str], source_scope: str | None,
+                      source_kind: str) -> tuple[list[dict], str | None]:
+    """Keep the C/C++ targets the way a name is written can reach.
+
+    A member access (`p->name()`) reaches a method, never a free function; a
+    free function's bare call reaches no method; `X::name` reaches the `name`
+    of an `X`; and a method's bare or `this->` call to a method of its own
+    class reaches that one. Returns the targets left, and the resolution
+    when the syntax alone decided it.
+    """
+    if "::" in name:
+        return targets, None  # the reference is qualified already: `C::f`
+    def qualified(t: dict) -> str:
+        return t.get("qualified") or t.get("name") or name
+
+    if source_scope and forms <= {"bare", "this"}:
+        own = [t for t in targets if qualified(t) == f"{source_scope}::{name}"]
+        if own:
+            return own, "same_class"
+    if forms == {"qualified"}:
+        named = [t for t in targets
+                 if any(qualified(t).endswith(f"{q}::{name}") for q in qualifiers)
+]
+        if named:
+            return named, "qualified" if len(named) == 1 else None
+    allowed: set[str] = set()
+    if forms & {"member", "this"}:
+        allowed |= _MEMBER_KINDS
+    if "bare" in forms or "qualified" in forms:
+        if source_kind == "function" and "qualified" not in forms:
+            allowed |= {k for k in _EDGE_TARGET_KINDS if k != "method"}
+        else:
+            allowed |= _EDGE_TARGET_KINDS
+    return [t for t in targets if t["kind"] in allowed], None
+
+
+# Only create edges TO meaningful symbol kinds (not prototypes/namespaces)
+_EDGE_TARGET_KINDS = frozenset({
+    "function", "method", "class", "struct", "enum", "interface", "template"})
+
+
 def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
     """Return a function mapping a symbol body to the known names it references.
 
@@ -1360,7 +1531,7 @@ class Indexer:
         excluded = _doc_languages()
         placeholders = ",".join("?" * len(excluded))
         rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.kind, f.path as file_path
+            f"""SELECT s.id, s.name, s.qualified_name, s.kind, f.path as file_path
                FROM symbols s JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
@@ -1370,53 +1541,16 @@ class Indexer:
         symbol_info: dict[int, dict] = {}
         for row in rows:
             name = row["name"]
-            info = {"id": row["id"], "file": row["file_path"], "kind": row["kind"]}
+            info = {"id": row["id"], "file": row["file_path"].replace("\\", "/"),
+                    "kind": row["kind"], "qualified": row["qualified_name"]}
             symbol_info[row["id"]] = info
             if name not in name_to_symbols:
                 name_to_symbols[name] = []
             name_to_symbols[name].append(info)
 
-        # Filter out short/common names that would create noise
-        MIN_NAME_LEN = 4
-        NOISE_NAMES = {
-            # Common short identifiers
-            "get", "set", "run", "new", "end", "add", "put", "pop", "top",
-            "map", "key", "val", "len", "str", "int", "err", "log", "max",
-            "min", "abs", "all", "any", "for", "not", "and", "the",
-            "def", "var", "let", "con", "ret", "gen", "ptr", "pos",
-            # Common C/C++ names
-            "init", "main", "next", "prev", "data", "size", "type", "name",
-            "node", "list", "info", "item", "test", "self", "this", "true",
-            "false", "none", "null", "void", "char", "bool", "auto",
-            "file", "path", "text", "line", "args", "argv", "argc",
-            "read", "open", "send", "recv", "copy", "move", "swap",
-            "push", "find", "sort", "hash", "lock", "call", "bind",
-            "from", "into", "with", "each", "then", "done", "fail",
-            "pass", "skip", "stop", "wait", "save", "load",
-            "value", "begin", "close", "clear", "reset", "write",
-            "check", "parse", "print", "state", "count", "index",
-            "start", "empty", "erase", "front", "apply",
-            # Common variable names that create cross-file noise
-            "result", "output", "input", "buffer", "config", "params",
-            "status", "error", "offset", "length", "width", "height",
-            "tensor", "image", "model", "layer", "batch", "channel",
-            # Catch2/test framework internals
-            "Clara", "Detail", "Catch", "Matchers",
-        }
-
-        # Only create edges TO meaningful symbol kinds (not prototypes/namespaces)
-        EDGE_TARGET_KINDS = {"function", "method", "class", "struct", "enum", "interface", "template"}
-
         filtered_names = {
             name: syms for name, syms in name_to_symbols.items()
-            if len(name) >= MIN_NAME_LEN and name not in NOISE_NAMES
-        }
-
-        # Skip names with too many symbols (ambiguous)
-        MAX_SYMBOL_FANOUT = 10
-        filtered_names = {
-            name: syms for name, syms in filtered_names.items()
-            if len(syms) <= MAX_SYMBOL_FANOUT
+            if not graph_name_excluded(name)
         }
 
         if not filtered_names:
@@ -1455,7 +1589,8 @@ class Indexer:
         MAX_REFS_PER_SYMBOL = 30
 
         content_rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.content, f.path as file_path, f.language
+            f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.content,
+                      f.path as file_path, f.language
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
@@ -1515,7 +1650,7 @@ class Indexer:
         for row in content_rows:
             source_id = row["id"]
             source_name = row["name"]
-            source_file = row["file_path"]
+            source_file = row["file_path"].replace("\\", "/")
             # Mask comments/strings BEFORE scanning: a name that appears only in
             # prose is not a reference (12.8% of sampled edges were this class).
             content = mask_noncode(row["content"], row["language"] or "")
@@ -1523,16 +1658,37 @@ class Indexer:
             referenced_names = match_names(content)
             referenced_names.discard(source_name)
 
-            imported = _imports_for(source_file, row["language"])
+            imported = _imports_for(row["file_path"], row["language"])
+            # In C and C++ the way a name is written narrows what it reaches,
+            # and a name the symbol declares for itself is no reference.
+            c_family = row["language"] in ("c", "cpp")
+            source_scope = None
+            if c_family:
+                referenced_names -= _declared_names(content, source_name, row["kind"])
+                qualified = row["qualified_name"] or ""
+                if row["kind"] in ("method", "template") and "::" in qualified:
+                    source_scope = qualified.rsplit("::", 1)[0]
             refs_for_this = 0
             for ref_name in referenced_names:
                 if refs_for_this >= MAX_REFS_PER_SYMBOL:
                     break
                 targets = [t for t in filtered_names.get(ref_name, [])
-                           if t["id"] != source_id and t["kind"] in EDGE_TARGET_KINDS]
+                           if t["id"] != source_id and t["kind"] in _EDGE_TARGET_KINDS]
+                decided = None
+                if c_family and targets:
+                    forms, qualifiers = _reference_forms(content, ref_name)
+                    targets, decided = _narrow_by_syntax(
+                        targets, ref_name, forms, qualifiers, source_scope, row["kind"])
                 if not targets:
                     continue
-                chosen, resolution = _select_targets(targets, source_file, imported, ref_name)
+                if decided:
+                    chosen, resolution = targets, decided
+                else:
+                    chosen, resolution = _select_targets(targets, source_file, imported, ref_name)
+                # A name defined in many places, with nothing but the name to
+                # pick among them, would link each call to every one.
+                if resolution == "name_only" and len(chosen) > GRAPH_MAX_FANOUT:
+                    continue
                 for target in chosen:
                     confidence = _compute_confidence(source_file, target["file"])
                     # Skip very low confidence edges
