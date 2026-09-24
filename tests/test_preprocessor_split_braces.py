@@ -200,7 +200,9 @@ void clampValue(int v) {
     ]
 
 
-def test_a_name_that_differs_per_branch_gives_one_symbol(tmp_path, db):
+def test_a_name_that_differs_per_branch_keeps_both_names(tmp_path, db):
+    """Both are real names — a caller of either one must find it. But they
+    name one body, so neither calls the other."""
     _index(tmp_path, db, {"scale.cpp": """\
 #ifdef WIDE_INPUT
 long scaleWide(long v) {
@@ -211,7 +213,15 @@ int scaleNarrow(int v) {
 }
 """})
 
-    assert _symbols(db, "scale.cpp") == [("scaleWide", 2, 7)]
+    assert _symbols(db, "scale.cpp") == [("scaleWide", 2, 7), ("scaleNarrow", 4, 7)]
+    edges = db.conn.execute(
+        """SELECT count(*) AS n FROM symbol_edges e
+           JOIN symbols s ON e.source_id = s.id
+           JOIN symbols t ON e.target_id = t.id
+           WHERE s.name IN ('scaleWide', 'scaleNarrow')
+             AND t.name IN ('scaleWide', 'scaleNarrow')"""
+    ).fetchone()["n"]
+    assert edges == 0
 
 
 def test_a_comment_opened_on_a_directive_line_stays_a_comment(tmp_path, db):

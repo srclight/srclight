@@ -1253,10 +1253,13 @@ class Indexer:
         # per platform, an alternative macro — exists only in the original.
         # A definition both parses find keeps the reparse's extent, which is
         # the one the braces actually give. They are the same definition when
-        # they share kind, name and start — or kind and end: a header written
-        # once per branch over one shared body starts the original parse's
-        # symbol at the last header and the reparse's at the first, and a
-        # name that differs per branch differs between the two parses too.
+        # they share kind, name and start — or kind, name and end: a header
+        # written once per branch over one shared body starts the original
+        # parse's symbol at the last header and the reparse's at the first.
+        # A different name is never the same definition. When the name
+        # itself differs per branch, both names are real and both are kept;
+        # and an original that ran on to the end of another definition must
+        # not be taken for it when the reparse cannot read it at all.
         recovered_nodes: set[int] = set()
         if lang in _PREPROCESSED_LANGS and root.has_error:
             broken = _conditional_error_ranges(root, source)
@@ -1268,14 +1271,14 @@ class Indexer:
                 recovered = [sym for sym in collect(recovery_tree.root_node)
                              if in_broken(sym[0])]
                 by_start = {(k, n, node.start_byte): i for i, (node, k, n) in enumerate(recovered)}
-                by_end = {(k, node.end_byte): i for i, (node, k, n) in enumerate(recovered)}
+                by_end = {(k, n, node.end_byte): i for i, (node, k, n) in enumerate(recovered)}
                 used: set[int] = set()
                 merged = []
                 for sym in raw_symbols:
                     node, kind, name = sym
                     if in_broken(node):
                         for key, index in (((kind, name, node.start_byte), by_start),
-                                           ((kind, node.end_byte), by_end)):
+                                           ((kind, name, node.end_byte), by_end)):
                             i = index.get(key)
                             if i is not None and i not in used:
                                 used.add(i)
@@ -1507,7 +1510,7 @@ class Indexer:
         excluded = _doc_languages()
         placeholders = ",".join("?" * len(excluded))
         rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.kind, f.path as file_path
+            f"""SELECT s.id, s.name, s.kind, s.start_line, s.end_line, f.path as file_path
                FROM symbols s JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
@@ -1517,7 +1520,8 @@ class Indexer:
         symbol_info: dict[int, dict] = {}
         for row in rows:
             name = row["name"]
-            info = {"id": row["id"], "file": row["file_path"], "kind": row["kind"]}
+            info = {"id": row["id"], "file": row["file_path"], "kind": row["kind"],
+                    "start": row["start_line"], "end": row["end_line"]}
             symbol_info[row["id"]] = info
             if name not in name_to_symbols:
                 name_to_symbols[name] = []
@@ -1602,7 +1606,8 @@ class Indexer:
         MAX_REFS_PER_SYMBOL = 30
 
         content_rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.content, f.path as file_path, f.language
+            f"""SELECT s.id, s.name, s.kind, s.content, s.start_line, s.end_line,
+                      f.path as file_path, f.language
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
@@ -1671,12 +1676,21 @@ class Indexer:
             referenced_names.discard(source_name)
 
             imported = _imports_for(source_file, row["language"])
+            # When a C/C++ name differs per #if branch, each name is kept as a
+            # symbol over the one shared body, so each one's text holds the
+            # other's header. Same kind, same file, same last line, different
+            # first line: two names for one body, not a call.
+            may_alias = row["language"] in _PREPROCESSED_LANGS
             refs_for_this = 0
             for ref_name in referenced_names:
                 if refs_for_this >= MAX_REFS_PER_SYMBOL:
                     break
                 targets = [t for t in filtered_names.get(ref_name, [])
-                           if t["id"] != source_id and t["kind"] in EDGE_TARGET_KINDS]
+                           if t["id"] != source_id and t["kind"] in EDGE_TARGET_KINDS
+                           and not (may_alias and t["file"] == source_file
+                                    and t["kind"] == row["kind"]
+                                    and t["end"] == row["end_line"]
+                                    and t["start"] != row["start_line"])]
                 if not targets:
                     continue
                 chosen, resolution = _select_targets(targets, source_file, imported, ref_name)
