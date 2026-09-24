@@ -995,3 +995,14 @@ def test_a_signature_is_shortened_and_never_stale():
     assert entry["kind"] == "struct" and "signature" not in entry
     assert len(entry["locations"]) == 2
     assert entry["locations"][0]["signature"] == "int stat(const char *path, int x)"
+
+
+def test_a_prototype_extends_only_its_own_overload():
+    from srclight.indexer import _accepts
+
+    ctor = {"kind": "method", "signature": "Angle()",
+            "other_signatures": ["Angle(short v)", "Angle(float v)", "Angle(const Angle&)"]}
+    assert not _accepts(ctor, "Angle", {1})
+    fn = {"kind": "function", "signature": "void log(int l, const char* t)",
+          "other_signatures": ["void log(int l, const char* t = 0)", "void log(float x)"]}
+    assert _accepts(fn, "log", {1}) and _accepts(fn, "log", {2})

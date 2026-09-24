@@ -856,16 +856,22 @@ def _accepts(t: dict, name: str, arities: set[int]) -> bool:
     if t["kind"] not in ("function", "method", "template"):
         return True
     short = name.rsplit("::", 1)[-1]
-    ranges = []
-    for signature in (t.get("signature"), *t.get("other_signatures", ())):
-        accepted = _param_range(signature, name)
-        if accepted is None and short != name:
-            accepted = _param_range(signature, short)
-        if accepted is None:
-            return True
-        ranges.append(accepted)
-    lowest = min(r[0] for r in ranges)
-    highest = max(r[1] for r in ranges)
+
+    def accepted_by(signature: str | None) -> tuple[int, float] | None:
+        found = _param_range(signature, name)
+        return found if found is not None or short == name else _param_range(signature, short)
+
+    own = accepted_by(t.get("signature"))
+    if own is None:
+        return True
+    lowest, highest = own
+    # A prototype with as many parameters is this function's own
+    # declaration — other counts are other overloads — and its defaults
+    # lower the count a call may pass.
+    for signature in t.get("other_signatures", ()):
+        declared = accepted_by(signature)
+        if declared is not None and declared[1] == highest:
+            lowest = min(lowest, declared[0])
     return any(lowest <= a <= highest for a in arities)
 
 
