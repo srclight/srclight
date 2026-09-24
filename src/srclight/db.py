@@ -388,6 +388,29 @@ class EdgeRecord:
 logger = logging.getLogger("srclight.db")
 
 
+def add_symbol_lines(conn: sqlite3.Connection, results: list[dict[str, Any]],
+                     schema: str | None = None) -> None:
+    """Set `line` and `end_line` on search hits, looked up by `symbol_id`.
+
+    ``schema`` names an attached database; hits whose symbol has since gone
+    are left without lines.
+    """
+    ids = [r["symbol_id"] for r in results if "symbol_id" in r]
+    table = f"[{schema}].symbols" if schema else "symbols"
+    lines: dict[int, tuple[int, int]] = {}
+    for start in range(0, len(ids), 500):
+        batch = ids[start:start + 500]
+        placeholders = ",".join("?" * len(batch))
+        for row in conn.execute(
+                f"SELECT id, start_line, end_line FROM {table} WHERE id IN ({placeholders})",
+                batch):
+            lines[row[0]] = (row[1], row[2])
+    for r in results:
+        found = lines.get(r.get("symbol_id"))
+        if found is not None:
+            r["line"], r["end_line"] = found
+
+
 class Database:
     """SQLite database for Srclight index."""
 
@@ -946,7 +969,11 @@ class Database:
 
         # vendored is a within-rung penalty now, not an infinite primary key
         results.sort(key=lambda r: (r.get("rank", 0), r.get("name") or ""))
-        return results[:limit]
+        results = results[:limit]
+        # The tiers read FTS tables, which carry no position: a hit named its
+        # file but not where in it.
+        add_symbol_lines(self.conn, results)
+        return results
 
     # --- Edges ---
 

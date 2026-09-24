@@ -852,10 +852,26 @@ class WorkspaceDB:
             matched = match_rung(query, r.get("name", "") or "") < RUNG_NONE
             r["name_match"] = matched
             any_name_match = any_name_match or matched
-        if not any_name_match:
-            return results[:min(limit, NAMELESS_RESULT_CAP)]
+        results = results[:min(limit, NAMELESS_RESULT_CAP) if not any_name_match else limit]
+        self._add_lines(results)
+        return results
 
-        return results[:limit]
+    def _add_lines(self, results: list[dict[str, Any]]) -> None:
+        """Give each hit the lines its symbol spans, read from its project."""
+        from .db import add_symbol_lines
+
+        by_project: dict[str, list[dict[str, Any]]] = {}
+        for r in results:
+            by_project.setdefault(r.get("project"), []).append(r)
+        entries = [e for e in self._all_indexable if e.name in by_project]
+        if not entries:
+            return
+        for batch in self._iter_batches(entries=entries):
+            for schema, project_name in batch:
+                try:
+                    add_symbol_lines(self.conn, by_project.get(project_name, []), schema)
+                except sqlite3.OperationalError:
+                    pass  # a project that cannot be read keeps its hits, lineless
 
     def codebase_map(self, project: str | None = None) -> dict[str, Any]:
         """Get aggregated stats across all projects (or a single one)."""
