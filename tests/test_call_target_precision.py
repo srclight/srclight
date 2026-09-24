@@ -1080,3 +1080,31 @@ void keep(Angle* p) {
 }
 """}, tmp_path)
     assert not any(a == "keep" and b == "Angle::Angle" for a, b, _ in edges)
+
+
+def test_a_type_use_reaches_no_constructor_defined_in_its_class(tmp_path):
+    edges = _edges({"angle.h": """\
+class Angle {
+public:
+    Angle() {}
+    Angle(const Angle& other) {}
+    Angle(short v) {}
+    short Val() const;
+};
+
+struct Lock_c {
+    Angle mYaw;
+};
+
+inline short readAngle(const Angle& a) {
+    return a.Val();
+}
+""", "use/use.cpp": """\
+void spin(short v) {
+    Angle(v);
+}
+"""}, tmp_path)
+    ctor_callers = {a for a, b, _ in edges if b == "Angle::Angle"}
+    assert "spin" in ctor_callers
+    assert not ctor_callers & {"readAngle", "Lock_c"}
+    assert ("readAngle", "Angle") in _pairs(edges)

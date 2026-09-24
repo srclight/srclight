@@ -2084,13 +2084,15 @@ class Indexer:
                     break
                 targets = [t for t in filtered_names.get(ref_name, [])
                            if t["id"] != source_id and (
-                               t["kind"] in _EDGE_TARGET_KINDS
-                               # A constructor declared in its class and
-                               # defined elsewhere is only a prototype here —
-                               # a target where the name is called, not where
-                               # it only names a type (`Angle* p`).
-                               or (t["kind"] == "prototype" and _is_constructor(t, ref_name)
-                                   and any(a is not None for a in arities_of.get(ref_name, ()))))]
+                               # A constructor — defined in its class, or only
+                               # declared there (a prototype) — is a target
+                               # where the name is called, never where it only
+                               # names a type: `Angle* p`, `const Angle& a`, a
+                               # field. That is a dependency on the class.
+                               (any(a is not None for a in arities_of.get(ref_name, ()))
+                                and t["kind"] in ("method", "prototype", "function", "template"))
+                               if _is_constructor(t, ref_name)
+                               else t["kind"] in _EDGE_TARGET_KINDS)]
                 decided = None
                 if c_family and targets:
                     forms, qualifiers = forms_of.get(ref_name, (set(), set()))
