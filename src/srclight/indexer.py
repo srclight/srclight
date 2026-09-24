@@ -1750,7 +1750,7 @@ class Indexer:
                 # A constructor defined in its class is stored as a function,
                 # `C::C`; its scope is still its class.
                 if row["kind"] in ("method", "template", "function") and "::" in qualified:
-                    source_scope = qualified.rsplit("::", 1)[0]
+                    source_scope = _without_template_args(qualified).rsplit("::", 1)[0]
                 forms_of = _reference_forms_all(
                     content, {n for n in referenced_names if "::" not in n})
             refs_for_this = 0
