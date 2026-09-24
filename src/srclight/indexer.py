@@ -680,14 +680,15 @@ _RESERVED_NAMES = {"c": _C_KEYWORDS, "cpp": _CPP_KEYWORDS}
 
 def _only_error_recovery_puts_it_here(node: Node) -> bool:
     """Whether a definition sits where only error recovery could have made
-    one: its own node holds an error, or it lies inside a function body,
-    where C and C++ allow no function definition.
+    one: its head (everything but its body) holds an error, or it lies inside
+    a function body, where C and C++ allow no function definition.
 
-    A keyword-named definition at file scope that parses cleanly is real —
-    `new` or `delete` in a C header that happens to be read as C++ — and is
-    kept whatever the detected language says.
+    An error inside the body says nothing — a macro used without its
+    semicolon puts one there in perfectly real code. A keyword-named
+    definition at file scope with a clean head is real: `new` or `delete` in
+    a C header that happens to be read as C++.
     """
-    if node.has_error:
+    if any(child.has_error for child in node.children if child.type not in _BODY_TYPES):
         return True
     parent = node.parent
     while parent is not None:
@@ -695,6 +696,10 @@ def _only_error_recovery_puts_it_here(node: Node) -> bool:
             return True
         parent = parent.parent
     return False
+
+
+# The children of a definition that are its body rather than its head.
+_BODY_TYPES = frozenset({"compound_statement", "field_declaration_list", "declaration_list"})
 
 
 def _kind_from_capture(capture_name: str) -> str:
@@ -1191,10 +1196,14 @@ class Indexer:
                 continue
 
             # A keyword-named definition is error recovery's work — a statement
-            # read as a definition. A macro may legally redefine a keyword,
-            # and a clean one at file scope is real (a C header read as C++).
-            if (symbol_name in _RESERVED_NAMES.get(lang, ()) and kind != "macro"
-                    and _only_error_recovery_puts_it_here(def_node)):
+            # read as a definition — except for a macro, which may legally
+            # redefine a keyword. A C keyword names nothing in either language
+            # and is always dropped; a word only C++ reserves (`new`, `class`)
+            # is a valid C name, so it is dropped only where error recovery put
+            # it (a C header read as C++ keeps its clean `new`).
+            if kind != "macro" and symbol_name in _RESERVED_NAMES.get(lang, ()) and (
+                    symbol_name in _C_KEYWORDS
+                    or _only_error_recovery_puts_it_here(def_node)):
                 continue
 
             if lang == "lua" and _lua_nameless_definition(def_node):

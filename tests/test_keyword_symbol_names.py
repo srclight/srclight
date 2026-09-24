@@ -107,3 +107,29 @@ void delete(void *block) {
     freeBlock(block);
 }
 """) == ["new", "delete"]
+
+
+def test_an_error_in_the_body_does_not_disown_a_real_definition(tmp_path, db):
+    """A macro used without its semicolon is common in C, and puts an error
+    inside the body. Only an error in the head says the definition itself is
+    error recovery's work."""
+    assert _names(tmp_path, db, "pool.h", """\
+/* see Pool::grab */
+void *new(int size) {
+    void *block = allocBlock(size);
+    TRACE_ALLOC(block)
+    return block;
+}
+""") == ["new"]
+
+
+@pytest.mark.parametrize("filename, text", [
+    ("opcodes.h", "VM_PROLOGUE\nswitch (opcode) {\ncase 0:\n    break;\n}\n"),
+    ("spin.c", "LOCK_GUARD(mutex)\nwhile (busy) {\n    spinOnce();\n}\n"),
+])
+def test_a_c_keyword_never_names_a_symbol(tmp_path, db, filename, text):
+    """A statement fragment meant to be included inside a function parses at
+    file scope without any error, and `switch (x) { ... }` after a macro reads
+    as a function `switch`. No symbol in C or C++ can be named `switch`,
+    `while` or `if`, wherever it sits."""
+    assert _names(tmp_path, db, filename, text) == []
