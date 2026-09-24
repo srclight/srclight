@@ -2038,6 +2038,7 @@ class Indexer:
             # In C and C++ the way a name is written narrows what it reaches,
             # and a name the symbol declares for itself is no reference.
             c_family = row["language"] in ("c", "cpp")
+            arities_of: dict[str, set] = {}
             source_scope = None
             if c_family:
                 unqualified = _without_template_args(row["qualified_name"] or "")
@@ -2054,7 +2055,6 @@ class Indexer:
                     rf"(?<![\w:]){re.escape(source_name)}(?![\w])",
                     " " * len(source_name), content, count=1)
                     if "::" in source_name else content)
-                arities_of: dict[str, set] = {}
                 receivers_of: dict[str, set] = {}
                 forms_of = _reference_forms_all(
                     own_blanked, {n for n in referenced_names if "::" not in n},
@@ -2086,8 +2086,11 @@ class Indexer:
                            if t["id"] != source_id and (
                                t["kind"] in _EDGE_TARGET_KINDS
                                # A constructor declared in its class and
-                               # defined elsewhere is only a prototype here.
-                               or (t["kind"] == "prototype" and _is_constructor(t, ref_name)))]
+                               # defined elsewhere is only a prototype here —
+                               # a target where the name is called, not where
+                               # it only names a type (`Angle* p`).
+                               or (t["kind"] == "prototype" and _is_constructor(t, ref_name)
+                                   and any(a is not None for a in arities_of.get(ref_name, ()))))]
                 decided = None
                 if c_family and targets:
                     forms, qualifiers = forms_of.get(ref_name, (set(), set()))

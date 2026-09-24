@@ -1066,3 +1066,17 @@ public:
     symbols = json.loads(server.symbols_in_file("flags.h"))["symbols"]
     assert {s.get("qualified_name") for s in symbols if s["name"] == "checkFlag"} == {
         "One_c::checkFlag", "Two_c::checkFlag"}
+
+
+def test_a_type_use_reaches_no_constructor_declaration(tmp_path):
+    edges = _edges({"angle.h": """\
+class Angle {
+public:
+    Angle(short v);
+};
+""", "use/use.cpp": """\
+void keep(Angle* p) {
+    Angle* q = p;
+}
+"""}, tmp_path)
+    assert not any(a == "keep" and b == "Angle::Angle" for a, b, _ in edges)
