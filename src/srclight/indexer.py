@@ -773,7 +773,8 @@ def _declared_names(content: str, name: str, kind: str) -> set[str]:
 
 _QUALIFIER_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:<[^;{}]*>)?\s*::\s*$")
 _THIS_ARROW_RE = re.compile(r"(?<![\w$])this\s*->$")
-_IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
+# Unicode letters too, as the name matcher reads them: `Ölstand_lesen`.
+_IDENT_RE = re.compile(r"(?:[^\W\d]|\$)[\w$]*")
 
 
 _TEMPLATE_ARGS_RE = re.compile(r"<[^<>(){};|&]*(?:<[^<>(){};|&]*>[^<>(){};|&]*)*>")
@@ -853,7 +854,7 @@ def _accepts(t: dict, name: str, arities: set[int]) -> bool:
     """Whether a target takes one of the argument counts seen. Every
     signature of the function counts: default arguments are often written
     in the header prototype only, not in the definition."""
-    if t["kind"] not in ("function", "method", "template"):
+    if t["kind"] not in ("function", "method", "template", "prototype"):
         return True
     short = name.rsplit("::", 1)[-1]
 
@@ -1921,7 +1922,10 @@ class Indexer:
                        if any(s["kind"] == "macro" for s in syms)}
 
         def _macro_misread(t: dict) -> bool:
+            # A constructor opens with its class's name, `Box(int)`: a macro
+            # of that name makes it no misread.
             return (t["kind"] in ("function", "method", "prototype")
+                    and not _is_constructor(t, t.get("qualified", "").rsplit("::", 1)[-1])
                     and t.get("qualified", "").rsplit("::", 1)[-1] in macro_names
                     and (t.get("signature") or "").lstrip().startswith(
                         t.get("qualified", "").rsplit("::", 1)[-1] + "("))

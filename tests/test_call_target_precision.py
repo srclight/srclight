@@ -89,7 +89,7 @@ def serve(tmp_path, monkeypatch):
         root = tmp_path / "repo"
         for name, text in files.items():
             (root / name).parent.mkdir(parents=True, exist_ok=True)
-            (root / name).write_text(text)
+            (root / name).write_text(text, encoding="utf-8")
         db_path = root / ".srclight" / "index.db"
         db_path.parent.mkdir()
         db = Database(db_path)
@@ -257,7 +257,7 @@ def _edges(files: dict[str, str], tmp_path) -> set[tuple[str, str, str]]:
     root = tmp_path / "edges"
     for name, text in files.items():
         (root / name).parent.mkdir(parents=True, exist_ok=True)
-        (root / name).write_text(text)
+        (root / name).write_text(text, encoding="utf-8")
     db = Database(root / "index.db")
     db.open()
     db.initialize()
@@ -1186,3 +1186,54 @@ void release() {
 }
 """}, tmp_path)
     assert not any(a == "release" and b == "WHEN_EXT" for a, b, _ in edges)
+
+
+def test_a_macro_named_like_a_class_keeps_its_constructors(tmp_path):
+    edges = _edges({"g.h": """\
+#define WidgetBox(...) make_box(__VA_ARGS__)
+class WidgetBox {
+public:
+    WidgetBox(int a, int b) : a_(a) {}
+    int a_;
+};
+""", "g.cpp": """\
+#include "g.h"
+void dispatcher() {
+    WidgetBox wb(1, 2);
+}
+"""}, tmp_path)
+    assert ("dispatcher", "WidgetBox::WidgetBox") in _pairs(edges)
+
+
+def test_a_name_starting_with_a_non_ascii_letter_keeps_its_calls(tmp_path):
+    edges = _edges({"u.cpp": """\
+int Ölstand_lesen(int a) {
+    return a;
+}
+
+int caller_two(int a) {
+    return Ölstand_lesen(a);
+}
+"""}, tmp_path)
+    assert ("caller_two", "Ölstand_lesen") in _pairs(edges)
+
+
+def test_constructor_declarations_are_filtered_by_argument_count(tmp_path):
+    edges = _edges({"box.h": """\
+class Box_c {
+public:
+    Box_c();
+    Box_c(int w, int h);
+};
+""", "use/use.cpp": """\
+void build() {
+    Box_c b(1, 2);
+}
+"""}, tmp_path)
+    db = Database(tmp_path / "edges" / "index.db")
+    db.open()
+    sigs = {r[0] for r in db.conn.execute(
+        """SELECT b.signature FROM symbol_edges e JOIN symbols a ON a.id = e.source_id
+           JOIN symbols b ON b.id = e.target_id WHERE a.name = 'build' AND b.kind = 'prototype'""")}
+    db.close()
+    assert sigs == {"Box_c(int w, int h)"}
