@@ -238,6 +238,32 @@ def _get_git_head(root: Path) -> str | None:
     return None
 
 
+def _shared_body(metadata: str | None) -> int | None:
+    """The shared-body mark the #if/#else recovery leaves in a symbol's metadata."""
+    if not metadata:
+        return None
+    try:
+        return json.loads(metadata).get("shared_body")
+    except (ValueError, AttributeError):
+        return None
+
+
+def _doc_comment_text(source_bytes: bytes, comment: Node, node: Node) -> str | None:
+    """The text of `comment` as `node`'s doc comment, or None if it is not one.
+
+    Read from the file rather than from the node: a node from the #if/#else
+    reparse would give the reparse's text. An #else, #elif or #endif in
+    between means the comment belongs to another branch than the definition;
+    only the reparse, with the directives blanked, can make such a comment
+    look adjacent. An opening #if in between is fine — the comment then
+    documents the whole conditional, the definition included.
+    """
+    if _BRANCH_END_RE.search(source_bytes, comment.end_byte, node.start_byte):
+        return None
+    return source_bytes[comment.start_byte:comment.end_byte].decode(
+        "utf-8", errors="replace").strip()
+
+
 def _extract_doc_comment(source_bytes: bytes, node: Node) -> str | None:
     """Extract doc comment preceding a symbol node."""
     # Look at the previous sibling for a comment
@@ -247,18 +273,11 @@ def _extract_doc_comment(source_bytes: bytes, node: Node) -> str | None:
         # Look at previous unnamed siblings too
         prev_sib = node.prev_sibling
         if prev_sib and prev_sib.type == "comment":
-            if _CONDITIONAL_RE.search(source_bytes, prev_sib.end_byte, node.start_byte):
-                return None
-            return prev_sib.text.decode("utf-8", errors="replace").strip()
+            return _doc_comment_text(source_bytes, prev_sib, node)
         return None
 
     if prev.type == "comment":
-        # A conditional directive in between means the comment belongs to
-        # another branch, not to this definition. Only a reparse with the
-        # directives blanked out can make such a comment the node's neighbor.
-        if _CONDITIONAL_RE.search(source_bytes, prev.end_byte, node.start_byte):
-            return None
-        return prev.text.decode("utf-8", errors="replace").strip()
+        return _doc_comment_text(source_bytes, prev, node)
 
     # Python: check for docstring (first child expression_statement with string)
     if node.type in ("function_definition", "class_definition"):
@@ -666,6 +685,51 @@ _CONDITIONAL_RE = re.compile(
     rb"^[ \t]*#[ \t]*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b", re.MULTILINE
 )
 
+# The directives that end a branch: whatever came before one of them belongs
+# to another branch than whatever comes after.
+_BRANCH_END_RE = re.compile(
+    rb"^[ \t]*#[ \t]*(elif|elifdef|elifndef|else|endif)\b", re.MULTILINE
+)
+
+# A character literal: one character or escape, or a short multi-character
+# constant ('RIFF'), closed on the same line.
+_CHAR_LITERAL_RE = re.compile(rb"'(?:\\[^\n]{1,8}?|[^'\\\n]{1,4})'")
+
+
+def _c_comment_bytes(source: bytes) -> bytearray:
+    """Mark the bytes of C/C++ comments with 1, everything else with 0.
+
+    Strings are stepped over, so a `/*` inside one opens nothing. A quote
+    opens a character literal only when one closes it shortly after on the
+    same line: a digit separator (1'000) or the apostrophe of an #error
+    message is a lone quote, and taking it for an opening one would hide
+    every comment after it.
+    """
+    marks = bytearray(len(source))
+    i, n = 0, len(source)
+    while i < n:
+        c = source[i]
+        if c == 0x2F and i + 1 < n and source[i + 1] in (0x2A, 0x2F):  # /* or //
+            if source[i + 1] == 0x2A:
+                end = source.find(b"*/", i + 2)
+                end = n if end == -1 else end + 2
+            else:
+                end = source.find(b"\n", i + 2)
+                end = n if end == -1 else end
+            marks[i:end] = b"\x01" * (end - i)
+            i = end
+        elif c == 0x22:  # "
+            i += 1
+            while i < n and source[i] not in (0x22, 0x0A):
+                i += 2 if source[i] == 0x5C else 1
+            i += 1
+        elif c == 0x27:  # '
+            literal = _CHAR_LITERAL_RE.match(source, i)
+            i = literal.end() if literal else i + 1
+        else:
+            i += 1
+    return marks
+
 
 def _first_branch_only(source: bytes) -> bytes:
     """Keep the first branch of every #if chain and blank everything else.
@@ -685,11 +749,7 @@ def _first_branch_only(source: bytes) -> bytes:
     one would leave the other half to be read as code. And a directive
     written inside a comment is not a directive.
     """
-    from .refmask import mask_noncode
-
-    # latin-1 maps each byte to one character, so offsets carry over.
-    text = source.decode("latin-1")
-    in_comment = [a != b for a, b in zip(text, mask_noncode(text, "cpp", mask_strings=False))]
+    in_comment = _c_comment_bytes(source)
 
     out = bytearray(source)
     first_branch: list[bool] = []  # per open conditional: still in its first branch
@@ -1261,6 +1321,7 @@ class Indexer:
         # and an original that ran on to the end of another definition must
         # not be taken for it when the reparse cannot read it at all.
         recovered_nodes: set[int] = set()
+        shared_bodies: dict[int, int] = {}  # id(def_node) -> end byte of the shared body
         if lang in _PREPROCESSED_LANGS and root.has_error:
             broken = _conditional_error_ranges(root, source)
             if broken:
@@ -1288,6 +1349,21 @@ class Indexer:
                 merged += [sym for i, sym in enumerate(recovered) if i not in used]
                 recovered_nodes = {id(sym[0]) for sym in recovered}
                 raw_symbols = merged
+
+                # Symbols of one kind that end on the same byte of a broken
+                # range, under different names, name one body: the name
+                # differs per branch, or an original ran on to the end of
+                # another definition. Each one's text holds the other's name,
+                # which the edge builder must not read as a call — so mark
+                # them here, where it is known, rather than guess later.
+                bodies: dict[tuple[str, int], list[tuple[Node, str, str | None]]] = {}
+                for sym in raw_symbols:
+                    if in_broken(sym[0]):
+                        bodies.setdefault((sym[1], sym[0].end_byte), []).append(sym)
+                shared_bodies = {
+                    id(sym[0]): end for (_kind, end), group in bodies.items()
+                    if len({sym[2] for sym in group}) > 1 for sym in group
+                }
                 # Containers before what they contain: the second pass finds
                 # a parent among the symbols already inserted.
                 raw_symbols.sort(key=lambda sym: (sym[0].start_byte, -sym[0].end_byte))
@@ -1341,6 +1417,8 @@ class Indexer:
                 body_hash=body_h,
                 line_count=def_node.end_point[0] - def_node.start_point[0] + 1,
                 parent_symbol_id=parent_id,
+                metadata=({"shared_body": shared_bodies[id(def_node)]}
+                          if id(def_node) in shared_bodies else None),
             )
 
             sym_id = self.db.insert_symbol(sym, rel_path)
@@ -1510,7 +1588,7 @@ class Indexer:
         excluded = _doc_languages()
         placeholders = ",".join("?" * len(excluded))
         rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.kind, s.start_line, s.end_line, f.path as file_path
+            f"""SELECT s.id, s.name, s.kind, s.metadata, f.path as file_path
                FROM symbols s JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
@@ -1521,7 +1599,7 @@ class Indexer:
         for row in rows:
             name = row["name"]
             info = {"id": row["id"], "file": row["file_path"], "kind": row["kind"],
-                    "start": row["start_line"], "end": row["end_line"]}
+                    "body": _shared_body(row["metadata"])}
             symbol_info[row["id"]] = info
             if name not in name_to_symbols:
                 name_to_symbols[name] = []
@@ -1606,8 +1684,7 @@ class Indexer:
         MAX_REFS_PER_SYMBOL = 30
 
         content_rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.kind, s.content, s.start_line, s.end_line,
-                      f.path as file_path, f.language
+            f"""SELECT s.id, s.name, s.content, s.metadata, f.path as file_path, f.language
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
@@ -1676,21 +1753,18 @@ class Indexer:
             referenced_names.discard(source_name)
 
             imported = _imports_for(source_file, row["language"])
-            # When a C/C++ name differs per #if branch, each name is kept as a
-            # symbol over the one shared body, so each one's text holds the
-            # other's header. Same kind, same file, same last line, different
-            # first line: two names for one body, not a call.
-            may_alias = row["language"] in _PREPROCESSED_LANGS
+            # Names the #if/#else recovery put over one shared body each hold
+            # the other's name; the extractor marked them, and between them
+            # that is not a call.
+            body = _shared_body(row["metadata"])
             refs_for_this = 0
             for ref_name in referenced_names:
                 if refs_for_this >= MAX_REFS_PER_SYMBOL:
                     break
                 targets = [t for t in filtered_names.get(ref_name, [])
                            if t["id"] != source_id and t["kind"] in EDGE_TARGET_KINDS
-                           and not (may_alias and t["file"] == source_file
-                                    and t["kind"] == row["kind"]
-                                    and t["end"] == row["end_line"]
-                                    and t["start"] != row["start_line"])]
+                           and not (body is not None and t["body"] == body
+                                    and t["file"] == source_file)]
                 if not targets:
                     continue
                 chosen, resolution = _select_targets(targets, source_file, imported, ref_name)

@@ -224,6 +224,75 @@ int scaleNarrow(int v) {
     assert edges == 0
 
 
+def test_two_functions_ending_on_one_line_still_call_each_other(tmp_path, db):
+    """Only names the recovery put over one body are exempt from edges. A
+    file with no conditional at all keeps every call it makes."""
+    _index(tmp_path, db, {"engine.cpp": """\
+void startEngine() {
+    warmUpEngine();
+} void warmUpEngine() { }
+"""})
+
+    callees = {r["name"] for r in db.conn.execute(
+        """SELECT t.name FROM symbol_edges e
+           JOIN symbols s ON e.source_id = s.id
+           JOIN symbols t ON e.target_id = t.id
+           WHERE s.name = 'startEngine'"""
+    )}
+    assert "warmUpEngine" in callees
+
+
+def test_a_comment_before_the_opening_directive_documents_the_function(tmp_path, db):
+    """An opening #ifdef in between means the comment sits before the whole
+    conditional, so it still applies. Only #else, #elif or #endif mean it
+    belongs to another branch."""
+    _index(tmp_path, db, {"device.cpp": """\
+/** Opens the device. */
+#ifdef PLATFORM_DESKTOP
+int openDevice(int handle) {
+#else
+int openDevice(long handle) {
+#endif
+    return 0;
+}
+"""})
+
+    row = db.conn.execute(
+        "SELECT start_line, doc_comment FROM symbols WHERE name = 'openDevice'"
+    ).fetchone()
+    assert row["start_line"] == 3
+    assert row["doc_comment"] == "/** Opens the device. */"
+
+
+def test_an_apostrophe_does_not_hide_the_comments_after_it(tmp_path, db):
+    """A digit separator is a lone apostrophe. Read as a character literal,
+    it hid every comment after it, and a commented-out #else then flipped the
+    live branch it sat in."""
+    _index(tmp_path, db, {"gauge.cpp": """\
+void Gauge_c::checkFlags() {
+    int limit = 1'000;
+#ifdef PLATFORM_DESKTOP
+    /* was:
+#else
+    */
+    if (isPanelVisible()) {
+#else
+    if (isPromptOpen()) {
+#endif
+        refreshGauge();
+    }
+}
+
+void Gauge_c::refreshGauge() {
+}
+"""})
+
+    assert _symbols(db, "gauge.cpp") == [
+        ("Gauge_c::checkFlags", 1, 13),
+        ("Gauge_c::refreshGauge", 15, 16),
+    ]
+
+
 def test_a_comment_opened_on_a_directive_line_stays_a_comment(tmp_path, db):
     """Blanking the whole directive line would cut the comment in two, and
     the reparse would read its second half as code."""
