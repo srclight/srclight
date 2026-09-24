@@ -222,3 +222,19 @@ def test_a_define_in_a_container_hides_only_its_own_line(tmp_path):
            JOIN symbols b ON b.id = e.target_id""")}
     db.close()
     assert ("Levels", "helper_value") in edges
+
+
+def test_a_macro_reads_its_own_body(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "log.c").write_text(
+        "void report(const char* m) {\n}\n#define SHOUT(msg) report(msg)\n")
+    db = Database(root / "index.db")
+    db.open()
+    db.initialize()
+    Indexer(db, IndexConfig(root=root)).index()
+    edges = {tuple(r) for r in db.conn.execute(
+        """SELECT a.name, b.name FROM symbol_edges e JOIN symbols a ON a.id = e.source_id
+           JOIN symbols b ON b.id = e.target_id""")}
+    db.close()
+    assert ("SHOUT", "report") in edges

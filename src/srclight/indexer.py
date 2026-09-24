@@ -659,6 +659,13 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
 _CALLABLE_KINDS = frozenset({"function", "method"})
 
 
+def _text_end(row) -> int:
+    """The last line a symbol's text spans. A `#define` node takes its
+    trailing newline, so its recorded end is the line after it."""
+    lines = len((row["content"] or "").rstrip("\r\n").split("\n"))
+    return min(row["end_line"], row["start_line"] + lines - 1)
+
+
 def _own_text(content: str, start_line: int, end_line: int,
               spans: Iterable[tuple[int, int]]) -> str:
     """Blank the lines of `content` that symbols nested in it occupy.
@@ -1497,11 +1504,8 @@ class Indexer:
         # are found by bisection rather than by walking the whole file.
         spans_by_file: dict[int, list[tuple[int, int]]] = {}
         for row in content_rows:
-            # The lines a symbol's text spans: a `#define` node takes its
-            # trailing newline, and its recorded end is the line after it.
-            text_lines = len((row["content"] or "").rstrip("\r\n").split("\n"))
             spans_by_file.setdefault(row["file_id"], []).append(
-                (row["start_line"], min(row["end_line"], row["start_line"] + text_lines - 1))
+                (row["start_line"], _text_end(row))
             )
         for spans in spans_by_file.values():
             spans.sort()
@@ -1572,8 +1576,8 @@ class Indexer:
             content = mask_noncode(row["content"], row["language"] or "")
             if row["kind"] not in _CALLABLE_KINDS:
                 content = _own_text(
-                    content, row["start_line"], row["end_line"],
-                    _nested_spans(row["file_id"], row["start_line"], row["end_line"]),
+                    content, row["start_line"], _text_end(row),
+                    _nested_spans(row["file_id"], row["start_line"], _text_end(row)),
                 )
 
             referenced_names = match_names(content)
