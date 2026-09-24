@@ -1217,11 +1217,14 @@ class Indexer:
         raw_symbols = collect(root)
 
         # A conditional that splits a brace across its branches breaks the
-        # parse, and the definitions caught in the ERROR node are lost or cut
-        # short. Reparse with only the first branch of each conditional, and
-        # take the definitions inside the broken ranges from that parse. The
-        # rest of the file keeps the original parse: there, a definition in
-        # each branch — one per platform — is still extracted.
+        # parse, and the definitions caught in the ERROR node are lost or run
+        # on over the ones after them. Reparse with only the first branch of
+        # each conditional and add what that parse finds inside the broken
+        # ranges. It completes the original parse and never replaces it: the
+        # reparse sees one branch, so a variant in an #else — one definition
+        # per platform, an alternative macro — exists only in the original.
+        # A definition both parses find (same kind, name and start) keeps the
+        # reparse's extent, which is the one the braces actually give.
         if lang in _PREPROCESSED_LANGS and root.has_error:
             broken = _conditional_error_ranges(root, source)
             if broken:
@@ -1229,9 +1232,15 @@ class Indexer:
                     return any(s <= node.start_byte and node.end_byte <= e for s, e in broken)
 
                 recovery_tree = parser.parse(_first_branch_only(source))
-                raw_symbols = [sym for sym in raw_symbols if not in_broken(sym[0])]
-                raw_symbols += [sym for sym in collect(recovery_tree.root_node)
-                                if in_broken(sym[0])]
+                recovered = {
+                    (sym[1], sym[2], sym[0].start_byte): sym
+                    for sym in collect(recovery_tree.root_node) if in_broken(sym[0])
+                }
+                merged = []
+                for sym in raw_symbols:
+                    key = (sym[1], sym[2], sym[0].start_byte)
+                    merged.append(recovered.pop(key, sym) if in_broken(sym[0]) else sym)
+                raw_symbols = merged + list(recovered.values())
                 # Containers before what they contain: the second pass finds
                 # a parent among the symbols already inserted.
                 raw_symbols.sort(key=lambda sym: (sym[0].start_byte, -sym[0].end_byte))

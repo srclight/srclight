@@ -152,6 +152,31 @@ void Panel_c::refreshPanel() {
     ]
 
 
+def test_what_the_first_parse_found_in_a_broken_range_is_kept(tmp_path, db):
+    """The reparse sees only the first branch of each conditional. A variant
+    defined in an #else, which the original parse did find inside the ERROR
+    node, must not be traded for the definitions the reparse recovers."""
+    _index(tmp_path, db, {"gauge.cpp": GAUGE_CPP + """
+#ifdef _WIN32
+void openSerialPort() {
+    openWin32Handle();
+}
+#else
+void openSerialPort() {
+    openPosixDevice();
+}
+#endif
+"""})
+
+    assert _symbols(db, "gauge.cpp") == [
+        ("Gauge_c::resetNeedle", 1, 3),
+        ("Gauge_c::updateState", 5, 20),
+        ("Gauge_c::moveNeedle", 22, 24),
+        ("openSerialPort", 27, 29),
+        ("openSerialPort", 31, 33),
+    ]
+
+
 def test_platform_variants_in_a_file_that_parses_are_all_kept(tmp_path, db):
     """One definition per platform is the common case and parses fine; the
     reparse must not trade those variants for the ones it recovers."""
