@@ -1901,19 +1901,26 @@ class Indexer:
             for sym in syms:
                 if sym["kind"] in ("function", "method") and sym.get("qualified") in prototype_signatures:
                     sym["other_signatures"] = prototype_signatures[sym["qualified"]]
-        # A name too common to follow alone is unambiguous written with its
-        # class: `Stack_c::get()` names one method. A member defined in its
-        # class has no symbol named that way, so it is listed under it.
+        # A member written with its class, `Stack_c::get()`, names one
+        # member — even when the name alone is too common to follow. A member
+        # defined or declared in its class has no symbol named that way, so it
+        # is listed under it; otherwise the text would read as the class
+        # `Stack_c` and a separate `get`.
         for name, syms in name_to_symbols.items():
-            if not graph_name_excluded(name):
-                continue
             for sym in syms:
+                if sym["kind"] not in _EDGE_TARGET_KINDS and not _is_constructor(sym, name):
+                    continue
                 parts = _without_template_args(sym.get("qualified") or "").split("::")
                 if len(parts) >= 2 and parts[-1] == name:
-                    alias = "::".join(parts[-2:])
-                    listed = filtered_names.setdefault(alias, [])
-                    if all(s["id"] != sym["id"] for s in listed):
-                        listed.append(sym)
+                    aliases = ["::".join(parts[-2:])]
+                    # `ns::Tint(1, 2)` constructs: the constructor goes with
+                    # the class it is written as.
+                    if len(parts) >= 3 and _is_constructor(sym, name):
+                        aliases.append("::".join(parts[-3:-1]))
+                    for alias in aliases:
+                        listed = filtered_names.setdefault(alias, [])
+                        if all(s["id"] != sym["id"] for s in listed):
+                            listed.append(sym)
 
         if not filtered_names:
             return 0
@@ -2069,7 +2076,11 @@ class Indexer:
                 if refs_for_this >= MAX_REFS_PER_SYMBOL:
                     break
                 targets = [t for t in filtered_names.get(ref_name, [])
-                           if t["id"] != source_id and t["kind"] in _EDGE_TARGET_KINDS]
+                           if t["id"] != source_id and (
+                               t["kind"] in _EDGE_TARGET_KINDS
+                               # A constructor declared in its class and
+                               # defined elsewhere is only a prototype here.
+                               or (t["kind"] == "prototype" and _is_constructor(t, ref_name)))]
                 decided = None
                 if c_family and targets:
                     forms, qualifiers = forms_of.get(ref_name, (set(), set()))

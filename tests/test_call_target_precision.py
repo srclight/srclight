@@ -1006,3 +1006,62 @@ def test_a_prototype_extends_only_its_own_overload():
     fn = {"kind": "function", "signature": "void log(int l, const char* t)",
           "other_signatures": ["void log(int l, const char* t = 0)", "void log(float x)"]}
     assert _accepts(fn, "log", {1}) and _accepts(fn, "log", {2})
+
+
+def test_a_constructor_declared_in_its_class_is_reached(tmp_path):
+    edges = _edges({"angle.h": """\
+class Angle {
+public:
+    Angle(const Angle& other);
+    Angle(short v);
+    Angle(float v);
+};
+""", "angle.cpp": """\
+#include "angle.h"
+
+Angle::Angle(short v) {
+}
+""", "use/use.cpp": """\
+void turn(short v) {
+    Angle a(v);
+    Angle(v);
+}
+"""}, tmp_path)
+    db = Database(tmp_path / "edges" / "index.db")
+    db.open()
+    reached = {r[0] for r in db.conn.execute(
+        """SELECT b.signature FROM symbol_edges e JOIN symbols a ON a.id = e.source_id
+           JOIN symbols b ON b.id = e.target_id WHERE a.name = 'turn'""") if r[0]}
+    db.close()
+    assert {"Angle(short v)", "Angle(float v)"} <= reached
+
+
+def test_a_qualified_call_to_an_in_class_member_names_the_member(tmp_path):
+    edges = _edges({"stack.h": """\
+class Stack_c {
+public:
+    static void scaleBy(float f);
+};
+""", "use/use.cpp": """\
+void grow() {
+    Stack_c::scaleBy(2.0f);
+}
+"""}, tmp_path)
+    reached = {b for a, b, _ in edges if a == "grow"}
+    assert "Stack_c::scaleBy" in reached and "Stack_c" not in reached
+
+
+def test_symbols_in_file_names_the_class_of_each_member(serve):
+    server = serve({"flags.h": """\
+class One_c {
+public:
+    bool checkFlag(int f);
+};
+class Two_c {
+public:
+    bool checkFlag(int f);
+};
+"""})
+    symbols = json.loads(server.symbols_in_file("flags.h"))["symbols"]
+    assert {s.get("qualified_name") for s in symbols if s["name"] == "checkFlag"} == {
+        "One_c::checkFlag", "Two_c::checkFlag"}

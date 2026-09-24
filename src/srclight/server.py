@@ -798,7 +798,8 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
             for schema, project_name in batch:
                 try:
                     rows = wdb.conn.execute(
-                        f"""SELECT s.name, s.kind, s.signature, s.start_line, s.end_line, s.doc_comment
+                        f"""SELECT s.name, s.qualified_name, s.kind, s.signature, s.start_line,
+                                  s.end_line, s.doc_comment
                            FROM [{schema}].symbols s
                            JOIN [{schema}].files f ON s.file_id = f.id
                            WHERE f.path = ?
@@ -807,6 +808,8 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
                     ).fetchall()
                     all_results.extend({
                         "name": r["name"],
+                        **({"qualified_name": r["qualified_name"]}
+                           if r["qualified_name"] and r["qualified_name"] != r["name"] else {}),
                         "kind": r["kind"],
                         "signature": r["signature"],
                         "line": r["start_line"],
@@ -831,6 +834,9 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
     for sym in symbols:
         result.append({
             "name": sym.name,
+            # Three `CheckFlag`s of three classes read alike without it.
+            **({"qualified_name": sym.qualified_name}
+               if sym.qualified_name and sym.qualified_name != sym.name else {}),
             "kind": sym.kind,
             "signature": sym.signature,
             "line": sym.start_line,
