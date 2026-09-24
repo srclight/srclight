@@ -706,8 +706,10 @@ _IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
 
 def _reference_forms_all(content: str, names: set[str]) -> dict[str, tuple[set[str], set[str]]]:
     """For each of `names`, how a C/C++ symbol's text refers to it: `member`
-    (`x.name`, `p->name`), `this` (`this->name`), `qualified` (`X::name`, with
-    each `X`), `global` (`::name`) or `bare`. One pass over the text."""
+    (`x.name(`, `p->name(`), `this` (`this->name(`), `qualified` (`X::name`,
+    with each `X`), `global` (`::name`) or `bare` — or as no function at all:
+    `field` (`x.name` with no call) and `object` (`name.x`, `name->x`). One
+    pass over the text."""
     found: dict[str, tuple[set[str], set[str]]] = {}
     for m in _IDENT_RE.finditer(content):
         name = m.group(0)
@@ -715,9 +717,15 @@ def _reference_forms_all(content: str, names: set[str]) -> dict[str, tuple[set[s
             continue
         forms, qualifiers = found.setdefault(name, (set(), set()))
         before = content[max(0, m.start() - 200):m.start()].rstrip()
-        if _THIS_ARROW_RE.search(before):
+        after = content[m.end():m.end() + 8].lstrip()
+        member_access = before.endswith(("->", ".")) and not before.endswith("..")
+        if member_access and not after.startswith(("(", "<")):
+            forms.add("field")  # `x.flags & mask`: a member read, no call
+        elif after.startswith(("->", ".")) and not after.startswith("..."):
+            forms.add("object")  # `current.pos`: a value, whatever else it names
+        elif _THIS_ARROW_RE.search(before):
             forms.add("this")
-        elif before.endswith((".", "->")) and not before.endswith(".."):
+        elif member_access:
             forms.add("member")
         elif before.endswith("::"):
             q = _QUALIFIER_RE.search(before)
@@ -766,6 +774,10 @@ def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
     Returns the targets left, and the resolution when the syntax alone
     decided it.
     """
+    values = forms & {"field", "object"}
+    forms = forms - values
+    if values and not forms:
+        return [], None  # only ever a value, never called or named as a function
     if "::" in name or not forms:
         return targets, None  # the reference is qualified already: `C::f`
 
@@ -1774,8 +1786,12 @@ class Indexer:
                     source_scope = unqualified or None
                 elif row["kind"] in ("method", "template", "function") and "::" in unqualified:
                     source_scope = unqualified.rsplit("::", 1)[0]
+                # An out-of-line definition opens with its own name, `C::f`:
+                # that is no call to the declaration `f`.
+                own_blanked = (content.replace(source_name, " " * len(source_name), 1)
+                               if "::" in source_name else content)
                 forms_of = _reference_forms_all(
-                    content, {n for n in referenced_names if "::" not in n})
+                    own_blanked, {n for n in referenced_names if "::" not in n})
                 # A parameter or local hides the name written bare only:
                 # `x.name()`, `::name()` and `C::name()` still call.
                 for declared in _declared_names(content, source_name, row["kind"]):

@@ -912,6 +912,42 @@ def _graph_coverage(db: Database, syms) -> dict:
     return {}
 
 
+_CALL_SITE_RE = re.compile(r"(?<![\w$])([A-Za-z_]\w*)\s*\(")
+
+
+def _callee_coverage(db: Database, syms, result: list[dict]) -> dict:
+    """Name the calls a body makes that the graph leaves out by design.
+
+    A callee list that silently skips `update()` and `calc()` reads as a
+    body that never calls them. The names it calls but the graph excludes —
+    too common, or defined too often to tell which one — are listed.
+    """
+    from .indexer import GRAPH_MAX_FANOUT, graph_name_excluded
+    from .refmask import mask_noncode
+
+    listed = {e["name"].rsplit("::", 1)[-1] for e in result}
+    own = {sym.name.rsplit("::", 1)[-1] for sym in syms}
+    called: set[str] = set()
+    for sym in syms:
+        if not sym.content:
+            continue
+        row = db.conn.execute(
+            "SELECT language FROM files WHERE path = ?", (sym.file_path,)).fetchone()
+        text = mask_noncode(sym.content, (row[0] if row else "") or "")
+        called.update(m.group(1) for m in _CALL_SITE_RE.finditer(text))
+    missing = sorted(
+        name for name in called - listed - own
+        if (graph_name_excluded(name) or db.count_graph_targets(name) > GRAPH_MAX_FANOUT)
+        and db.count_graph_targets(name) > 0)
+    if not missing:
+        return {}
+    shown = ", ".join(f"`{n}`" for n in missing[:15]) + (" …" if len(missing) > 15 else "")
+    return {"graph_note": (
+        f"Calls to {shown} are not listed: these names are too common, or defined more "
+        f"than {GRAPH_MAX_FANOUT} times, for the graph to tell which one is called. "
+        f"find_pattern can locate the call sites.")}
+
+
 def _dedup_edges(edges: list[dict]) -> list[dict]:
     """Deduplicate edges by symbol name, keeping the highest-confidence entry."""
     by_name: dict[str, dict] = {}
@@ -1045,7 +1081,8 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
             return _symbol_not_found_error(symbol_name, project)
         callees = _union_edges(syms, db.get_callees)
         result = _dedup_edges(callees)
-        matched = _matched_symbols(db, syms, incoming=False)
+        matched = {**_matched_symbols(db, syms, incoming=False),
+                   **_callee_coverage(db, syms, result)}
         db.close()
         return json.dumps({
             "project": project,
@@ -1064,7 +1101,8 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
     result = _dedup_edges(callees)
 
     payload = {"symbol": symbol_name, "callee_count": len(result), "callees": result,
-               **_matched_symbols(db, syms, incoming=False)}
+               **_matched_symbols(db, syms, incoming=False),
+               **_callee_coverage(db, syms, result)}
     _stamp_freshness(payload, (c.get("file") or c.get("file_path")
                                for c in result if isinstance(c, dict)))
     return json.dumps(payload, indent=2)

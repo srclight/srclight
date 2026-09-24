@@ -598,3 +598,91 @@ int run_dev(struct ops* o) {
 def test_a_long_qualifier_chain_does_not_recurse():
     body = "void f() {" + " const" * 3000 + " Widget w;}"
     assert "w" in _declared_names(body, "f", "function")
+
+
+def test_a_member_read_or_an_object_is_no_call(tmp_path):
+    edges = _edges({"stream.h": """\
+class Stream_c {
+public:
+    int flags();
+};
+""", "ctx/ctx.cpp": """\
+int current() {
+    return 0;
+}
+""", "actor/actor.cpp": """\
+struct Pose { int angle; int pos; };
+struct Attn { int flags; };
+
+void stepActor(Pose& current, Attn& info) {
+    current.angle = 3;
+    if (info.flags & 4) {
+    }
+}
+"""}, tmp_path)
+    reached = {b for a, b, _ in edges if a == "stepActor"}
+    assert "current" not in reached and "Stream_c::flags" not in reached
+
+
+def test_a_function_pointer_field_read_is_no_call_but_its_call_is(tmp_path):
+    edges = _edges({"irq.c": """\
+struct ops { void (*handleIrq)(int); };
+
+void handleIrq(int v) {
+}
+
+int hasHandler(struct ops *o) {
+    return o->handleIrq != 0;
+}
+
+void fire(struct ops *o) {
+    o->handleIrq(1);
+}
+"""}, tmp_path)
+    assert ("fire", "handleIrq") in _pairs(edges)
+    assert ("hasHandler", "handleIrq") not in _pairs(edges)
+
+
+def test_a_local_named_like_its_method_makes_no_self_call(tmp_path):
+    edges = _edges({"door.h": """\
+class Door_c {
+public:
+    int paint();
+    int visible();
+};
+""", "door.cpp": """\
+#include "door.h"
+
+int Door_c::paint() {
+    int paint = visible();
+    if (!paint) {
+        return 0;
+    }
+    return paint;
+}
+"""}, tmp_path)
+    assert not any(a == "Door_c::paint" and b == "Door_c::paint" for a, b, _ in edges)
+    assert ("Door_c::paint", "Door_c::visible") in _pairs(edges)
+
+
+def test_callees_name_the_calls_the_graph_leaves_out(serve):
+    files = _lamps(12)
+    files["far/far.cpp"] = """\
+class Box_c {
+public:
+    void reset();
+};
+
+void Box_c::reset() {
+}
+
+void tickFar(void* lamp, Box_c* box) {
+    lamp->blinkLamp();
+    box->reset();
+}
+"""
+    server = serve(files)
+    payload = json.loads(server.get_callees("tickFar"))
+    note = payload["graph_note"]
+    assert "`blinkLamp`" in note and "`reset`" in note
+    assert "graph_note" not in json.loads(server.get_callees("ownLamp"))
