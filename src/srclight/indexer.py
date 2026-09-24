@@ -1432,6 +1432,8 @@ class Indexer:
                          if _extent_is_sound(sym[0])]
             by_start = {(k, n, node.start_byte): i for i, (node, k, n) in enumerate(recovered)}
             by_end = {(k, n, node.end_byte): i for i, (node, k, n) in enumerate(recovered)}
+            by_span = {(n, node.start_byte, node.end_byte): i
+                       for i, (node, _k, n) in enumerate(recovered)}
             # Proof that an original ran on over something: a function the reparse
             # reads at top level. A struct, an enum or a macro local to a function
             # sits in its tail in both parses and proves nothing.
@@ -1469,6 +1471,18 @@ class Indexer:
                                 sym = recovered[i]
                                 recovered_nodes.add(id(twin))
                         break
+                else:
+                    # One definition read as two kinds: a class head broken
+                    # by a conditional (`class C #if X : public B #endif {`)
+                    # leaves its members at file scope in the original parse
+                    # — functions and prototypes — where the reparse reads
+                    # the class and its methods. Same name, same extent: the
+                    # same definition, named by the parse that read the class.
+                    i = by_span.get((name, node.start_byte, node.end_byte))
+                    if i is not None and i not in used:
+                        used.add(i)
+                        sym = recovered[i]
+                        recovered_nodes.add(id(sym[0]))
                 merged.append(sym)
             added = [sym for i, sym in enumerate(recovered) if i not in used]
             recovered_nodes.update(id(sym[0]) for sym in added)

@@ -810,3 +810,35 @@ class Panel_c {
 
     starts = {start for name, start, end in _symbols(db, "panel.cpp") if name == "applyMode"}
     assert 1 not in starts
+
+
+BASE_UNDER_IF = """\
+class Stick_c
+#if TOOLING
+    : public Inspectable
+#endif
+{
+public:
+    Stick_c();
+    bool shiftGear(unsigned);
+
+    bool checkMode(unsigned short flag) {
+        return (flag & mMode) ? true : false;
+    }
+
+    float readHigh() { return mHigh; }
+
+    float mHigh;
+    unsigned short mMode;
+};
+"""
+
+
+def test_a_class_with_its_base_under_if_yields_each_member_once(tmp_path, db):
+    _index(tmp_path, db, {"stick.h": BASE_UNDER_IF})
+    rows = db.conn.execute(
+        "SELECT name, qualified_name, kind, start_line FROM symbols WHERE name IN "
+        "('shiftGear', 'checkMode', 'readHigh')").fetchall()
+    spans = [(r[0], r[3]) for r in rows]
+    assert len(spans) == len(set(spans)) == 3
+    assert ("shiftGear", "Stick_c::shiftGear") in {(r[0], r[1]) for r in rows}
