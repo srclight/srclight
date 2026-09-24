@@ -173,3 +173,20 @@ def test_a_variable_typed_by_a_macro_is_no_function(tmp_path):
     assert ("PICK_TYPE", "macro") in kinds
     assert not any(n == "PICK_TYPE" and k != "macro" for n, k in kinds)
     assert ("realOne", "function") in kinds
+
+
+def test_a_class_field_typed_by_a_macro_is_no_prototype(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "cfg.h").write_text("#define PICK_TYPE(a, b) a\n")
+    (root / "panel.h").write_text(
+        "#include \"cfg.h\"\nclass Panel_c {\npublic:\n    void redraw();\n"
+        "    /* 0x10 */ PICK_TYPE(float, short) mSlots[150];\n    int mCount;\n};\n")
+    db = Database(root / "index.db")
+    db.open()
+    db.initialize()
+    Indexer(db, IndexConfig(root=root)).index()
+    kinds = {(r[0], r[1]) for r in db.conn.execute("SELECT name, kind FROM symbols")}
+    db.close()
+    assert not any(n == "PICK_TYPE" and k != "macro" for n, k in kinds)
+    assert any(n == "redraw" for n, _ in kinds)

@@ -700,7 +700,14 @@ def _macro_typed_declaration(def_node: Node, name: str) -> bool:
     while i < len(text) and depth:
         depth += {"(": 1, ")": -1}.get(text[i], 0)
         i += 1
-    after = re.match(r"\s*([A-Za-z_]\w*)\s*[;=,\[]", text[i:])
+    rest = text[i:]
+    if not rest.strip() and def_node.parent is not None:
+        # In a class body the parser may end the node at the parenthesis
+        # and leave the field's name to what follows.
+        parent = def_node.parent
+        rest = parent.text[def_node.end_byte - parent.start_byte:][:200].decode(
+            "utf-8", errors="replace")
+    after = re.match(r"\s*([A-Za-z_]\w*)\s*[;=,\[]", rest)
     return after is not None and after.group(1) not in _AFTER_PARAMS_WORDS
 
 
