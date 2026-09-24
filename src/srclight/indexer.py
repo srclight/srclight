@@ -704,6 +704,9 @@ def _kind_from_capture(capture_name: str) -> str:
         "qconv": "method",
         "ptrop2": "function",
         "ptropproto": "prototype",
+        "ptropproto2": "prototype",
+        "ptrrefproto": "prototype",
+        "ptrreffield": "method",
         "ptrreffn": "function",
         "ptrrefinline": "method",
         "ptrrefmethod": "method",
@@ -806,23 +809,41 @@ _DECLARATOR_NAME_TYPES = frozenset({
 })
 
 
-def _operator_cast_name(node: Node) -> str:
-    """`operator const char*() const` -> "operator const char*".
-
-    The name is everything before the parameter list: the target type alone
-    drops its pointer, reference and const, and two conversions of one class
-    — to `char` and to `const char*` — then shared one name. A qualified
-    definition keeps its scope: `Box::operator bool`.
-    """
-    return " ".join(node.text.decode("utf-8", errors="replace").split("(")[0].split())
+def _conversion_of(node: Node) -> Node | None:
+    """The operator_cast a name node stands for, through any number of
+    qualification levels (`ns::Box::operator int`), or None."""
+    while node is not None and node.type == "qualified_identifier":
+        node = node.child_by_field_name("name")
+    return node if node is not None and node.type == "operator_cast" else None
 
 
 def _names_a_conversion(node: Node) -> bool:
     """Whether a name node is a conversion operator, qualified or not."""
-    return node.type == "operator_cast" or (
-        node.type == "qualified_identifier"
-        and any(child.type == "operator_cast" for child in node.children)
-    )
+    return _conversion_of(node) is not None
+
+
+def _operator_cast_name(node: Node) -> str:
+    """`operator const char*() const` -> "operator const char*".
+
+    The name is everything before the conversion's own parameter list — found
+    in the tree, not by the first `(`, which may belong to the target type
+    (`operator Callback<void(int)>`) or to the scope. The target type alone
+    would drop its pointer, reference and const. A qualified definition keeps
+    its scope: `ns::Box::operator bool`.
+    """
+    cast = _conversion_of(node)
+    declarator = cast.child_by_field_name("declarator") if cast is not None else None
+    while declarator is not None and declarator.type != "abstract_function_declarator":
+        inner = declarator.child_by_field_name("declarator")
+        if inner is None:
+            inner = next((c for c in declarator.named_children
+                          if c.type.endswith("declarator")), None)
+        declarator = inner
+    parameters = (declarator.child_by_field_name("parameters")
+                  if declarator is not None else None)
+    end = parameters.start_byte if parameters is not None else node.end_byte
+    text = node.text[:end - node.start_byte]
+    return " ".join(text.decode("utf-8", errors="replace").split())
 
 
 def _declarator_name(node: Node | None) -> str | None:

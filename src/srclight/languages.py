@@ -271,9 +271,11 @@ _CPP_QUERY = """
 (declaration
     declarator: (operator_cast) @convdecl.name) @convdecl.def
 
+; Any qualified declarator directly under a definition is a conversion
+; operator — an ordinary method's sits under a function_declarator — however
+; many levels its qualification has (`ns::Box::operator int`).
 (function_definition
-    declarator: (qualified_identifier
-        name: (operator_cast)) @qconv.name) @qconv.def
+    declarator: (qualified_identifier) @qconv.name) @qconv.def
 
 ; `T** operator&()`, and a free operator declared returning a pointer.
 (function_definition
@@ -286,6 +288,25 @@ _CPP_QUERY = """
     declarator: (pointer_declarator
         declarator: (function_declarator
             declarator: (operator_name) @ptropproto.name))) @ptropproto.def
+
+(declaration
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (operator_name) @ptropproto2.name)))) @ptropproto2.def
+
+; `T*& f();` declared, at file scope or in a class.
+(declaration
+    declarator: (pointer_declarator
+        declarator: (reference_declarator
+            (function_declarator
+                declarator: (identifier) @ptrrefproto.name)))) @ptrrefproto.def
+
+(field_declaration
+    declarator: (pointer_declarator
+        declarator: (reference_declarator
+            (function_declarator
+                declarator: (field_identifier) @ptrreffield.name)))) @ptrreffield.def
 
 ; A reference to a pointer, `T*& f()`: the pointer wraps the reference.
 (function_definition

@@ -220,3 +220,41 @@ def conversion_symbols(tmp_path, db):
 ])
 def test_conversion_operators_and_members_under_conditionals(conversion_symbols, expected):
     assert expected in conversion_symbols
+
+
+DEEP_CONVERSIONS_CPP = """\
+namespace ns_a {
+class Box_c {
+public:
+    operator Callback_t<void(int)>() const { return mCallback; }
+};
+}
+
+ns_a::Box_c::operator int() const { return 1; }
+
+Node_s*& freeRefPtr();
+Node_s** operator-(Node_s* node, int step);
+"""
+
+
+@pytest.fixture
+def deep_symbols(tmp_path, db):
+    root = tmp_path / "deep"
+    root.mkdir()
+    (root / "box.cpp").write_text(DEEP_CONVERSIONS_CPP)
+    Indexer(db, IndexConfig(root=root)).index()
+    return {(r["name"], r["kind"], r["start_line"]) for r in db.conn.execute(
+        "SELECT name, kind, start_line FROM symbols"
+    )}
+
+
+@pytest.mark.parametrize("expected", [
+    # A `(` inside the target type is not the parameter list.
+    ("operator Callback_t<void(int)>", "method", 4),
+    # Defined outside its class under a two-level qualification.
+    ("ns_a::Box_c::operator int", "method", 8),
+    ("freeRefPtr", "prototype", 10),
+    ("operator-", "prototype", 11),
+])
+def test_conversions_and_declarations_in_their_remaining_shapes(deep_symbols, expected):
+    assert expected in deep_symbols
