@@ -689,7 +689,20 @@ def _kind_from_capture(capture_name: str) -> str:
         "inline_method": "method",
         "ptrinline": "method",
         "ptrinline2": "method",
-        "inline_op": "method",
+        # An operator is a method or a free function depending on where it
+        # sits; _in_class_body turns these into methods inside a class.
+        "inline_op": "function",
+        "refop": "function",
+        "ptrop": "function",
+        "field_op": "method",
+        "reffield_op": "method",
+        "ptrfield_op": "method",
+        "opproto": "prototype",
+        "refopproto": "prototype",
+        "conv": "method",
+        "ptrreffn": "function",
+        "ptrrefinline": "method",
+        "ptrrefmethod": "method",
         "inline_dtor": "method",
         # C++ definitions and declarations returning a reference
         "reffn": "function",
@@ -721,10 +734,12 @@ def _get_enclosing_scope(node: Node) -> list[str]:
     defined inside namespace myapp { namespace util { class ConfigManager { ... } } }
     """
     scopes: list[str] = []
+    previous = node
     current = node.parent
     while current is not None:
         if current.type in (
             "namespace_definition", "class_specifier", "struct_specifier",
+            "union_specifier",
             "class_definition",  # Python
             "class_declaration", "namespace_declaration",  # C#
         ):
@@ -732,13 +747,16 @@ def _get_enclosing_scope(node: Node) -> list[str]:
             if name_node:
                 scopes.append(name_node.text.decode("utf-8", errors="replace"))
         elif current.type == "template_declaration":
-            # Look for named child inside the template
+            # Look for named child inside the template — unless the walk just
+            # came up through it: that class is already in the scopes, and
+            # adding it again named a template's members `Holder::Holder::f`.
             for child in current.children:
-                if child.type in ("class_specifier", "struct_specifier"):
+                if child.type in ("class_specifier", "struct_specifier", "union_specifier"):
                     name_node = child.child_by_field_name("name")
-                    if name_node:
+                    if name_node and child != previous:
                         scopes.append(name_node.text.decode("utf-8", errors="replace"))
                     break
+        previous = current
         current = current.parent
     scopes.reverse()
     return scopes
@@ -778,6 +796,51 @@ def _build_qualified_name(symbol_name: str | None, node: Node, lang: str) -> str
         return symbol_name
 
 
+_DECLARATOR_NAME_TYPES = frozenset({
+    "identifier", "field_identifier", "qualified_identifier", "operator_name",
+    "destructor_name", "type_identifier",
+})
+
+
+def _operator_cast_name(node: Node) -> str:
+    """`operator bool() const` -> "operator bool"."""
+    target = node.child_by_field_name("type")
+    if target is not None:
+        return "operator " + target.text.decode("utf-8", errors="replace")
+    return " ".join(node.text.decode("utf-8", errors="replace").split("(")[0].split())
+
+
+def _declarator_name(node: Node | None) -> str | None:
+    """The name a C/C++ declarator declares, through any pointer, reference or
+    function declarator around it.
+
+    A reference_declarator holds its inner declarator without a field name,
+    so the walk falls back on its first named declarator child.
+    """
+    while node is not None:
+        if node.type in _DECLARATOR_NAME_TYPES:
+            return node.text.decode("utf-8", errors="replace")
+        if node.type == "operator_cast":
+            return _operator_cast_name(node)
+        inner = node.child_by_field_name("declarator")
+        if inner is None:
+            inner = next((child for child in node.named_children
+                          if child.type.endswith("declarator")
+                          or child.type in _DECLARATOR_NAME_TYPES
+                          or child.type == "operator_cast"), None)
+        node = inner
+    return None
+
+
+def _in_class_body(node: Node) -> bool:
+    """Whether a C++ definition sits in a class body, a template one included:
+    a method, whatever pattern matched it."""
+    parent = node.parent
+    if parent is not None and parent.type == "template_declaration":
+        parent = parent.parent
+    return parent is not None and parent.type == "field_declaration_list"
+
+
 def _extract_template_name(node: Node) -> str | None:
     """Extract the name from a template_declaration's inner declaration.
 
@@ -790,22 +853,14 @@ def _extract_template_name(node: Node) -> str | None:
             name_node = child.child_by_field_name("name")
             if name_node:
                 return name_node.text.decode("utf-8", errors="replace")
-        elif child.type == "function_definition":
+        elif child.type in ("function_definition", "declaration"):
+            # A function, a template variable or a forward declaration. The
+            # name can sit under pointer and reference declarators — reading
+            # the declarator's own text named `T& pick()` "& pick()".
             declarator = child.child_by_field_name("declarator")
             if declarator:
-                # Could be function_declarator -> identifier or qualified_identifier
-                inner = declarator.child_by_field_name("declarator")
-                if inner:
-                    return inner.text.decode("utf-8", errors="replace")
-                return declarator.text.decode("utf-8", errors="replace")
-        elif child.type == "declaration":
-            # Template variable or forward declaration
-            declarator = child.child_by_field_name("declarator")
-            if declarator:
-                inner = declarator.child_by_field_name("declarator")
-                if inner:
-                    return inner.text.decode("utf-8", errors="replace")
-                return declarator.text.decode("utf-8", errors="replace")
+                return (_declarator_name(declarator)
+                        or declarator.text.decode("utf-8", errors="replace"))
         elif child.type == "alias_declaration":
             name_node = child.child_by_field_name("name")
             if name_node:
@@ -1140,10 +1195,18 @@ class Indexer:
                     def_node = nodes[0]
                     kind = _kind_from_capture(capture_name)
                 elif capture_name.endswith(".name") and nodes:
-                    symbol_name = nodes[0].text.decode("utf-8", errors="replace")
+                    if nodes[0].type == "operator_cast":
+                        symbol_name = _operator_cast_name(nodes[0])
+                    else:
+                        symbol_name = nodes[0].text.decode("utf-8", errors="replace")
 
             if def_node is None:
                 continue
+
+            # In C++ the same shape defines a free function or a method; where
+            # it sits decides — a class body, a template one included.
+            if lang == "cpp" and kind == "function" and _in_class_body(def_node):
+                kind = "method"
 
             # For templates without a name, extract from the inner declaration
             if symbol_name is None and kind == "template":

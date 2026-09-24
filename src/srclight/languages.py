@@ -223,6 +223,67 @@ _CPP_QUERY = """
     declarator: (reference_declarator
         (function_declarator
             declarator: (field_identifier) @reffield_fn.name))) @reffield_fn.def
+
+; Operators returning a reference or a pointer — `T& operator[]`,
+; `T* operator->`, `Stream& operator<<` — the most common operator shapes.
+; Whether a definition is a method or a free function is decided by where it
+; sits (see _in_class_body), not by the pattern.
+(function_definition
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (operator_name) @refop.name))) @refop.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (operator_name) @ptrop.name))) @ptrop.def
+
+; Operators declared in their class, and free operators declared.
+(field_declaration
+    declarator: (function_declarator
+        declarator: (operator_name) @field_op.name)) @field_op.def
+
+(field_declaration
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (operator_name) @reffield_op.name))) @reffield_op.def
+
+(field_declaration
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (operator_name) @ptrfield_op.name))) @ptrfield_op.def
+
+(declaration
+    declarator: (function_declarator
+        declarator: (operator_name) @opproto.name)) @opproto.def
+
+(declaration
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (operator_name) @refopproto.name))) @refopproto.def
+
+; A conversion operator, `operator bool() const`, is named by an operator_cast.
+(function_definition
+    declarator: (operator_cast) @conv.name) @conv.def
+
+; A reference to a pointer, `T*& f()`: the pointer wraps the reference.
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (reference_declarator
+            (function_declarator
+                declarator: (identifier) @ptrreffn.name)))) @ptrreffn.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (reference_declarator
+            (function_declarator
+                declarator: (field_identifier) @ptrrefinline.name)))) @ptrrefinline.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (reference_declarator
+            (function_declarator
+                declarator: (qualified_identifier) @ptrrefmethod.name)))) @ptrrefmethod.def
 """
 
 _JS_QUERY = """
