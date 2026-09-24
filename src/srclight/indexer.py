@@ -651,6 +651,33 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
     return match
 
 
+# Words a C or C++ symbol can never be named. Error recovery can still hand
+# one to the extractor: `if (a == b) { ... }` cut off from its chain reads as
+# a function `if` taking `(a == b)`. C++ reserves more than C, where `new`,
+# `delete` or `class` are ordinary identifiers.
+_C_KEYWORDS = frozenset({
+    "auto", "break", "case", "char", "const", "continue", "default", "do",
+    "double", "else", "enum", "extern", "float", "for", "goto", "if", "inline",
+    "int", "long", "register", "restrict", "return", "short", "signed",
+    "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned",
+    "void", "volatile", "while", "_Alignas", "_Alignof", "_Atomic", "_Bool",
+    "_Complex", "_Generic", "_Imaginary", "_Noreturn", "_Static_assert",
+    "_Thread_local",
+})
+_CPP_KEYWORDS = _C_KEYWORDS | frozenset({
+    "alignas", "alignof", "and", "and_eq", "asm", "bitand", "bitor", "bool",
+    "catch", "char8_t", "char16_t", "char32_t", "class", "co_await",
+    "co_return", "co_yield", "compl", "concept", "const_cast", "consteval",
+    "constexpr", "constinit", "decltype", "delete", "dynamic_cast", "explicit",
+    "export", "false", "friend", "mutable", "namespace", "new", "noexcept",
+    "not", "not_eq", "nullptr", "operator", "or", "or_eq", "private",
+    "protected", "public", "reinterpret_cast", "requires", "static_assert",
+    "static_cast", "template", "this", "thread_local", "throw", "true", "try",
+    "typeid", "typename", "using", "virtual", "wchar_t", "xor", "xor_eq",
+})
+_RESERVED_NAMES = {"c": _C_KEYWORDS, "cpp": _CPP_KEYWORDS}
+
+
 def _kind_from_capture(capture_name: str) -> str:
     """Map tree-sitter capture names to symbol kinds."""
     prefix = capture_name.split(".")[0]
@@ -1142,6 +1169,10 @@ class Indexer:
             # separator. An empty name is not NULL, so it would slip past every
             # IS NOT NULL filter and reach the name index.
             if symbol_name == "" or (symbol_name or "").endswith((".", ":")):
+                continue
+
+            # A keyword is never a name — only error recovery makes it one.
+            if symbol_name in _RESERVED_NAMES.get(lang, ()):
                 continue
 
             if lang == "lua" and _lua_nameless_definition(def_node):
