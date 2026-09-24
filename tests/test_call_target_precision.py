@@ -506,3 +506,95 @@ int peek(Hub_c* hub) {
 }
 """}, tmp_path)
     assert ("peek", "fetchSlot") in _pairs(edges)
+
+
+def test_a_local_named_like_a_getter_hides_only_the_bare_name(tmp_path):
+    edges = _edges({"layer.h": """\
+class Layer {
+public:
+    float opacity();
+    int spacing();
+};
+""", "use/blend.cpp": """\
+void blendPanel(Layer* layer, const Layer& other) {
+    float opacity = layer->opacity();
+    auto spacing = other.spacing();
+}
+"""}, tmp_path)
+    assert {("blendPanel", "Layer::opacity"), ("blendPanel", "Layer::spacing")} <= _pairs(edges)
+
+
+def test_a_global_call_hides_nothing_behind_a_parameter(tmp_path):
+    edges = _edges({"tally.cpp": """\
+int tally(int n) {
+    return n;
+}
+
+int sumUp(int tally) {
+    return ::tally(tally);
+}
+"""}, tmp_path)
+    assert ("sumUp", "tally") in _pairs(edges)
+
+
+def test_a_class_template_is_its_own_scope(tmp_path):
+    edges = _edges({"a/box.h": """\
+namespace store {
+void refill(int n);
+template <typename T> class Crate {
+public:
+    void refill(int n);
+    void topUp() { refill(3); }
+};
+}
+""", "a/box.cpp": """\
+namespace store {
+void refill(int n) {
+}
+}
+"""}, tmp_path)
+    assert not any(r == "same_class" and b == "store::refill" for _, b, r in edges)
+
+
+def test_a_global_call_prefers_the_global_function(tmp_path):
+    edges = _edges({"gain.cpp": """\
+int computeGain() {
+    return 1;
+}
+
+namespace audio {
+int computeGain() {
+    return 2;
+}
+
+int mixTrack() {
+    return ::computeGain();
+}
+}
+"""}, tmp_path)
+    reached = {b for a, b, _ in edges if a == "audio::mixTrack"}
+    assert reached == {"computeGain"}
+
+
+def test_a_c_member_call_ranks_no_function_first(tmp_path):
+    edges = _edges({"c/ops.h": """\
+static inline int flush_all(int v) {
+    return v;
+}
+""", "c/drv.c": """\
+struct ops { int (*flush_all)(int); };
+
+static int flush_all(int v) {
+    return v;
+}
+
+int run_dev(struct ops* o) {
+    return o->flush_all(1);
+}
+"""}, tmp_path)
+    assert {r for a, _, r in edges if a == "run_dev"} == {"same_file"}
+
+
+def test_a_long_qualifier_chain_does_not_recurse():
+    body = "void f() {" + " const" * 3000 + " Widget w;}"
+    assert "w" in _declared_names(body, "f", "function")

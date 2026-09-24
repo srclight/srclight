@@ -607,12 +607,28 @@ _TYPE_WORDS = _DECL_QUALIFIERS | {"long", "short", "int", "char", "float", "doub
 
 
 def _opens_a_declaration(content: str, at: int) -> bool:
-    before = content[max(0, at - 80):at].rstrip()
-    if not before or before[-1] in _DECL_OPENERS:
-        return True
-    word = _WORD_BEFORE_RE.search(before)
-    return word is not None and word.group(1) in _DECL_QUALIFIERS and _opens_a_declaration(
-        content, word.start() + max(0, at - 80))
+    while True:
+        start = max(0, at - 80)
+        before = content[start:at].rstrip()
+        if not before or before[-1] in _DECL_OPENERS:
+            return True
+        word = _WORD_BEFORE_RE.search(before)
+        if word is None or word.group(1) not in _DECL_QUALIFIERS:
+            return False
+        at = start + word.start()
+
+
+def _declares_a_class(content: str) -> bool:
+    """Whether a template symbol's text is a class template's body, rather
+    than a function template."""
+    m = re.match(r"\s*template\s*<", content)
+    if m is None:
+        return False
+    depth, i = 1, m.end()
+    while i < len(content) and depth:
+        depth += {"<": 1, ">": -1}.get(content[i], 0)
+        i += 1
+    return re.match(r"\s*(?:class|struct|union)\b[^;(]*\{", content[i:]) is not None
 
 
 def _parameter_name(param: str) -> str | None:
@@ -705,7 +721,7 @@ def _reference_forms_all(content: str, names: set[str]) -> dict[str, tuple[set[s
             forms.add("member")
         elif before.endswith("::"):
             q = _QUALIFIER_RE.search(before)
-            if q is None:
+            if q is None or q.group(1) in _NOT_A_TYPE:  # `return ::name()`
                 forms.add("global")
             else:
                 forms.add("qualified")
@@ -737,7 +753,8 @@ def _is_constructor(t: dict, name: str) -> bool:
 
 def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
                       qualifiers: set[str], source_scope: str | None,
-                      source_kind: str) -> tuple[list[dict], str | None]:
+                      source_kind: str, source_in_c: bool = False,
+                      ) -> tuple[list[dict], str | None]:
     """Keep the C/C++ targets the way a name is written can reach.
 
     `X::name` reaches the `name` of an `X` (or `X`'s constructor); a method's
@@ -775,8 +792,9 @@ def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
         if named:
             return named, "qualified" if len(named) == 1 else None
     preferred = targets
-    if forms <= {"member", "this"}:
-        # A function in a `.c` file is never a method. One in C++ — or in a
+    if forms <= {"member", "this"} and not source_in_c:
+        # C has no methods: a member call there goes through a pointer field,
+        # and nothing ranks one function above another. A function in a `.c` file is never a method. One in C++ — or in a
         # header, which is C or C++ — may be: an inline method in a class
         # body the parser could not follow is stored as one.
         preferred = [t for t in targets
@@ -787,6 +805,9 @@ def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
         # A template may be a free function template; only a method is out.
         preferred = [t for t in targets
                      if t["kind"] != "method" or _is_constructor(t, name)]
+        if forms == {"global"}:
+            # `::name` is the global one, not a namespace's.
+            preferred = [t for t in preferred if "::" not in qualified(t)] or preferred
     return (preferred or targets), None
 
 
@@ -1745,14 +1766,26 @@ class Indexer:
             c_family = row["language"] in ("c", "cpp")
             source_scope = None
             if c_family:
-                referenced_names -= _declared_names(content, source_name, row["kind"])
-                qualified = row["qualified_name"] or ""
-                # A constructor defined in its class is stored as a function,
-                # `C::C`; its scope is still its class.
-                if row["kind"] in ("method", "template", "function") and "::" in qualified:
-                    source_scope = _without_template_args(qualified).rsplit("::", 1)[0]
+                unqualified = _without_template_args(row["qualified_name"] or "")
+                # A class template's body is its own scope. A constructor
+                # defined in its class is stored as a function, `C::C`; its
+                # scope is still its class.
+                if row["kind"] == "template" and _declares_a_class(content):
+                    source_scope = unqualified or None
+                elif row["kind"] in ("method", "template", "function") and "::" in unqualified:
+                    source_scope = unqualified.rsplit("::", 1)[0]
                 forms_of = _reference_forms_all(
                     content, {n for n in referenced_names if "::" not in n})
+                # A parameter or local hides the name written bare only:
+                # `x.name()`, `::name()` and `C::name()` still call.
+                for declared in _declared_names(content, source_name, row["kind"]):
+                    if declared not in referenced_names:
+                        continue
+                    forms, qualifiers = forms_of.get(declared, (set(), set()))
+                    if forms <= {"bare"}:
+                        referenced_names.discard(declared)
+                    else:
+                        forms_of[declared] = (forms - {"bare"}, qualifiers)
             refs_for_this = 0
             for ref_name in referenced_names:
                 if refs_for_this >= MAX_REFS_PER_SYMBOL:
@@ -1763,7 +1796,8 @@ class Indexer:
                 if c_family and targets:
                     forms, qualifiers = forms_of.get(ref_name, (set(), set()))
                     targets, decided = _narrow_by_syntax(
-                        targets, ref_name, forms, qualifiers, source_scope, row["kind"])
+                        targets, ref_name, forms, qualifiers, source_scope, row["kind"],
+                        source_in_c=source_file.endswith(".c"))
                 if not targets:
                     continue
                 if decided:
