@@ -2088,6 +2088,10 @@ class Indexer:
                 forms_of = _reference_forms_all(
                     own_blanked, {n for n in referenced_names if "::" not in n},
                     arities_of, receivers_of)
+                # A name met only inside the definition's own name — the class
+                # in `~C()` — is no reference.
+                referenced_names -= {n for n in referenced_names
+                                     if n.isidentifier() and n not in forms_of}
                 var_types = _declared_types(content, source_name, row["kind"])
                 # A qualified name, `C::f(...)`, is one token to the matcher:
                 # its argument counts are read here.
