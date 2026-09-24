@@ -764,7 +764,11 @@ def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
             return named, "qualified" if len(named) == 1 else None
     preferred = targets
     if forms <= {"member", "this"}:
-        preferred = [t for t in targets if t["kind"] in _MEMBER_KINDS]
+        # A C function is never a method. A C++ one may be: an inline method
+        # in a class body the parser could not follow is stored as one.
+        preferred = [t for t in targets
+                     if t["kind"] in _MEMBER_KINDS
+                     or (t["kind"] == "function" and t.get("language") != "c")]
     elif forms == {"global"} or (
             source_kind == "function" and not source_scope and forms <= {"bare", "global"}):
         preferred = [t for t in targets
@@ -1594,7 +1598,7 @@ class Indexer:
         excluded = _doc_languages()
         placeholders = ",".join("?" * len(excluded))
         rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.qualified_name, s.kind, f.path as file_path
+            f"""SELECT s.id, s.name, s.qualified_name, s.kind, f.path as file_path, f.language
                FROM symbols s JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
@@ -1605,7 +1609,8 @@ class Indexer:
         for row in rows:
             name = row["name"]
             info = {"id": row["id"], "file": row["file_path"].replace("\\", "/"),
-                    "kind": row["kind"], "qualified": row["qualified_name"]}
+                    "kind": row["kind"], "qualified": row["qualified_name"],
+                    "language": row["language"]}
             symbol_info[row["id"]] = info
             if name not in name_to_symbols:
                 name_to_symbols[name] = []

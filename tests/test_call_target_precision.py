@@ -45,7 +45,7 @@ void Vec_c::scaleVec() {
 void Mat_c::scaleVec() {
 }
 """,
-    "free/free.cpp": """\
+    "free/free.c": """\
 void scaleVec() {
 }
 
@@ -427,3 +427,36 @@ void starter() {
     payload = json.loads(server.get_callers("Pool::init"))
     assert "starter" in {e["name"] for e in payload["callers"]}
     assert "Only calls written `Pool::init(...)`" in payload["graph_note"]
+
+
+def test_a_member_call_keeps_a_cpp_function_it_may_be_a_method(tmp_path):
+    """An inline method in a class body the parser lost track of is stored
+    as a free C++ function; a member call may still reach it. A C function
+    never is a method."""
+    edges = _edges({"lost.cpp": """\
+int readSpeed() {
+    return 1;
+}
+""", "legacy.c": """\
+int readSpeed() {
+    return 2;
+}
+""", "car/car.h": """\
+class Car {
+public:
+    int readSpeed();
+};
+""", "use/drive.cpp": """\
+int drive(Car* car) {
+    return car->readSpeed();
+}
+"""}, tmp_path)
+    assert ("drive", "Car::readSpeed") in _pairs(edges)
+    db = Database(tmp_path / "edges" / "index.db")
+    db.open()
+    reached = {r[0] for r in db.conn.execute(
+        """SELECT f.path FROM symbol_edges e JOIN symbols a ON a.id = e.source_id
+           JOIN symbols b ON b.id = e.target_id JOIN files f ON f.id = b.file_id
+           WHERE a.name = 'drive' AND b.name = 'readSpeed'""")}
+    db.close()
+    assert "lost.cpp" in reached and "legacy.c" not in reached
