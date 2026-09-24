@@ -678,6 +678,32 @@ _CPP_KEYWORDS = _C_KEYWORDS | frozenset({
 _RESERVED_NAMES = {"c": _C_KEYWORDS, "cpp": _CPP_KEYWORDS}
 
 
+_AFTER_PARAMS_WORDS = frozenset({
+    "const", "volatile", "override", "final", "noexcept", "throw", "try", "requires",
+    "mutable", "__attribute__",
+})
+
+
+def _macro_typed_declaration(def_node: Node, name: str) -> bool:
+    """Whether a "function" is a variable declared with a macro as its type:
+    no return type before the name, and after the parentheses another name
+    closed by `;`, `=`, `,` or `[` — `MACRO(f32, s16) mField;`."""
+    if def_node.child_by_field_name("type") is not None:
+        return False
+    text = def_node.text.decode("utf-8", errors="replace")
+    m = re.match(
+        rf"\s*(?:(?:static|extern|inline|const|volatile)\s+)*{re.escape(name)}\s*\(",
+        text)
+    if m is None:
+        return False
+    depth, i = 1, m.end()
+    while i < len(text) and depth:
+        depth += {"(": 1, ")": -1}.get(text[i], 0)
+        i += 1
+    after = re.match(r"\s*([A-Za-z_]\w*)\s*[;=,\[]", text[i:])
+    return after is not None and after.group(1) not in _AFTER_PARAMS_WORDS
+
+
 def _function_inside_a_function(node: Node, kind: str) -> bool:
     """Whether a definition is a function read inside another function's
     body, where C and C++ allow none: error recovery's work.
@@ -1200,6 +1226,12 @@ class Indexer:
             if kind != "macro" and symbol_name in _RESERVED_NAMES.get(lang, ()) and (
                     symbol_name in _C_KEYWORDS
                     or _function_inside_a_function(def_node, kind)):
+                continue
+
+            # `MACRO_TYPE(f32, s16) mField;` declares a variable whose type a
+            # macro spells; the parser reads the macro as a function.
+            if (lang in ("c", "cpp") and kind in ("function", "prototype")
+                    and symbol_name and _macro_typed_declaration(def_node, symbol_name)):
                 continue
 
             if lang == "lua" and _lua_nameless_definition(def_node):

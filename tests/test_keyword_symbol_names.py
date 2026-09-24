@@ -153,3 +153,23 @@ def test_real_c_names_that_cpp_reserves_survive(tmp_path, db, text, expected):
     may name things `new`, `delete` or `class`. Only a function read inside
     another function's body is error recovery's work."""
     assert _names(tmp_path, db, "pool.h", text) == expected
+
+
+def test_a_variable_typed_by_a_macro_is_no_function(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "cfg.h").write_text("#define PICK_TYPE(a, b) a\n")
+    (root / "menu.h").write_text(
+        "#include \"cfg.h\"\nclass Menu_c {\npublic:\n    PICK_TYPE(float, short) mScale;\n};\n")
+    (root / "rain.cpp").write_text(
+        "#include \"cfg.h\"\nstatic PICK_TYPE(float, short) s_spin = 0;\n"
+        "int realOne(int v) {\n    return v;\n}\n")
+    db = Database(root / "index.db")
+    db.open()
+    db.initialize()
+    Indexer(db, IndexConfig(root=root)).index()
+    kinds = {(r[0], r[1]) for r in db.conn.execute("SELECT name, kind FROM symbols")}
+    db.close()
+    assert ("PICK_TYPE", "macro") in kinds
+    assert not any(n == "PICK_TYPE" and k != "macro" for n, k in kinds)
+    assert ("realOne", "function") in kinds
