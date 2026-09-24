@@ -262,9 +262,30 @@ _CPP_QUERY = """
         (function_declarator
             declarator: (operator_name) @refopproto.name))) @refopproto.def
 
-; A conversion operator, `operator bool() const`, is named by an operator_cast.
+; A conversion operator, `operator bool() const`, is named by an operator_cast:
+; defined in its class, declared there (a plain declaration), or defined
+; outside it under a qualified name.
 (function_definition
     declarator: (operator_cast) @conv.name) @conv.def
+
+(declaration
+    declarator: (operator_cast) @convdecl.name) @convdecl.def
+
+(function_definition
+    declarator: (qualified_identifier
+        name: (operator_cast)) @qconv.name) @qconv.def
+
+; `T** operator&()`, and a free operator declared returning a pointer.
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (operator_name) @ptrop2.name)))) @ptrop2.def
+
+(declaration
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (operator_name) @ptropproto.name))) @ptropproto.def
 
 ; A reference to a pointer, `T*& f()`: the pointer wraps the reference.
 (function_definition

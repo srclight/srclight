@@ -182,3 +182,41 @@ def test_calls_reach_an_inline_method_and_a_reference_returning_function(symbols
     )}
 
     assert {"plainInline", "freeReference"} <= callees
+
+
+CONVERSIONS_CPP = """\
+class Box_c {
+public:
+    operator const char*() const;
+    operator int&() { return mValue; }
+#ifdef BOX_EXTRA
+    Box_c& operator+=(int step) { return *this; }
+    Box_c** operator&() { return &mSelf; }
+#endif
+};
+Box_c::operator bool() const { return mValue != 0; }
+Node_c* operator+(Node_c* node, int step);
+"""
+
+
+@pytest.fixture
+def conversion_symbols(tmp_path, db):
+    root = tmp_path / "conv"
+    root.mkdir()
+    (root / "box.cpp").write_text(CONVERSIONS_CPP)
+    Indexer(db, IndexConfig(root=root)).index()
+    return {(r["name"], r["kind"], r["start_line"]) for r in db.conn.execute(
+        "SELECT name, kind, start_line FROM symbols"
+    )}
+
+
+@pytest.mark.parametrize("expected", [
+    ("operator const char*", "method", 3),   # declared in the class, pointer kept
+    ("operator int&", "method", 4),          # reference kept in the name
+    ("operator+=", "method", 6),             # a method inside an #ifdef in the class
+    ("operator&", "method", 7),              # returning a pointer to a pointer
+    ("Box_c::operator bool", "method", 10),  # defined outside its class
+    ("operator+", "prototype", 11),          # free operator declared, returning a pointer
+])
+def test_conversion_operators_and_members_under_conditionals(conversion_symbols, expected):
+    assert expected in conversion_symbols

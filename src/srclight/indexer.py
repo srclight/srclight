@@ -700,6 +700,10 @@ def _kind_from_capture(capture_name: str) -> str:
         "opproto": "prototype",
         "refopproto": "prototype",
         "conv": "method",
+        "convdecl": "method",
+        "qconv": "method",
+        "ptrop2": "function",
+        "ptropproto": "prototype",
         "ptrreffn": "function",
         "ptrrefinline": "method",
         "ptrrefmethod": "method",
@@ -803,11 +807,22 @@ _DECLARATOR_NAME_TYPES = frozenset({
 
 
 def _operator_cast_name(node: Node) -> str:
-    """`operator bool() const` -> "operator bool"."""
-    target = node.child_by_field_name("type")
-    if target is not None:
-        return "operator " + target.text.decode("utf-8", errors="replace")
+    """`operator const char*() const` -> "operator const char*".
+
+    The name is everything before the parameter list: the target type alone
+    drops its pointer, reference and const, and two conversions of one class
+    — to `char` and to `const char*` — then shared one name. A qualified
+    definition keeps its scope: `Box::operator bool`.
+    """
     return " ".join(node.text.decode("utf-8", errors="replace").split("(")[0].split())
+
+
+def _names_a_conversion(node: Node) -> bool:
+    """Whether a name node is a conversion operator, qualified or not."""
+    return node.type == "operator_cast" or (
+        node.type == "qualified_identifier"
+        and any(child.type == "operator_cast" for child in node.children)
+    )
 
 
 def _declarator_name(node: Node | None) -> str | None:
@@ -818,10 +833,10 @@ def _declarator_name(node: Node | None) -> str | None:
     so the walk falls back on its first named declarator child.
     """
     while node is not None:
+        if _names_a_conversion(node):
+            return _operator_cast_name(node)
         if node.type in _DECLARATOR_NAME_TYPES:
             return node.text.decode("utf-8", errors="replace")
-        if node.type == "operator_cast":
-            return _operator_cast_name(node)
         inner = node.child_by_field_name("declarator")
         if inner is None:
             inner = next((child for child in node.named_children
@@ -833,10 +848,12 @@ def _declarator_name(node: Node | None) -> str | None:
 
 
 def _in_class_body(node: Node) -> bool:
-    """Whether a C++ definition sits in a class body, a template one included:
-    a method, whatever pattern matched it."""
+    """Whether a C++ definition sits in a class body — through a template, or
+    through the #if blocks a class body may hold — and so is a method,
+    whatever pattern matched it."""
     parent = node.parent
-    if parent is not None and parent.type == "template_declaration":
+    while parent is not None and (parent.type == "template_declaration"
+                                  or parent.type.startswith("preproc_")):
         parent = parent.parent
     return parent is not None and parent.type == "field_declaration_list"
 
@@ -1195,7 +1212,7 @@ class Indexer:
                     def_node = nodes[0]
                     kind = _kind_from_capture(capture_name)
                 elif capture_name.endswith(".name") and nodes:
-                    if nodes[0].type == "operator_cast":
+                    if _names_a_conversion(nodes[0]):
                         symbol_name = _operator_cast_name(nodes[0])
                     else:
                         symbol_name = nodes[0].text.decode("utf-8", errors="replace")
