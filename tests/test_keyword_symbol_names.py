@@ -71,6 +71,31 @@ int Scene_c::drawScene() {
 """) == ["Scene_c::drawScene"]
 
 
+def test_a_macro_may_redefine_a_keyword(tmp_path, db):
+    """`#define inline __inline` is legal and common in compatibility
+    headers: the macro is a real definition."""
+    assert _names(tmp_path, db, "compat.c", """\
+#define inline __inline
+#define restrict __restrict
+
+static inline int clampLevel(int level) {
+    return level < 0 ? 0 : level;
+}
+""") == ["inline", "restrict", "clampLevel"]
+
+
+def test_a_c_header_read_as_cpp_keeps_its_c_names(tmp_path, db):
+    """A `.h` file is read as C++ as soon as `::` shows up near its top, even
+    in a comment. Its definitions named `new` or `delete` still parse
+    cleanly at file scope, where error recovery has no part: they are real."""
+    assert _names(tmp_path, db, "pool.h", """\
+/* see Pool::grab */
+void *new(int size) { return allocBlock(size); }
+void delete(void *block) { freeBlock(block); }
+struct class { int size; };
+""") == ["new", "delete", "class"]
+
+
 def test_a_cpp_keyword_is_an_ordinary_name_in_c(tmp_path, db):
     """`new` and `delete` are reserved in C++ only."""
     assert _names(tmp_path, db, "pool.c", """\

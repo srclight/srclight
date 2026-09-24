@@ -678,6 +678,25 @@ _CPP_KEYWORDS = _C_KEYWORDS | frozenset({
 _RESERVED_NAMES = {"c": _C_KEYWORDS, "cpp": _CPP_KEYWORDS}
 
 
+def _only_error_recovery_puts_it_here(node: Node) -> bool:
+    """Whether a definition sits where only error recovery could have made
+    one: its own node holds an error, or it lies inside a function body,
+    where C and C++ allow no function definition.
+
+    A keyword-named definition at file scope that parses cleanly is real —
+    `new` or `delete` in a C header that happens to be read as C++ — and is
+    kept whatever the detected language says.
+    """
+    if node.has_error:
+        return True
+    parent = node.parent
+    while parent is not None:
+        if parent.type == "compound_statement":
+            return True
+        parent = parent.parent
+    return False
+
+
 def _kind_from_capture(capture_name: str) -> str:
     """Map tree-sitter capture names to symbol kinds."""
     prefix = capture_name.split(".")[0]
@@ -1171,8 +1190,11 @@ class Indexer:
             if symbol_name == "" or (symbol_name or "").endswith((".", ":")):
                 continue
 
-            # A keyword is never a name — only error recovery makes it one.
-            if symbol_name in _RESERVED_NAMES.get(lang, ()):
+            # A keyword-named definition is error recovery's work — a statement
+            # read as a definition. A macro may legally redefine a keyword,
+            # and a clean one at file scope is real (a C header read as C++).
+            if (symbol_name in _RESERVED_NAMES.get(lang, ()) and kind != "macro"
+                    and _only_error_recovery_puts_it_here(def_node)):
                 continue
 
             if lang == "lua" and _lua_nameless_definition(def_node):
