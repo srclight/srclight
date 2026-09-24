@@ -685,6 +685,56 @@ def _parameter_names(content: str, name: str, kind: str) -> set[str]:
     return found
 
 
+def _type_of_declaration(text: str, declared: str) -> str | None:
+    """The class a declaration `const ns::Type<int>* name` gives `name`."""
+    text = text.split("=", 1)[0]
+    while True:
+        stripped = re.sub(r"<[^<>]*>", " ", text)
+        if stripped == text:
+            break
+        text = stripped
+    text = re.sub(r"[A-Za-z_]\w*\s*::\s*", "", text)
+    words = re.findall(r"[A-Za-z_]\w*", text)
+    if len(words) < 2 or words[-1] != declared:
+        return None
+    kind = words[-2]
+    return None if kind in _TYPE_WORDS else kind
+
+
+def _declared_types(content: str, name: str, kind: str) -> dict[str, str]:
+    """The class each variable a C/C++ symbol declares is of — its
+    parameters and its locals — where the declaration writes it."""
+    types: dict[str, str] = {}
+    if kind not in ("class", "struct", "union", "enum", "macro"):
+        short = name.rsplit("::", 1)[-1]
+        m = re.search(rf"(?<![\w$]){re.escape(short)}\s*\(", content)
+        if m is not None:
+            depth, i = 1, m.end()
+            while i < len(content) and depth:
+                depth += {"(": 1, ")": -1}.get(content[i], 0)
+                i += 1
+            depth, part = 0, []
+            for ch in content[m.end():i - 1] + ",":
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    depth -= 1
+                if ch == "," and depth == 0:
+                    declared = _parameter_name("".join(part))
+                    if declared:
+                        found = _type_of_declaration("".join(part), declared)
+                        if found:
+                            types[declared] = found
+                    part = []
+                else:
+                    part.append(ch)
+    for m in _LOCAL_DECL_RE.finditer(content):
+        if (m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
+                and m.group(1) not in _TYPE_WORDS and _opens_a_declaration(content, m.start())):
+            types.setdefault(m.group(2), m.group(1))
+    return types
+
+
 def _declared_names(content: str, name: str, kind: str) -> set[str]:
     """Names a C/C++ symbol declares for itself — its parameters, its locals,
     a class's fields. Inside the symbol they name that variable, not the
@@ -704,7 +754,69 @@ _THIS_ARROW_RE = re.compile(r"(?<![\w$])this\s*->$")
 _IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
 
 
-def _reference_forms_all(content: str, names: set[str]) -> dict[str, tuple[set[str], set[str]]]:
+def _call_arity(content: str, paren: int) -> int:
+    """How many arguments the call whose `(` sits at `paren` passes."""
+    depth, commas, i, empty = 0, 0, paren, True
+    while i < len(content):
+        ch = content[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                break
+        elif ch == "," and depth == 1:
+            commas += 1
+        elif depth >= 1 and not ch.isspace():
+            empty = False
+        i += 1
+    return 0 if empty else commas + 1
+
+
+def _param_range(signature: str | None, name: str) -> tuple[int, float] | None:
+    """How many arguments a function's signature accepts, defaults and `...`
+    counted — or None when the signature cannot say."""
+    if not signature:
+        return None
+    m = re.search(rf"(?<![\w$]){re.escape(name)}\s*\(", signature)
+    if m is None:
+        return None
+    depth, i = 1, m.end()
+    while i < len(signature) and depth:
+        depth += {"(": 1, ")": -1}.get(signature[i], 0)
+        i += 1
+    params = signature[m.end():i - 1].strip()
+    if params in ("", "void"):
+        return (0, 0)
+    parts, depth, part = [], 0, []
+    # In a declaration `<` opens template arguments: `map<int, int> m` is one.
+    for ch in params + ",":
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(part).strip())
+            part = []
+        else:
+            part.append(ch)
+    if any("..." in part for part in parts):
+        return (sum(1 for part in parts if "=" not in part and "..." not in part), float("inf"))
+    required = sum(1 for part in parts if "=" not in part)
+    return (required, len(parts))
+
+
+def _accepts(t: dict, name: str, arities: set[int]) -> bool:
+    if t["kind"] not in ("function", "method", "template"):
+        return True
+    accepted = _param_range(t.get("signature"), name)
+    return accepted is None or any(accepted[0] <= a <= accepted[1] for a in arities)
+
+
+def _reference_forms_all(content: str, names: set[str],
+                         arities: dict[str, set] | None = None,
+                         receivers: dict[str, set] | None = None,
+                         ) -> dict[str, tuple[set[str], set[str]]]:
     """For each of `names`, how a C/C++ symbol's text refers to it: `member`
     (`x.name(`, `p->name(`), `this` (`this->name(`), `qualified` (`X::name`,
     with each `X`), `global` (`::name`) or `bare` — or as no function at all:
@@ -717,7 +829,14 @@ def _reference_forms_all(content: str, names: set[str]) -> dict[str, tuple[set[s
             continue
         forms, qualifiers = found.setdefault(name, (set(), set()))
         before = content[max(0, m.start() - 200):m.start()].rstrip()
-        after = content[m.end():m.end() + 200].lstrip()[:3]
+        ahead = content[m.end():m.end() + 200]
+        after = ahead.lstrip()[:3]
+        if arities is not None:
+            # The argument count of each call; None where the name is not
+            # called there (a function pointer, a declaration).
+            arities.setdefault(name, set()).add(
+                _call_arity(content, m.end() + len(ahead) - len(ahead.lstrip()))
+                if after.startswith("(") else None)
         member_access = before.endswith(("->", ".")) and not before.endswith("..")
         # `(*o->fn)(1)` and `CALL(o->fn)` call what the parenthesis closes on.
         if member_access and not after.startswith(("(", "<", ")")):
@@ -728,6 +847,15 @@ def _reference_forms_all(content: str, names: set[str]) -> dict[str, tuple[set[s
             forms.add("this")
         elif member_access:
             forms.add("member")
+            if receivers is not None:
+                # The variable the member is called on, when it is one:
+                # `lamp->f()`, not `a.b->f()` nor `get()->f()`.
+                lead = before[:-2] if before.endswith("->") else before[:-1]
+                lead = lead.rstrip()
+                var = re.search(r"([A-Za-z_]\w*)$", lead)
+                simple = var is not None and not lead[:var.start()].rstrip().endswith(
+                    (".", "->", "::", ")", "]"))
+                receivers.setdefault(name, set()).add(var.group(1) if simple else None)
         elif before.endswith("::"):
             q = _QUALIFIER_RE.search(before)
             if q is None or q.group(1) in _NOT_A_TYPE:  # `return ::name()`
@@ -763,6 +891,8 @@ def _is_constructor(t: dict, name: str) -> bool:
 def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
                       qualifiers: set[str], source_scope: str | None,
                       source_kind: str, source_in_c: bool = False,
+                      arities: set | None = None,
+                      receiver_types: set | None = None,
                       ) -> tuple[list[dict], str | None]:
     """Keep the C/C++ targets the way a name is written can reach.
 
@@ -784,6 +914,21 @@ def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
 
     def qualified(t: dict) -> str:
         return t.get("qualified") or name
+
+    # A call passing two arguments reaches no `f(int)`. Only when every use
+    # is a call: a function pointer names every overload.
+    if arities and None not in arities:
+        fitting = [t for t in targets if _accepts(t, name, arities)]
+        if fitting:
+            targets = fitting
+
+    # `lamp->f()` with `Lamp_c* lamp` declared in the symbol reaches `Lamp_c::f`.
+    if forms == {"member"} and receiver_types and None not in receiver_types:
+        typed = [t for t in targets if t["kind"] in _MEMBER_KINDS and any(
+            _without_template_args(qualified(t)).endswith(f"{c}::{name}")
+            for c in receiver_types)]
+        if typed:
+            return typed, "typed"
 
     def is_named(t: dict, full: str) -> bool:
         q = qualified(t)
@@ -821,7 +966,15 @@ def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
         if forms == {"global"}:
             # `::name` is the global one, not a namespace's.
             preferred = [t for t in preferred if "::" not in qualified(t)] or preferred
-    return (preferred or targets), None
+    pool = preferred or targets
+    if forms == {"member"}:
+        # `x.f()` with the type of `x` unknown: when several classes have an
+        # `f`, neither the file nor the directory says which one.
+        classes = {qualified(t).rsplit("::", 1)[0] for t in pool
+                   if t["kind"] in _MEMBER_KINDS and "::" in qualified(t)}
+        if len(classes) > 1:
+            return pool, "name_only"
+    return pool, None
 
 
 # Only create edges TO meaningful symbol kinds (not prototypes/namespaces)
@@ -1646,7 +1799,7 @@ class Indexer:
         excluded = _doc_languages()
         placeholders = ",".join("?" * len(excluded))
         rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.qualified_name, s.kind, f.path as file_path
+            f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.signature, f.path as file_path
                FROM symbols s JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
@@ -1657,7 +1810,8 @@ class Indexer:
         for row in rows:
             name = row["name"]
             info = {"id": row["id"], "file": row["file_path"].replace("\\", "/"),
-                    "kind": row["kind"], "qualified": row["qualified_name"]}
+                    "kind": row["kind"], "qualified": row["qualified_name"],
+                    "signature": row["signature"]}
             symbol_info[row["id"]] = info
             if name not in name_to_symbols:
                 name_to_symbols[name] = []
@@ -1806,8 +1960,12 @@ class Indexer:
                     rf"(?<![\w:]){re.escape(source_name)}(?![\w])",
                     " " * len(source_name), content, count=1)
                     if "::" in source_name else content)
+                arities_of: dict[str, set] = {}
+                receivers_of: dict[str, set] = {}
                 forms_of = _reference_forms_all(
-                    own_blanked, {n for n in referenced_names if "::" not in n})
+                    own_blanked, {n for n in referenced_names if "::" not in n},
+                    arities_of, receivers_of)
+                var_types = _declared_types(content, source_name, row["kind"])
                 # A parameter or local hides the name written bare only:
                 # `x.name()`, `::name()` and `C::name()` still call.
                 for declared in _declared_names(content, source_name, row["kind"]):
@@ -1829,7 +1987,10 @@ class Indexer:
                     forms, qualifiers = forms_of.get(ref_name, (set(), set()))
                     targets, decided = _narrow_by_syntax(
                         targets, ref_name, forms, qualifiers, source_scope, row["kind"],
-                        source_in_c=source_file.endswith(".c"))
+                        source_in_c=source_file.endswith(".c"),
+                        arities=arities_of.get(ref_name),
+                        receiver_types={var_types.get(v) for v in receivers_of.get(ref_name, ())}
+                        or None)
                 if not targets:
                     continue
                 if decided:

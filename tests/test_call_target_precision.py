@@ -447,7 +447,7 @@ public:
     int readSpeed();
 };
 """, "use/drive.cpp": """\
-int drive(Car* car) {
+int drive(void* car) {
     return car->readSpeed();
 }
 """}, tmp_path)
@@ -501,7 +501,7 @@ int fetchSlot(int i) {
 """, "cls/hub_c.h": """\
 class Hub_c { public: int fetchSlot(int i); };
 """, "use/use.cpp": """\
-int peek(Hub_c* hub) {
+int peek(void* hub) {
     return hub->fetchSlot(1);
 }
 """}, tmp_path)
@@ -768,3 +768,87 @@ void resetFar(void* lamp) {
     server = serve(files)
     assert "graph_note" not in json.loads(server.get_callees("setupFar"))
     assert "`blinkLamp`" in json.loads(server.get_callees("resetFar"))["graph_note"]
+
+
+def test_a_member_call_is_not_decided_by_the_file_among_classes(tmp_path):
+    """`info.readSlot()` in a header that also defines `Play_c::readSlot`:
+    the file says nothing of the type of `info`."""
+    edges = _edges({"save/save.h": """\
+class Info_c {
+public:
+    int readSlot();
+};
+
+class Save_c {
+public:
+    int readSlot();
+};
+""", "game.h": """\
+class Play_c {
+public:
+    int readSlot(int idx);
+    int readHost();
+};
+
+struct Game_c { Info_c info; Play_c play; };
+extern Game_c g_game;
+
+inline int getInfoSlot() {
+    return g_game.info.readSlot();
+}
+
+inline int getPlaySlot() {
+    return g_game.play.readSlot(0);
+}
+"""}, tmp_path)
+    info = {(b, r) for a, b, r in edges if a == "getInfoSlot"}
+    assert ("Play_c::readSlot", "same_file") not in info
+    assert all(r == "name_only" for b, r in info if b.endswith("readSlot"))
+    play = {(b, r) for a, b, r in edges if a == "getPlaySlot"}
+    assert ("Play_c::readSlot", "same_file") in play
+    assert not any(b.startswith(("Info_c", "Save_c")) for b, _ in play)
+
+
+def test_call_arity_and_parameter_range():
+    from srclight.indexer import _call_arity, _param_range
+
+    text = "f(); g(a, h(b, c), {1, 2}); k( );"
+    assert _call_arity(text, text.index("(")) == 0
+    assert _call_arity(text, text.index("g(") + 1) == 3
+    assert _call_arity(text, text.index("k(") + 1) == 0
+    assert _param_range("int f(int a, int b = 2)", "f") == (1, 2)
+    assert _param_range("void f(void)", "f") == (0, 0)
+    assert _param_range("void f(std::map<int, int> m)", "f") == (1, 1)
+    assert _param_range("int f(const char* fmt, ...)", "f") == (1, float("inf"))
+
+
+def test_a_member_call_on_a_typed_variable_reaches_that_class(tmp_path):
+    edges = _edges({"a/info.h": """\
+class Info_c {
+public:
+    int readSlot();
+};
+""", "b/save.h": """\
+class Save_c {
+public:
+    int readSlot();
+};
+""", "use/use.cpp": """\
+int fromParam(Info_c* info) {
+    return info->readSlot();
+}
+
+int fromLocal() {
+    Save_c save;
+    return save.readSlot();
+}
+
+int fromChain(Holder* h) {
+    return h->info.readSlot();
+}
+"""}, tmp_path)
+    assert {(b, r) for a, b, r in edges if a == "fromParam" and "readSlot" in b} == {
+        ("Info_c::readSlot", "typed")}
+    assert {(b, r) for a, b, r in edges if a == "fromLocal" and "readSlot" in b} == {
+        ("Save_c::readSlot", "typed")}
+    assert {r for a, b, r in edges if a == "fromChain" and "readSlot" in b} == {"name_only"}
