@@ -659,6 +659,30 @@ class Database:
             return None
         return self._row_to_symbol(row)
 
+    def get_graph_symbols(self, name: str) -> list[SymbolRecord]:
+        """The symbols whose graph edges answer for `name`.
+
+        A C++ method declared in its class and defined outside it is two
+        symbols: the declaration, named `f` with qualified name `C::f`, and
+        the definition, named `C::f`. Calls written `obj->f()` land on the
+        declaration; the body scanned for callees is the definition's. So a
+        qualified name stands for every symbol it names — by name or by
+        qualified name — and their edges together are the method's. A bare
+        name resolves as get_symbol_by_name does.
+        """
+        assert self.conn is not None
+        if "::" not in name:
+            sym = self.get_symbol_by_name(name)
+            return [sym] if sym is not None else []
+        rows = self.conn.execute(
+            """SELECT s.*, f.path as file_path FROM symbols s
+               JOIN files f ON s.file_id = f.id
+               WHERE s.name = ? OR s.qualified_name = ?
+               ORDER BY s.id""",
+            (name, name),
+        ).fetchall()
+        return [self._row_to_symbol(r) for r in rows]
+
     def get_symbols_by_name(self, name: str, limit: int = 20) -> list[SymbolRecord]:
         """Get all symbols matching exact name, with LIKE fallback."""
         assert self.conn is not None

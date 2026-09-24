@@ -910,11 +910,11 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        syms = db.get_graph_symbols(symbol_name)
+        if not syms:
             db.close()
             return _symbol_not_found_error(symbol_name, project)
-        callers = db.get_callers(sym.id)
+        callers = [edge for sym in syms for edge in db.get_callers(sym.id)]
         result = _dedup_edges(callers)
         db.close()
         return json.dumps({
@@ -925,11 +925,13 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
         }, indent=2)
 
     db = _get_db()
-    sym = db.get_symbol_by_name(symbol_name)
-    if sym is None:
+    # A qualified method name stands for its declaration and its definition:
+    # calls land on the one, the scanned body is the other's.
+    syms = db.get_graph_symbols(symbol_name)
+    if not syms:
         return _symbol_not_found_error(symbol_name)
 
-    callers = db.get_callers(sym.id)
+    callers = [edge for sym in syms for edge in db.get_callers(sym.id)]
     result = _dedup_edges(callers)
 
     payload = {"symbol": symbol_name, "caller_count": len(result), "callers": result}
@@ -963,11 +965,11 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        syms = db.get_graph_symbols(symbol_name)
+        if not syms:
             db.close()
             return _symbol_not_found_error(symbol_name, project)
-        callees = db.get_callees(sym.id)
+        callees = [edge for sym in syms for edge in db.get_callees(sym.id)]
         result = _dedup_edges(callees)
         db.close()
         return json.dumps({
@@ -978,11 +980,11 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
         }, indent=2)
 
     db = _get_db()
-    sym = db.get_symbol_by_name(symbol_name)
-    if sym is None:
+    syms = db.get_graph_symbols(symbol_name)
+    if not syms:
         return _symbol_not_found_error(symbol_name)
 
-    callees = db.get_callees(sym.id)
+    callees = [edge for sym in syms for edge in db.get_callees(sym.id)]
     result = _dedup_edges(callees)
 
     payload = {"symbol": symbol_name, "callee_count": len(result), "callees": result}
