@@ -715,6 +715,14 @@ def _raw_string_prefix(source: bytes, quote: int) -> bool:
     return not (chr(before).isalnum() or before == 0x5F)
 
 
+def _ends_with_backslash(source: bytes, newline: int) -> bool:
+    """Whether the line ending at `newline` ends in a backslash, CRLF too."""
+    j = newline - 1
+    if j >= 0 and source[j] == 0x0D:
+        j -= 1
+    return j >= 0 and source[j] == 0x5C
+
+
 def _c_comment_bytes(source: bytes) -> bytearray:
     """Mark the bytes of C/C++ comments with 1, everything else with 0.
 
@@ -736,23 +744,23 @@ def _c_comment_bytes(source: bytes) -> bytearray:
                 end = n if end == -1 else end + 2
             else:
                 end = source.find(b"\n", i + 2)
-                while end != -1 and source[:end].rstrip(b"\r").endswith(b"\\"):
+                while end != -1 and _ends_with_backslash(source, end):
                     end = source.find(b"\n", end + 1)
                 end = n if end == -1 else end
             marks[i:end] = b"\x01" * (end - i)
             i = end
-        elif c == 0x22 and _raw_string_prefix(source, i):  # R"delim( ... )delim"
-            opening = _RAW_DELIMITER_RE.match(source, i + 1)
-            if opening is None:
-                i += 1
-                continue
+        elif c == 0x22 and _raw_string_prefix(source, i) and (
+                opening := _RAW_DELIMITER_RE.match(source, i + 1)):  # R"delim( ... )delim"
             closing = b")" + opening.group(1) + b'"'
             end = source.find(closing, opening.end())
             i = n if end == -1 else end + len(closing)
         elif c == 0x22:  # "
             i += 1
             while i < n and source[i] not in (0x22, 0x0A):
-                i += 2 if source[i] == 0x5C else 1
+                if source[i] == 0x5C:  # an escape; before a CRLF it splices both bytes
+                    i += 3 if source[i + 1:i + 3] == b"\r\n" else 2
+                else:
+                    i += 1
             i += 1
         elif c == 0x27:  # '
             literal = _CHAR_LITERAL_RE.match(source, i)
@@ -808,6 +816,29 @@ def _first_branch_only(source: bytes) -> bytes:
         continued = bool(continued or directive) and body.endswith(b"\\")
         pos = end
     return bytes(out)
+
+
+_CALLABLE_KINDS_CPP = frozenset({"function", "method"})
+
+# Where a C/C++ definition sits at top level: file scope, a namespace or an
+# `extern "C"` block.
+_TOP_LEVEL_PARENTS = frozenset({"translation_unit", "declaration_list"})
+
+
+def _at_top_level(node: Node) -> bool:
+    parent = node.parent
+    if parent is not None and parent.type == "template_declaration":
+        parent = parent.parent
+    return parent is not None and parent.type in _TOP_LEVEL_PARENTS
+
+
+def _closes_for_real(node: Node) -> bool:
+    """Whether a definition ends on a closing token that is in the source,
+    rather than one tree-sitter made up because the braces never closed."""
+    last = node
+    while last.child_count:
+        last = last.children[-1]
+    return not last.is_missing
 
 
 def _extent_is_sound(node: Node) -> bool:
@@ -1366,7 +1397,11 @@ class Indexer:
                          if _extent_is_sound(sym[0])]
             by_start = {(k, n, node.start_byte): i for i, (node, k, n) in enumerate(recovered)}
             by_end = {(k, n, node.end_byte): i for i, (node, k, n) in enumerate(recovered)}
-            recovered_starts = sorted(node.start_byte for node, _kind, _name in recovered)
+            # Proof that an original ran on over something: a function the reparse
+            # reads at top level. A struct, an enum or a macro local to a function
+            # sits in its tail in both parses and proves nothing.
+            recovered_starts = sorted(node.start_byte for node, kind, _name in recovered
+                                      if kind in _CALLABLE_KINDS_CPP and _at_top_level(node))
             used: set[int] = set()
             merged = []
             for sym in raw_symbols:
@@ -1381,17 +1416,19 @@ class Indexer:
                         # which is not always the live one (`#if 0`), and
                         # can close one brace more than the real code. So it
                         # may extend a definition the original parse cut
-                        # short, but it shortens one only when the part it
-                        # drops holds another definition the reparse reads
-                        # on its own — the original ran on over it. A tail of
-                        # mere statements means the reparse ended too early.
+                        # short, but it shortens one only when the original
+                        # demonstrably ran on: it never closed (tree-sitter
+                        # made its closing brace up), or the part the reparse
+                        # drops holds another function. A tail of mere
+                        # statements after a real closing brace means the
+                        # reparse ended too early.
                         if (twin.start_byte, twin.end_byte) != (node.start_byte, node.end_byte):
                             grows = (twin.start_byte <= node.start_byte
                                      and twin.end_byte >= node.end_byte)
                             first = bisect.bisect_left(recovered_starts, twin.end_byte)
                             swallowed = (first < len(recovered_starts)
                                          and recovered_starts[first] < node.end_byte)
-                            if grows or swallowed:
+                            if grows or swallowed or not _closes_for_real(node):
                                 sym = recovered[i]
                                 recovered_nodes.add(id(twin))
                         break

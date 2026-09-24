@@ -626,3 +626,81 @@ void Gauge_c::refreshGauge() {
         ("Gauge_c::checkFlags", 1, 11),
         ("Gauge_c::refreshGauge", 13, 14),
     ]
+
+
+def test_a_local_type_in_the_dropped_tail_is_not_a_swallowed_definition(tmp_path, db):
+    """A shorter extent from the reparse is accepted only when the tail it
+    drops holds a definition the original ran on over. A struct, an enum or a
+    macro local to the function is part of it in both parses: no proof."""
+    _index(tmp_path, db, {"walk.cpp": """\
+void walkItems(int mode) {
+#if 0
+    if (mode) {
+        legacyWalk();
+    }
+#else
+    if (mode > 1) {
+#endif
+        fastWalk();
+    }
+    struct WalkPair_s { int key; } pairValue;
+#define WALK_LIMIT 8
+    finishWalk(pairValue.key);
+}
+
+void finishWalk(int key) {
+}
+"""})
+
+    assert ("walkItems", 1, 14) in _symbols(db, "walk.cpp")
+
+
+def test_a_function_run_on_over_globals_is_cut_back(tmp_path, db):
+    """An initializer chosen by #if right after `=` breaks the original parse:
+    it never sees the function close, runs on over the tables after it, and
+    ends on a closing brace tree-sitter had to make up. The reparse reads the
+    function cleanly, and its shorter extent is the right one even though what
+    it drops holds no other function — only globals."""
+    _index(tmp_path, db, {"shop.cpp": """static int createShop(Actor_c* actor) {
+    prepareShop(actor);
+
+    u32 priceTable[] =
+#if PLATFORM_ALPHA
+    {
+        1,
+        2,
+    };
+#else
+    {
+        3,
+        4,
+    };
+#endif
+
+    if (!openShop(actor, priceTable[0])) {
+        return 0;
+    }
+    return 1;
+}
+
+static Method_c l_shopMethod = {
+    1, 2,
+};
+
+PROFILE_TAIL;
+"""})
+
+    assert ("createShop", 1, 21) in _symbols(db, "shop.cpp")
+
+
+def test_a_string_continued_across_a_crlf_line_stays_a_string():
+    """An escaped line break inside a string splices the next line in. With
+    CRLF endings the escape used to swallow the CR alone, end the string on
+    the LF, and read what followed the next quote as a new string."""
+    from srclight.indexer import _c_comment_bytes
+
+    source = b'puts("ab\\\r\ncd"); /* note\r\n#else\r\n */\r\nlive();\r\n'
+    marks = _c_comment_bytes(source)
+    comment = source.index(b"/*")
+    assert all(marks[comment:source.index(b"*/") + 2])
+    assert not any(marks[source.index(b"live"):])
