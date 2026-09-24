@@ -34,3 +34,17 @@ def test_a_derived_struct_far_below_the_head_makes_a_header_cpp(tmp_path):
 def test_a_plain_c_header_stays_c(tmp_path):
     text = C_PREAMBLE + "struct point { int x; int y; };\n/* a class of errors */\nint classify(int v);\n"
     assert detect_language(_header(tmp_path, text)) == "c"
+
+
+def test_a_comment_mentioning_cpp_leaves_a_header_c(tmp_path):
+    text = C_PREAMBLE + "/*\nclass Foo;\ntemplate <typename T>\npublic: see above\n*/\n// namespace old {\nint plain(void);\n"
+    assert detect_language(_header(tmp_path, text)) == "c"
+
+
+def test_blank_lines_do_not_slow_detection_down(tmp_path):
+    import time
+
+    path = _header(tmp_path, C_PREAMBLE + "\n" * 50000 + "    \n" * 20000 + "int tail(void);\n")
+    start = time.monotonic()
+    assert detect_language(path) == "c"
+    assert time.monotonic() - start < 1.0

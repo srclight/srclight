@@ -626,9 +626,17 @@ _FILENAME_TO_LANG: dict[str, str] = {
 }
 
 
+_C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+
+
+def _without_c_comments(text: str) -> str:
+    """The text with its comments removed: a comment may mention a class."""
+    return _C_COMMENT_RE.sub(" ", text)
+
+
 # Constructs that only C++ writes, looked for past a header's head.
 _CPP_CONSTRUCT_RE = re.compile(
-    r"^\s*(?:template\s*<"
+    r"^[ \t]*(?:template\s*<"
     r"|(?:class|struct)\s+[A-Za-z_]\w*\s*(?:final\s*)?:\s*(?:public|protected|private|virtual)\b"
     r"|class\s+[A-Za-z_]\w*\s*[{;]"
     r"|namespace\s+[A-Za-z_]\w*\s*\{"
@@ -659,7 +667,7 @@ def detect_language(path: Path) -> str | None:
             # reach its first class far below the head. Read as C, the class
             # and its inline methods vanish, so the rest of the file is looked
             # at too — for constructs no C header writes.
-            if _CPP_CONSTRUCT_RE.search(content):
+            if _CPP_CONSTRUCT_RE.search(_without_c_comments(content)):
                 return "cpp"
         except OSError:
             pass
