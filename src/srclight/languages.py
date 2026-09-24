@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from tree_sitter import Language
@@ -789,6 +790,26 @@ _FILENAME_TO_LANG: dict[str, str] = {
 }
 
 
+_C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+
+
+def _without_c_comments(text: str) -> str:
+    """The text with its comments removed: a comment may mention a class."""
+    return _C_COMMENT_RE.sub(" ", text)
+
+
+# Constructs that only C++ writes, looked for past a header's head.
+_CPP_CONSTRUCT_RE = re.compile(
+    r"^[ \t]*(?:template\s*<"
+    r"|(?:class|struct)\s+[A-Za-z_]\w*\s*(?:final\s*)?:\s*(?:public|protected|private|virtual)\b"
+    r"|class\s+[A-Za-z_]\w*\s*[{;]"
+    r"|namespace\s+[A-Za-z_]\w*\s*\{"
+    r"|(?:public|protected|private)\s*:"
+    r"|extern\s+\"C\+\+\")",
+    re.MULTILINE,
+)
+
+
 def detect_language(path: Path) -> str | None:
     """Detect language from file extension or filename."""
     # Check exact filename first (e.g. CMakeLists.txt)
@@ -802,9 +823,15 @@ def detect_language(path: Path) -> str | None:
     # Heuristic: .h files — check for C++ indicators
     if suffix == ".h" and lang == "c":
         try:
-            content = path.read_text(errors="replace")[:4096]
+            content = path.read_text(errors="replace")
             cpp_indicators = ("class ", "namespace ", "template", "::", "std::")
-            if any(ind in content for ind in cpp_indicators):
+            if any(ind in content[:4096] for ind in cpp_indicators):
+                return "cpp"
+            # A header may open with pages of C-compatible declarations and
+            # reach its first class far below the head. Read as C, the class
+            # and its inline methods vanish, so the rest of the file is looked
+            # at too — for constructs no C header writes.
+            if _CPP_CONSTRUCT_RE.search(_without_c_comments(content)):
                 return "cpp"
         except OSError:
             pass
