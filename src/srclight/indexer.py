@@ -1906,6 +1906,7 @@ class Indexer:
         # defined or declared in its class has no symbol named that way, so it
         # is listed under it; otherwise the text would read as the class
         # `Stack_c` and a separate `get`.
+        member_aliases: set[str] = set()
         for name, syms in name_to_symbols.items():
             for sym in syms:
                 if sym["kind"] not in _EDGE_TARGET_KINDS and not _is_constructor(sym, name):
@@ -1918,6 +1919,7 @@ class Indexer:
                     if len(parts) >= 3 and _is_constructor(sym, name):
                         aliases.append("::".join(parts[-3:-1]))
                     for alias in aliases:
+                        member_aliases.add(alias)
                         listed = filtered_names.setdefault(alias, [])
                         if all(s["id"] != sym["id"] for s in listed):
                             listed.append(sym)
@@ -2026,6 +2028,11 @@ class Indexer:
 
             referenced_names = match_names(content)
             referenced_names.discard(source_name)
+            # `A::B::c()` read as the member `B::c` still names the class `B`.
+            for qualified_ref in [n for n in referenced_names if n in member_aliases]:
+                qualifier = qualified_ref.rsplit("::", 1)[0].rsplit("::", 1)[-1]
+                if qualifier in filtered_names and qualifier != source_name:
+                    referenced_names.add(qualifier)
 
             imported = _imports_for(row["file_path"], row["language"])
             # In C and C++ the way a name is written narrows what it reaches,

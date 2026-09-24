@@ -1048,7 +1048,8 @@ void grow() {
 }
 """}, tmp_path)
     reached = {b for a, b, _ in edges if a == "grow"}
-    assert "Stack_c::scaleBy" in reached and "Stack_c" not in reached
+    # The member is reached; the class it is written with stays a dependency.
+    assert {"Stack_c::scaleBy", "Stack_c"} <= reached
 
 
 def test_symbols_in_file_names_the_class_of_each_member(serve):
