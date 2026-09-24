@@ -169,6 +169,60 @@ _CPP_QUERY = """
 (field_declaration
     declarator: (function_declarator
         declarator: (field_identifier) @field_fn.name)) @field_fn.def
+
+; A method defined inside its class body is named by a field_identifier —
+; neither an identifier (free function) nor a qualified_identifier (method
+; defined outside the class). The same goes for an operator or a destructor
+; defined there.
+(function_definition
+    declarator: (function_declarator
+        declarator: (field_identifier) @inline_method.name)) @inline_method.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (field_identifier) @ptrinline.name))) @ptrinline.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (field_identifier) @ptrinline2.name)))) @ptrinline2.def
+
+(function_definition
+    declarator: (function_declarator
+        declarator: (operator_name) @inline_op.name)) @inline_op.def
+
+(function_definition
+    declarator: (function_declarator
+        declarator: (destructor_name) @inline_dtor.name)) @inline_dtor.def
+
+; A `T&` (or `T&&`) return type wraps the declarator in a reference_declarator,
+; and its child carries no field name, so it is matched positionally.
+(function_definition
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (identifier) @reffn.name))) @reffn.def
+
+(function_definition
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (qualified_identifier) @refmethod.name))) @refmethod.def
+
+(function_definition
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (field_identifier) @refinline.name))) @refinline.def
+
+(declaration
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (identifier) @refproto.name))) @refproto.def
+
+(field_declaration
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (field_identifier) @reffield_fn.name))) @reffield_fn.def
 """
 
 _JS_QUERY = """

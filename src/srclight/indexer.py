@@ -685,6 +685,18 @@ def _kind_from_capture(capture_name: str) -> str:
         "impl": "impl",
         "template": "template",
         "field_fn": "method",  # method declarations in class bodies (headers)
+        # C++ methods defined inside their class body
+        "inline_method": "method",
+        "ptrinline": "method",
+        "ptrinline2": "method",
+        "inline_op": "method",
+        "inline_dtor": "method",
+        # C++ definitions and declarations returning a reference
+        "reffn": "function",
+        "refmethod": "method",
+        "refinline": "method",
+        "refproto": "prototype",
+        "reffield_fn": "method",
         "var": "function",     # arrow functions
         "var2": "function",
         "ctor": "function",    # C# constructors
