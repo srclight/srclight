@@ -588,9 +588,53 @@ _NOT_A_TYPE = frozenset({
     "protected", "operator", "do", "if", "while", "for", "switch", "typedef",
     "alignof", "decltype", "static_assert", "defined",
 })
+# A declaration starts a statement, a parameter or a `for` header — after one
+# of these, or after a word that only qualifies what follows.
+_DECL_OPENERS = frozenset(";{}(,)")
+_DECL_QUALIFIERS = frozenset({
+    "const", "volatile", "static", "extern", "register", "mutable", "constexpr",
+    "inline", "thread_local", "unsigned", "signed", "struct", "class", "union",
+    "enum", "typename",
+})
 _LOCAL_DECL_RE = re.compile(
-    r"(?<![\w.>:])([A-Za-z_]\w*)(?:\s*<[^;{}()<>]*>)?[\s*&]+([A-Za-z_]\w*)\s*(?=[=;,\[]|\{)")
+    r"(?<![\w.>:])([A-Za-z_]\w*)(?:\s*<[^;{}()<>]*>)?[\s*&]+([A-Za-z_]\w*)\s*"
+    r"(?=(?:=(?!=))|[;,\[{])")
+_WORD_BEFORE_RE = re.compile(r"([A-Za-z_]\w*)\s*$")
 _MACRO_PARAMS_RE = re.compile(r"#\s*define\s+\w+\(([^)]*)\)")
+# Words a parameter's type may hold that are no name of its own.
+_TYPE_WORDS = _DECL_QUALIFIERS | {"long", "short", "int", "char", "float", "double", "void",
+                                  "bool", "auto"}
+
+
+def _opens_a_declaration(content: str, at: int) -> bool:
+    before = content[max(0, at - 80):at].rstrip()
+    if not before or before[-1] in _DECL_OPENERS:
+        return True
+    word = _WORD_BEFORE_RE.search(before)
+    return word is not None and word.group(1) in _DECL_QUALIFIERS and _opens_a_declaration(
+        content, word.start() + max(0, at - 80))
+
+
+def _parameter_name(param: str) -> str | None:
+    """The name a parameter declares, or None when it declares none —
+    `Vec_c`, `const Vec_c&`, `struct Node*` name only a type."""
+    param = param.split("=", 1)[0]
+    pointer = re.search(r"\(\s*[*&^]\s*(\w+)\s*\)", param)
+    if pointer:
+        return pointer.group(1)
+    param = re.sub(r"\[[^\]]*\]", "", param)
+    while True:
+        stripped = re.sub(r"<[^<>]*>", " ", param)
+        if stripped == param:
+            break
+        param = stripped
+    param = re.sub(r"[A-Za-z_]\w*\s*::\s*", "", param)  # `ns::Type` is one type
+    words = re.findall(r"[A-Za-z_]\w*", param)
+    if len(words) < 2 or words[-1] in _TYPE_WORDS:
+        return None
+    if all(w in _DECL_QUALIFIERS - {"unsigned", "signed"} for w in words[:-1]):
+        return None  # `const Vec_c`, `struct Node`: a type after its qualifiers
+    return words[-1]
 
 
 def _parameter_names(content: str, name: str, kind: str) -> set[str]:
@@ -598,31 +642,27 @@ def _parameter_names(content: str, name: str, kind: str) -> set[str]:
     from its text: the first parenthesised list after its own name."""
     if kind == "macro":
         m = _MACRO_PARAMS_RE.search(content)
-        params = m.group(1) if m else ""
-    else:
-        short = name.rsplit("::", 1)[-1]
-        m = re.search(rf"(?<![\w$]){re.escape(short)}\s*\(", content)
-        if m is None:
-            return set()
-        depth, i = 1, m.end()
-        while i < len(content) and depth:
-            depth += {"(": 1, ")": -1}.get(content[i], 0)
-            i += 1
-        params = content[m.end():i - 1]
+        return {p.strip() for p in m.group(1).split(",") if p.strip().isidentifier()} if m else set()
+    short = name.rsplit("::", 1)[-1]
+    m = re.search(rf"(?<![\w$]){re.escape(short)}\s*\(", content)
+    if m is None:
+        return set()
+    depth, i = 1, m.end()
+    while i < len(content) and depth:
+        depth += {"(": 1, ")": -1}.get(content[i], 0)
+        i += 1
     found: set[str] = set()
     depth, part = 0, []
-    for ch in params + ",":
-        if ch in "([{<":
+    # `<` and `>` are no brackets here: in a default argument they compare.
+    for ch in content[m.end():i - 1] + ",":
+        if ch in "([{":
             depth += 1
-        elif ch in ")]}>":
+        elif ch in ")]}":
             depth -= 1
         if ch == "," and depth == 0:
-            text = "".join(part).split("=", 1)[0]
-            pointer = re.search(r"\(\s*[*&^]\s*(\w+)\s*\)", text)
-            text = pointer.group(1) if pointer else re.sub(r"\[[^\]]*\]", "", text)
-            ident = re.findall(r"[A-Za-z_]\w*", text)
-            if ident:
-                found.add(ident[-1])
+            declared = _parameter_name("".join(part))
+            if declared:
+                found.add(declared)
             part = []
         else:
             part.append(ch)
@@ -637,39 +677,54 @@ def _declared_names(content: str, name: str, kind: str) -> set[str]:
     names = set() if kind in ("class", "struct", "union", "enum") else _parameter_names(
         content, name, kind)
     for m in _LOCAL_DECL_RE.finditer(content):
-        if m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE:
+        if (m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
+                and _opens_a_declaration(content, m.start())):
             names.add(m.group(2))
     return names
 
 
-_QUALIFIER_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:<[^;{}()]*>)?\s*::\s*$")
+_QUALIFIER_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:<[^;{}]*>)?\s*::\s*$")
+_THIS_ARROW_RE = re.compile(r"(?<![\w$])this\s*->$")
+_IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
 
 
-def _reference_forms(content: str, name: str) -> tuple[set[str], set[str]]:
-    """How a C/C++ symbol's text refers to `name`: `member` (`x.name`,
-    `p->name`), `this` (`this->name`), `qualified` (`X::name`, with each `X`
-    returned) or `bare`."""
-    forms: set[str] = set()
-    qualifiers: set[str] = set()
-    for m in re.finditer(rf"(?<![\w$]){re.escape(name)}(?![\w$])", content):
+def _reference_forms_all(content: str, names: set[str]) -> dict[str, tuple[set[str], set[str]]]:
+    """For each of `names`, how a C/C++ symbol's text refers to it: `member`
+    (`x.name`, `p->name`), `this` (`this->name`), `qualified` (`X::name`, with
+    each `X`), `global` (`::name`) or `bare`. One pass over the text."""
+    found: dict[str, tuple[set[str], set[str]]] = {}
+    for m in _IDENT_RE.finditer(content):
+        name = m.group(0)
+        if name not in names:
+            continue
+        forms, qualifiers = found.setdefault(name, (set(), set()))
         before = content[max(0, m.start() - 200):m.start()].rstrip()
-        if before.endswith("->") and before[:-2].rstrip().endswith("this"):
+        if _THIS_ARROW_RE.search(before):
             forms.add("this")
         elif before.endswith((".", "->")) and not before.endswith(".."):
             forms.add("member")
         elif before.endswith("::"):
             q = _QUALIFIER_RE.search(before)
             if q is None:
-                forms.add("bare")  # `::name`, the global one
+                forms.add("global")
             else:
                 forms.add("qualified")
                 qualifiers.add(q.group(1))
         else:
             forms.add("bare")
-    return forms, qualifiers
+    return found
+
+
+def _reference_forms(content: str, name: str) -> tuple[set[str], set[str]]:
+    """`_reference_forms_all` for a single name."""
+    return _reference_forms_all(content, {name}).get(name, (set(), set()))
 
 
 _MEMBER_KINDS = frozenset({"method", "template"})
+
+
+def _is_constructor(t: dict, name: str) -> bool:
+    return (t.get("qualified") or "").endswith(f"{name}::{name}")
 
 
 def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
@@ -677,36 +732,44 @@ def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
                       source_kind: str) -> tuple[list[dict], str | None]:
     """Keep the C/C++ targets the way a name is written can reach.
 
-    A member access (`p->name()`) reaches a method, never a free function; a
-    free function's bare call reaches no method; `X::name` reaches the `name`
-    of an `X`; and a method's bare or `this->` call to a method of its own
-    class reaches that one. Returns the targets left, and the resolution
-    when the syntax alone decided it.
+    `X::name` reaches the `name` of an `X` (or `X`'s constructor); a method's
+    bare or `this->` call reaches its own class's method when there is one.
+    Otherwise the syntax only ranks: a member access (`p->name()`) prefers
+    methods to free functions, a free function's bare or `::` call prefers
+    anything but methods — prefers, because the extractor's kinds are not
+    certain, and C calls through pointer fields named like functions.
+    Returns the targets left, and the resolution when the syntax alone
+    decided it.
     """
-    if "::" in name:
+    if "::" in name or not forms:
         return targets, None  # the reference is qualified already: `C::f`
-    def qualified(t: dict) -> str:
-        return t.get("qualified") or t.get("name") or name
 
-    if source_scope and forms <= {"bare", "this"}:
+    def qualified(t: dict) -> str:
+        return t.get("qualified") or name
+
+    def is_named(t: dict, full: str) -> bool:
+        q = qualified(t)
+        return q == full or q.endswith("::" + full)
+
+    own_class = source_scope and source_scope.rsplit("::", 1)[-1] != name
+    if own_class and forms <= {"bare", "this"}:
         own = [t for t in targets if qualified(t) == f"{source_scope}::{name}"]
         if own:
             return own, "same_class"
     if forms == {"qualified"}:
-        named = [t for t in targets
-                 if any(qualified(t).endswith(f"{q}::{name}") for q in qualifiers)
-]
+        named = [t for t in targets if any(
+            is_named(t, f"{q}::{name}") or is_named(t, f"{q}::{name}::{name}")
+            for q in qualifiers)]
         if named:
             return named, "qualified" if len(named) == 1 else None
-    allowed: set[str] = set()
-    if forms & {"member", "this"}:
-        allowed |= _MEMBER_KINDS
-    if "bare" in forms or "qualified" in forms:
-        if source_kind == "function" and "qualified" not in forms:
-            allowed |= {k for k in _EDGE_TARGET_KINDS if k != "method"}
-        else:
-            allowed |= _EDGE_TARGET_KINDS
-    return [t for t in targets if t["kind"] in allowed], None
+    preferred = targets
+    if forms <= {"member", "this"}:
+        preferred = [t for t in targets if t["kind"] in _MEMBER_KINDS]
+    elif forms == {"global"} or (
+            source_kind == "function" and not source_scope and forms <= {"bare", "global"}):
+        preferred = [t for t in targets
+                     if t["kind"] not in _MEMBER_KINDS or _is_constructor(t, name)]
+    return (preferred or targets), None
 
 
 # Only create edges TO meaningful symbol kinds (not prototypes/namespaces)
@@ -1666,8 +1729,12 @@ class Indexer:
             if c_family:
                 referenced_names -= _declared_names(content, source_name, row["kind"])
                 qualified = row["qualified_name"] or ""
-                if row["kind"] in ("method", "template") and "::" in qualified:
+                # A constructor defined in its class is stored as a function,
+                # `C::C`; its scope is still its class.
+                if row["kind"] in ("method", "template", "function") and "::" in qualified:
                     source_scope = qualified.rsplit("::", 1)[0]
+                forms_of = _reference_forms_all(
+                    content, {n for n in referenced_names if "::" not in n})
             refs_for_this = 0
             for ref_name in referenced_names:
                 if refs_for_this >= MAX_REFS_PER_SYMBOL:
@@ -1676,7 +1743,7 @@ class Indexer:
                            if t["id"] != source_id and t["kind"] in _EDGE_TARGET_KINDS]
                 decided = None
                 if c_family and targets:
-                    forms, qualifiers = _reference_forms(content, ref_name)
+                    forms, qualifiers = forms_of.get(ref_name, (set(), set()))
                     targets, decided = _narrow_by_syntax(
                         targets, ref_name, forms, qualifiers, source_scope, row["kind"])
                 if not targets:

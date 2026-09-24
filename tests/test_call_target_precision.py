@@ -185,7 +185,9 @@ def test_reference_forms():
     assert _reference_forms("this->scaleVec();", "scaleVec") == ({"this"}, set())
     assert _reference_forms("Mat_c::scaleVec();", "scaleVec") == ({"qualified"}, {"Mat_c"})
     assert _reference_forms("Box<int>::scaleVec();", "scaleVec") == ({"qualified"}, {"Box"})
-    assert _reference_forms("::scaleVec(); scaleVec();", "scaleVec") == ({"bare"}, set())
+    assert _reference_forms("::scaleVec(); scaleVec();", "scaleVec") == (
+        {"global", "bare"}, set())
+    assert _reference_forms("i_this->scaleVec();", "scaleVec") == ({"member"}, set())
 
 
 def test_parameter_names():
@@ -244,5 +246,184 @@ void wipe(Box_c* box) {
 """})
     payload = json.loads(server.get_callers("Box_c::reset"))
     assert payload["caller_count"] == 0
-    assert "not in the graph" in payload["graph_note"]
+    assert "too short or too common" in payload["graph_note"]
     assert r"find_pattern(r'\breset\s*\(')" in payload["graph_note"]
+
+
+# --- What narrowing must not lose -------------------------------------------
+
+def _edges(files: dict[str, str], tmp_path) -> set[tuple[str, str, str]]:
+    root = tmp_path / "edges"
+    for name, text in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text)
+    db = Database(root / "index.db")
+    db.open()
+    db.initialize()
+    Indexer(db, IndexConfig(root=root)).index()
+    rows = db.conn.execute(
+        """SELECT a.qualified_name, b.qualified_name, e.resolution FROM symbol_edges e
+           JOIN symbols a ON a.id = e.source_id JOIN symbols b ON b.id = e.target_id""")
+    edges = {tuple(r) for r in rows}
+    db.close()
+    return edges
+
+
+def _pairs(edges) -> set[tuple[str, str]]:
+    return {(a, b) for a, b, _ in edges}
+
+
+def test_a_constructor_defined_in_its_class_reaches_its_methods(tmp_path):
+    edges = _edges({"engine.cpp": """\
+class Engine {
+public:
+    Engine(int v) { warmUp(); }
+    void warmUp();
+};
+
+void Engine::warmUp() {
+}
+""", "free.cpp": """\
+void warmUp() {
+}
+"""}, tmp_path)
+    assert ("Engine::Engine", "Engine::warmUp") in _pairs(edges)
+    assert ("Engine::Engine", "warmUp") not in _pairs(edges)
+
+
+def test_a_global_call_is_no_call_to_the_own_class(tmp_path):
+    edges = _edges({"pool.h": """\
+class Pool {
+public:
+    void flushAll();
+    void drainQueue();
+};
+""", "pool.cpp": """\
+#include "pool.h"
+
+void Pool::drainQueue() {
+    ::flushAll();
+}
+""", "other/flush.cpp": """\
+void flushAll() {
+}
+"""}, tmp_path)
+    assert ("Pool::drainQueue", "flushAll") in _pairs(edges)
+    assert ("Pool::drainQueue", "Pool::flushAll") not in _pairs(edges)
+
+
+def test_a_c_call_through_a_pointer_field_still_reaches_the_function(tmp_path):
+    edges = _edges({"irq.c": """\
+struct ops { void (*handleIrq)(int); };
+
+void handleIrq(int v) {
+}
+
+void dispatchAll(struct ops *o) {
+    o->handleIrq(3);
+}
+"""}, tmp_path)
+    assert ("dispatchAll", "handleIrq") in _pairs(edges)
+
+
+def test_a_qualifier_matches_a_whole_class_name(tmp_path):
+    edges = _edges({"box.h": """\
+class MyBox {
+public:
+    void fillUp();
+};
+""", "use/use.cpp": """\
+void pour() {
+    Box::fillUp();
+}
+"""}, tmp_path)
+    assert all(r != "qualified" for a, b, r in edges if a == "pour")
+
+
+def test_a_qualified_constructor_call_reaches_the_constructor(tmp_path):
+    edges = _edges({"tint.h": """\
+namespace paint {
+class Tint {
+public:
+    Tint(int r, int g) {}
+};
+}
+""", "use/use.cpp": """\
+void shade() {
+    paint::Tint(1, 2);
+}
+"""}, tmp_path)
+    assert ("shade", "paint::Tint::Tint") in _pairs(edges)
+
+
+def test_a_method_naming_its_own_class_reaches_the_class(tmp_path):
+    edges = _edges({"crate.h": """\
+class Crate {
+public:
+    Crate() {}
+    Crate* selfRef();
+};
+
+Crate* Crate::selfRef() {
+    return (Crate*)0;
+}
+"""}, tmp_path)
+    assert ("Crate::selfRef", "Crate") in _pairs(edges)
+
+
+def test_an_unnamed_parameter_keeps_its_type_referenced(tmp_path):
+    edges = _edges({"node.h": """\
+struct Node {
+    int weight;
+};
+""", "walk.cpp": """\
+#include "node.h"
+
+void visitNode(Node*, int) {
+}
+"""}, tmp_path)
+    assert ("visitNode", "Node") in _pairs(edges)
+
+
+def test_parameter_names_of_unnamed_parameters():
+    assert _parameter_names("void f(Vec_c) {}", "f", "function") == set()
+    assert _parameter_names("void f(const Vec_c&) {}", "f", "function") == set()
+    assert _parameter_names("void f(struct Node*) {}", "f", "function") == set()
+    assert _parameter_names("void f(std::vector<Item>) {}", "f", "function") == set()
+    assert _parameter_names("void f(unsigned count, const int k) {}", "f", "function") == {
+        "count", "k"}
+    assert _parameter_names(
+        "void f(bool on = lim > 3, Widget keepMe) {}", "f", "function") == {"on", "keepMe"}
+
+
+def test_an_expression_is_no_declaration():
+    body = """\
+int probe(int n) {
+    return n * helperFn;
+    x = y & otherFn;
+    if (mask & isReady == 0) {}
+    const Widget local = make();
+}
+"""
+    names = _declared_names(body, "probe", "function")
+    assert {"helperFn", "otherFn", "isReady"}.isdisjoint(names)
+    assert {"n", "local"} <= names
+
+
+def test_a_common_name_with_a_qualified_definition_says_which_calls_count(serve):
+    server = serve({"pool.cpp": """\
+class Pool {
+public:
+    void init();
+};
+
+void Pool::init() {
+}
+
+void starter() {
+    Pool::init();
+}
+"""})
+    payload = json.loads(server.get_callers("Pool::init"))
+    assert "starter" in {e["name"] for e in payload["callers"]}
+    assert "Only calls written `Pool::init(...)`" in payload["graph_note"]

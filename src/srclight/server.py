@@ -889,8 +889,17 @@ def _graph_coverage(db: Database, syms) -> dict:
     from .indexer import GRAPH_MAX_FANOUT, graph_name_excluded
 
     for name in sorted({sym.name.rsplit("::", 1)[-1] for sym in syms}):
-        search = f"find_pattern(r'\\b{name}\\s*\\(') lists the call sites."
+        search = f"find_pattern(r'\\b{re.escape(name)}\\s*\\(') lists the call sites."
         if graph_name_excluded(name):
+            # A definition outside its class is stored as `C::name`, which the
+            # graph keeps: a call written `C::name()` reaches it.
+            qualified = sorted({sym.name for sym in syms
+                                if "::" in sym.name and not graph_name_excluded(sym.name)})
+            if qualified:
+                return {"graph_note": (
+                    f"Only calls written `{qualified[0]}(...)` are in the graph: `{name}` "
+                    f"alone is too short or too common to tell a call from a variable. "
+                    f"{search}")}
             return {"graph_note": (
                 f"Calls to `{name}` are not in the graph: the name is too short or "
                 f"too common to tell a call from a variable. {search}")}
@@ -928,6 +937,7 @@ def _dedup_edges(edges: list[dict]) -> list[dict]:
         else:
             by_name[name]["_locations"].append((s.file_path, s.start_line))
             if confidence > by_name[name]["confidence"]:
+                by_name[name].pop("resolution", None)
                 by_name[name].update(entry)
                 by_name[name]["_locations"] = by_name[name]["_locations"]
 

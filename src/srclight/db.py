@@ -734,10 +734,15 @@ class Database:
     def count_graph_targets(self, name: str) -> int:
         """How many symbols a call written `name` could land on."""
         assert self.conn is not None
+        from .indexer import _doc_languages
+
+        excluded = sorted(_doc_languages())
         return self.conn.execute(
-            """SELECT COUNT(*) FROM symbols WHERE name = ? AND kind IN
-               ('function','method','class','struct','enum','interface','template')""",
-            (name,),
+            f"""SELECT COUNT(*) FROM symbols s JOIN files f ON s.file_id = f.id
+               WHERE s.name = ? AND s.kind IN
+               ('function','method','class','struct','enum','interface','template')
+               AND f.language NOT IN ({",".join("?" * len(excluded))})""",
+            (name, *excluded),
         ).fetchone()[0]
 
     def get_symbols_by_name(self, name: str, limit: int = 20) -> list[SymbolRecord]:
