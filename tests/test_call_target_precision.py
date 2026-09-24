@@ -686,3 +686,19 @@ void tickFar(void* lamp, Box_c* box) {
     note = payload["graph_note"]
     assert "`blinkLamp`" in note and "`reset`" in note
     assert "graph_note" not in json.loads(server.get_callees("ownLamp"))
+
+
+def test_a_common_name_written_with_its_class_is_a_call(tmp_path):
+    edges = _edges({"stack.h": """\
+class Stack_c {
+public:
+    static void copy(int v);
+    static int get();
+};
+""", "use/use.cpp": """\
+int useStack() {
+    Stack_c::copy(1);
+    return Stack_c::get();
+}
+"""}, tmp_path)
+    assert {("useStack", "Stack_c::copy"), ("useStack", "Stack_c::get")} <= _pairs(edges)

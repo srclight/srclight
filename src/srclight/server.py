@@ -891,10 +891,12 @@ def _graph_coverage(db: Database, syms) -> dict:
     for name in sorted({sym.name.rsplit("::", 1)[-1] for sym in syms}):
         search = f"find_pattern(r'\\b{re.escape(name)}\\s*\\(') lists the call sites."
         if graph_name_excluded(name):
-            # A definition outside its class is stored as `C::name`, which the
-            # graph keeps: a call written `C::name()` reaches it.
-            qualified = sorted({sym.name for sym in syms
-                                if "::" in sym.name and not graph_name_excluded(sym.name)})
+            # A call written with the class, `C::name()`, names one member and
+            # is kept.
+            from .indexer import _without_template_args
+            qualified = sorted({
+                "::".join(_without_template_args(sym.qualified_name or sym.name).split("::")[-2:])
+                for sym in syms if "::" in (sym.qualified_name or sym.name)})
             if qualified:
                 return {"graph_note": (
                     f"Only calls written `{qualified[0]}(...)` are in the graph: `{name}` "

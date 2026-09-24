@@ -1666,6 +1666,19 @@ class Indexer:
             name: syms for name, syms in name_to_symbols.items()
             if not graph_name_excluded(name)
         }
+        # A name too common to follow alone is unambiguous written with its
+        # class: `Stack_c::get()` names one method. A member defined in its
+        # class has no symbol named that way, so it is listed under it.
+        for name, syms in name_to_symbols.items():
+            if not graph_name_excluded(name):
+                continue
+            for sym in syms:
+                parts = _without_template_args(sym.get("qualified") or "").split("::")
+                if len(parts) >= 2 and parts[-1] == name:
+                    alias = "::".join(parts[-2:])
+                    listed = filtered_names.setdefault(alias, [])
+                    if all(s["id"] != sym["id"] for s in listed):
+                        listed.append(sym)
 
         if not filtered_names:
             return 0
