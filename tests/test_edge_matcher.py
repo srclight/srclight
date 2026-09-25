@@ -208,6 +208,26 @@ REFERENCE_CASES = [
         "handle_event(); handler(); handle();",
         id="names-that-are-prefixes-of-each-other",
     ),
+    pytest.param(
+        # Reached from the run after the `~`, and still bound by the boundary
+        # before the `~` itself.
+        {"~Widget", "~Widget<T>", "Widget", "~WidgetPool"},
+        "x~Widget; x~Widget<T>; x~WidgetPool; ~Widget(); p->~Widget(); x~Widgets;",
+        id="destructor-names-are-reached-from-their-class-run",
+    ),
+    pytest.param(
+        # Prefixes of different lengths before the same run.
+        {"1. Setup", ". Setup", "Setup", "~Setup", "~~Setup"},
+        "a1. Setup; x. Setup; y~Setup; z~~Setup; Setup;",
+        id="prefixed-names-before-the-same-run",
+    ),
+    pytest.param(
+        # A prefix ending in a digit: no run starts after it, so the name
+        # is searched for directly, beside one reached from its run.
+        {"~1x", "~x", "~"},
+        "a~1x; b~x; c~;",
+        id="prefix-ending-in-a-digit",
+    ),
 ]
 
 

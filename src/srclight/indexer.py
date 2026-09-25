@@ -1284,17 +1284,26 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
     case that proves it -- accepting `Registry<T>::Lookup` must leave
     `Inner::Leaf` still findable.
     """
-    # Names that do not begin with an identifier character (extraction can
-    # produce a few). They cannot be reached from an identifier run, so they
-    # are located directly.
+    # Names that do not begin with an identifier character. Most still hold
+    # one after a few punctuation characters -- a destructor `~Widget`, a
+    # numbered title `1. Setup` -- and are reached from that run: an occurrence
+    # of `~Widget` is an occurrence of the run `Widget` with `~` before it.
+    # Only the rest, with no run that can start after their prefix, are
+    # located directly.
     unanchored: list[str] = []
     grouping: dict[str, list[str]] = {}
+    prefixed: dict[str, dict[int, list[str]]] = {}
     for name in names:
         head = _LEADING_RUN_RE.match(name)
-        if head is None:
+        if head is not None:
+            grouping.setdefault(head.group(0), []).append(name)
+            continue
+        inner = _LEADING_RUN_RE.search(name)
+        if inner is None or _IS_WORD_CHAR(name[inner.start() - 1]) is not None:
             unanchored.append(name)
         else:
-            grouping.setdefault(head.group(0), []).append(name)
+            (prefixed.setdefault(inner.group(0), {})
+             .setdefault(inner.start(), []).append(name))
     # Longest first, so the first candidate that matches at a position is the
     # one the alternation would have chosen. Frozen into tuples: the scan hands
     # these lists straight to the caller's walk, and a shared list that anything
@@ -1303,6 +1312,15 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
         head: tuple(sorted(candidates, key=len, reverse=True))
         for head, candidates in grouping.items()
     }
+    # Per run, the prefixed names that end their prefix where it starts: the
+    # longest prefix first, as it starts furthest back and the walk goes in
+    # order. Names with the same prefix length start at the same position, so
+    # they share a tuple, longest first like a bucket.
+    before_run = {
+        run: tuple((length, tuple(sorted(candidates, key=len, reverse=True)))
+                   for length, candidates in sorted(by_length.items(), reverse=True))
+        for run, by_length in prefixed.items()
+    }
 
     def anchored_candidates(content: str):
         """Identifier runs, in order, with the names that could start there.
@@ -1310,12 +1328,19 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
         The lookbehind in _IDENT_RUN_RE has already established the leading
         boundary — the run begins on an identifier character and the character
         before it is not a word character — so the walk need only check where
-        each candidate ENDS.
+        each candidate ENDS. A prefixed name starts before its run, on a
+        character that is not the start of any run, so the boundary there is
+        checked here, as it is for the names located directly.
         """
         for run in _IDENT_RUN_RE.finditer(content):
-            names_here = buckets.get(run.group(0))
+            word, start = run.group(0), run.start()
+            for length, names_here in before_run.get(word, ()):
+                at = start - length
+                if at >= 0 and _on_boundary(content, at):
+                    yield at, names_here
+            names_here = buckets.get(word)
             if names_here is not None:
-                yield run.start(), names_here
+                yield start, names_here
 
     def all_candidates(content: str):
         """The same, plus the names that no identifier run can reach.
