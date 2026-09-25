@@ -723,6 +723,16 @@ def _ends_with_backslash(source: bytes, newline: int) -> bool:
     return j >= 0 and source[j] == 0x5C
 
 
+def _digit_separator(source: bytes, i: int) -> bool:
+    """Whether the quote at `i` follows a word or a number, as in `1'000`,
+    rather than opening a character literal — whose only word before it is
+    an encoding prefix, `L'x'`, `u8'x'`."""
+    j = i
+    while j > 0 and (chr(source[j - 1]).isalnum() or source[j - 1] == 0x5F):
+        j -= 1
+    return j < i and source[j:i] not in (b"L", b"u", b"U", b"u8")
+
+
 def _c_comment_bytes(source: bytes, literals: bool = False) -> bytearray:
     """Mark the bytes of C/C++ comments with 1, everything else with 0 — and
     with `literals`, the bytes of strings and character literals too.
@@ -769,6 +779,8 @@ def _c_comment_bytes(source: bytes, literals: bool = False) -> bytearray:
             i = min(i + 1, n)
             if literals:
                 marks[start:i] = b"\x01" * (i - start)
+        elif c == 0x27 and _digit_separator(source, i):  # 1'000
+            i += 1
         elif c == 0x27:  # '
             literal = _CHAR_LITERAL_RE.match(source, i)
             if literal and literals:
@@ -886,9 +898,9 @@ def _brace_view(source: bytes) -> bytes:
     with comments, strings, character literals and preprocessor lines
     blanked — a brace in any of them is no block. Offsets are the source's."""
     view = bytearray(_first_branch_only(source))
-    for i, mark in enumerate(_c_comment_bytes(source, literals=True)):
-        if mark and view[i] not in (0x0A, 0x0D):
-            view[i] = 0x20
+    for run in re.finditer(rb"\x01+", _c_comment_bytes(source, literals=True)):
+        view[run.start():run.end()] = re.sub(
+            rb"[^\r\n]", b" ", bytes(view[run.start():run.end()]))
     pos = 0
     continued = False
     for line in bytes(view).splitlines(keepends=True):
@@ -928,34 +940,44 @@ class _ExtendedNode:
         return getattr(self._node, name)
 
 
-def _extend_to_braces(found: list, source: bytes, view_of) -> list:
+def _extend_to_braces(symbols: list, source: bytes, view_of) -> list:
     """Let a function end where its braces close.
 
     A macro the parser cannot read — `PICK(< a, == b)`, or a bare `BLOCK_END`
     standing for a brace — can make error recovery swallow a closing brace:
     the function ends early and the rest of its body is left at file scope.
-    Only a definition holding errors is checked, and it is extended only
-    when no other definition starts in the part it gains: an unbalanced
-    brace in the text must never merge two definitions.
+    Only a function holding errors is checked — with the template around
+    it, if any — and it is extended only when no other definition starts in
+    the part it gains: an unbalanced brace in the text must never merge two
+    definitions. A declaration there proves nothing: the tail's statements
+    read at file scope, `Guard hold(lock);`, give prototypes.
     """
     view = None
-    starts = None
+    blockers: list[int] = []
+    newlines: list[int] = []
     extended = []
-    for sym in found:
-        node, kind, _name = sym
-        body = node.child_by_field_name("body") if node.type == "function_definition" else None
-        if node.has_error and body is not None and body.type == "compound_statement":
+    for sym in symbols:
+        node, kind, name = sym
+        function = node
+        if node.type == "template_declaration":
+            function = next((c for c in node.named_children
+                             if c.type == "function_definition"), node)
+        body = (function.child_by_field_name("body")
+                if function.type == "function_definition" and function.has_error else None)
+        if body is not None and body.type == "compound_statement":
             if view is None:
                 view = view_of()
-                starts = sorted(n.start_byte for n, k, _ in found if k != "macro")
+                blockers = sorted(n.start_byte for n, k, _ in symbols
+                                  if k not in ("macro", "prototype"))
+                newlines = [m.start() for m in re.finditer(b"\n", source)]
             close = (_brace_close(view, body.start_byte)
                      if view[body.start_byte:body.start_byte + 1] == b"{" else None)
             if close is not None and close > node.end_byte:
-                first = bisect.bisect_left(starts, node.end_byte)
-                if first == len(starts) or starts[first] >= close:
-                    row = source.count(b"\n", 0, close)
-                    column = close - (source.rfind(b"\n", 0, close) + 1)
-                    sym = (_ExtendedNode(node, close, (row, column)), kind, _name)
+                first = bisect.bisect_left(blockers, node.end_byte)
+                if first == len(blockers) or blockers[first] >= close:
+                    row = bisect.bisect_left(newlines, close)
+                    column = close - (newlines[row - 1] + 1 if row else 0)
+                    sym = (_ExtendedNode(node, close, (row, column)), kind, name)
         extended.append(sym)
     return extended
 
@@ -1487,16 +1509,7 @@ class Indexer:
                     continue
 
                 found.append((def_node, kind, symbol_name))
-            if lang in _PREPROCESSED_LANGS:
-                found = _extend_to_braces(found, source, brace_view)
             return found
-
-        view_cache: list[bytes] = []
-
-        def brace_view() -> bytes:
-            if not view_cache:
-                view_cache.append(_brace_view(source))
-            return view_cache[0]
 
         raw_symbols = collect(root)
 
@@ -1522,7 +1535,9 @@ class Indexer:
         # ran on to the end of another definition must not be taken for it.
         recovered_nodes: set[int] = set()
         shared_bodies: dict[int, int] = {}  # id(def_node) -> end byte of the shared body
-        if (lang in _PREPROCESSED_LANGS and root.has_error
+        if lang in _PREPROCESSED_LANGS and root.has_error and not _CONDITIONAL_RE.search(source):
+            raw_symbols = _extend_to_braces(raw_symbols, source, lambda: _brace_view(source))
+        elif (lang in _PREPROCESSED_LANGS and root.has_error
                 and _CONDITIONAL_RE.search(source)):
             recovery_tree = parser.parse(_first_branch_only(source))
             recovered = [sym for sym in collect(recovery_tree.root_node)
@@ -1584,6 +1599,12 @@ class Indexer:
             added = [sym for i, sym in enumerate(recovered) if i not in used]
             recovered_nodes.update(id(sym[0]) for sym in added)
             raw_symbols = merged + added
+            # Extended once both parses are merged, so that no definition
+            # either of them kept is covered.
+            extended = _extend_to_braces(raw_symbols, source, lambda: _brace_view(source))
+            recovered_nodes.update(id(new[0]) for old, new in zip(raw_symbols, extended)
+                                   if new[0] is not old[0] and id(old[0]) in recovered_nodes)
+            raw_symbols = extended
 
             # Symbols of one kind that end on the same byte under different
             # names, one of them from the reparse, name one body: the name

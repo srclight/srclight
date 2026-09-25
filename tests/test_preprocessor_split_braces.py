@@ -919,3 +919,83 @@ void second() {
     symbols = _symbols(db, "open.cpp")
     assert ("second", 11, 13) in symbols
     assert not any(n == "first" and end >= 11 for n, _s, end in symbols)
+
+
+def test_a_function_template_is_extended_with_its_function(tmp_path, db):
+    _index(tmp_path, db, {"tpl.cpp": """\
+#define PICK(a, b) a
+template <typename T>
+void drawAll(T level) {
+    if (ready) {
+        if (level PICK(< limit + 1, == limit)) {
+            level = -1;
+        }
+    }
+    if (glow > 0.0f) {
+        paint(3);
+    }
+}
+"""})
+    spans = {(n, s, e) for n, s, e in _symbols(db, "tpl.cpp") if n == "drawAll"}
+    assert spans and all(e == 12 for _n, _s, e in spans), spans
+
+
+def test_a_local_object_in_the_tail_does_not_block_the_extension(tmp_path, db):
+    _index(tmp_path, db, {"lock.cpp": """\
+#define PICK(a, b) a
+void drawAll() {
+    if (ready) {
+        if (level PICK(< limit + 1, == limit)) {
+            level = -1;
+        }
+    }
+    Guard hold(lockObject);
+    paint(3);
+}
+"""})
+    assert ("drawAll", 2, 10) in _symbols(db, "lock.cpp")
+
+
+def test_the_extension_never_covers_a_definition_the_merge_kept(tmp_path, db):
+    _index(tmp_path, db, {"loop.cpp": """\
+#define PICK(a, b) a
+void manage() {
+    if (ready) {
+        if (level PICK(< limit + 1, == limit)) {
+            level = -1;
+        }
+    }
+#if FAST
+    fastPath();
+#else
+    FOR_EACH(item) {
+        slowPath(item);
+    }
+#endif
+    finish();
+}
+"""})
+    symbols = _symbols(db, "loop.cpp")
+    extents = {n: (s, e) for n, s, e in symbols}
+    for name, (start, end) in extents.items():
+        for other, (o_start, o_end) in extents.items():
+            if name != other and start < o_start <= end:
+                assert o_end <= end, (name, other, symbols)
+                parent = db.conn.execute(
+                    "SELECT parent_symbol_id FROM symbols WHERE name = ?", (other,)).fetchone()[0]
+                assert parent is not None, (name, other, symbols)
+
+
+def test_a_digit_separator_is_no_character_literal(tmp_path, db):
+    _index(tmp_path, db, {"sep.cpp": """\
+#define PICK(a, b) a
+namespace outer {
+void first() {
+    if (v PICK(< a, == b)) {
+    }
+    use({1'0},'a');
+}
+int table_size = computeSize();
+}
+"""})
+    assert not any(n == "first" and e > 7 for n, _s, e in _symbols(db, "sep.cpp"))
