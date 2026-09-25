@@ -928,6 +928,10 @@ _TYPE_BEFORE_NAME_RE = re.compile(
     r"[A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?(?:\s*[*&]+\s*|\s+)$")
 _TYPE_WORD_RE = re.compile(
     r"\s*(?:(?:const|static|constexpr|volatile|register)\s+)*([A-Za-z_][\w:]*)")
+# The `:` opening a constructor's initializer list, after its parameters and
+# any specifiers: `Foo(int v) noexcept :`.
+_INITIALIZER_LIST_RE = re.compile(
+    r"\)\s*(?:(?:noexcept|const|override|final|throw\s*\(\s*\))\s*)*:(?!:)")
 
 
 def _declares_or_initializes(before: str) -> bool:
@@ -939,8 +943,19 @@ def _declares_or_initializes(before: str) -> bool:
     from .indexer import _NOT_A_TYPE
 
     stripped = before.rstrip()
+    statement = re.split(r"[;{}]", stripped)[-1]
+    # A constructor's initializer list, `Foo(int v) noexcept : m(v), n(w)`:
+    # every name opening an initializer at its top level. A `?` in the
+    # statement makes the `:` a conditional's, `ok ? f(a) : g(b)`.
+    opened = _INITIALIZER_LIST_RE.search(statement)
+    if opened and "?" not in statement:
+        rest = statement[opened.end():]
+        if stripped.endswith(":") and not rest.strip():
+            return True
+        if stripped.endswith(",") and rest.count("(") == rest.count(")"):
+            return True
     if stripped.endswith(":") and not stripped.endswith("::"):
-        return stripped[:-1].rstrip().endswith(")")
+        return False
     match = _TYPE_BEFORE_NAME_RE.search(before)
     if match is None:
         return False

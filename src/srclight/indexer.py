@@ -837,6 +837,27 @@ def _call_arity(content: str, paren: int) -> int:
     return 0 if empty else commas + 1
 
 
+def _without_template_commas(params: str) -> str:
+    """Hide the commas of template argument lists, `map<int, int> m` being
+    one parameter. A `<` opens one only right after a name, closed by a `>`
+    with nothing between that only an expression holds, `=` included: in a
+    default argument, `x < 3, int c` and `1 << 3` compare and shift."""
+    out = None
+    for m in re.finditer(r"(?<=[A-Za-z_\d:])\s*<(?!<)", params):
+        at = m.end() - 1
+        before = params[:m.start()]
+        if at and params[at - 1] == "<" or not re.search(r"[A-Za-z_][\w:]*$", before):
+            continue
+        args = _TEMPLATE_ARGS_RE.match(params, at)
+        if args is None or "=" in args.group(0):
+            continue
+        out = out or list(params)
+        for k in range(args.start(), args.end()):
+            if out[k] == ",":
+                out[k] = ";"
+    return params if out is None else "".join(out)
+
+
 @functools.lru_cache(maxsize=65536)
 def _param_range(signature: str | None, name: str) -> tuple[int, float] | None:
     """How many arguments a function's signature accepts, defaults and `...`
@@ -856,20 +877,14 @@ def _param_range(signature: str | None, name: str) -> tuple[int, float] | None:
     params = signature[m.end():i - 1].strip()
     if params in ("", "void"):
         return (0, 0)
-    parts, depth, angle, part = [], 0, 0, []
-    # `<` opens template arguments (`map<int, int> m` is one parameter); a
-    # `>` closes one only when one is open — `x > 0` and `p->next` in a
-    # default argument close nothing.
-    for j, ch in enumerate(params + ","):
+    params = _without_template_commas(params)
+    parts, depth, part = [], 0, []
+    for ch in params + ",":
         if ch in "([{":
             depth += 1
         elif ch in ")]}":
             depth -= 1
-        elif ch == "<" and j and (params[j - 1].isalnum() or params[j - 1] in "_: "):
-            angle += 1
-        elif ch == ">" and angle and not (j and params[j - 1] == "-"):
-            angle -= 1
-        if ch == "," and depth == 0 and angle == 0:
+        if ch == "," and depth == 0:
             parts.append("".join(part).strip())
             part = []
         else:

@@ -1280,8 +1280,11 @@ def test_callee_note_counts_calls_after_operators_and_labels():
     assert _declares_or_initializes("{\n    Timer ")
     assert _declares_or_initializes("Box(int v) : ")
     for call in ("if (a && ", "x = y * ", "return a > ", "case 1: ", "default: ",
-                 "v = ok ? a : "):
+                 "v = ok ? a : ", "return ok ? prepare(a) : ", "f(x, "):
         assert not _declares_or_initializes(call), call
+    for initializer in ("Box(int v) : m(v), ", "Box(int v) noexcept : ",
+                        "Box(int v) : m(v), n(w), "):
+        assert _declares_or_initializes(initializer), initializer
 
 
 def test_forward_declarations_do_not_make_a_defined_class_ambiguous(tmp_path):
@@ -1515,6 +1518,15 @@ def test_a_signature_counts_no_comma_inside_a_comment_or_a_literal():
     assert _param_range("void f(int a, /* (x, y) */ int b)", "f") == (2, 2)
     assert _param_range('void join(const char* s = "a,b")', "join") == (0, 1)
     assert _param_range("void sep(char c = ',')", "sep") == (0, 1)
+
+
+def test_a_comparison_in_a_default_argument_opens_no_template():
+    from srclight.indexer import _param_range
+
+    assert _param_range("void f(int a, bool b = x < 3, int c)", "f") == (2, 3)
+    assert _param_range("void setMode(int m, int mask = 1 << 3)", "setMode") == (1, 2)
+    assert _param_range("void put(std::map<int, int> m, int n)", "put") == (2, 2)
+    assert _param_range("void pair(std::pair<std::vector<int>, int> p)", "pair") == (1, 1)
 
 
 def test_a_constructor_is_named_by_whole_names():

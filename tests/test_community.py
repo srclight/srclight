@@ -349,3 +349,19 @@ def test_detect_communities_large_graph_above_sql_variable_limit(db):
     communities = detect_communities(db)  # must not raise "too many SQL variables"
     assert len(communities) >= 1
     assert sum(c["symbol_count"] for c in communities) >= 1000
+
+
+def test_an_entry_point_is_seen_in_a_later_flow_of_the_same_label(db):
+    from srclight.community import compute_impact
+
+    syms = _build_test_graph(db)
+    login, other, leaf = syms["login"], syms["hash_password"], syms["validate_password"]
+    flows = [
+        {"label": "login -> validate_password", "entry_symbol_id": other,
+         "steps": [{"symbol_id": other}, {"symbol_id": login}, {"symbol_id": leaf}]},
+        {"label": "login -> validate_password", "entry_symbol_id": login,
+         "steps": [{"symbol_id": login}, {"symbol_id": leaf}]},
+    ]
+    result = compute_impact(db, login, {}, flows)
+    assert result["is_entry_point"] is True
+    assert result["affected_flows"] == ["login -> validate_password"]
