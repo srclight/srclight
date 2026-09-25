@@ -270,7 +270,7 @@ def _doc_comment_text(source_bytes: bytes, comment: Node, node: Node) -> str | N
             break
         first = above
     return source_bytes[first.start_byte:comment.end_byte].decode(
-        "utf-8", errors="replace").replace("\r\n", "\n").strip()
+        "utf-8", errors="replace").strip()
 
 
 def _extract_doc_comment(source_bytes: bytes, node: Node) -> str | None:
