@@ -342,3 +342,20 @@ def test_impact_lists_each_flow_once(serve):
     server = serve(GATES)
     flows = json.loads(server.get_impact("Gate_c::openGate"))["affected_flows"]
     assert len(flows) == len(set(flows))
+
+
+def test_a_function_defined_in_a_namespace_block_is_found_by_its_qualified_name(serve):
+    server = serve({"events.cpp": """\
+namespace game {
+namespace events {
+int holder() {
+    return 0;
+}
+}
+}
+"""})
+    found = json.loads(server.get_symbol("game::events::holder"))
+    assert "error" not in found, found
+    assert "return 0" in json.dumps(found)
+    signature = json.loads(server.get_signature("game::events::holder"))
+    assert "error" not in signature, signature
