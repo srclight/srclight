@@ -261,8 +261,16 @@ def _doc_comment_text(source_bytes: bytes, comment: Node, node: Node) -> str | N
     """
     if _BRANCH_END_RE.search(source_bytes, comment.end_byte, node.start_byte):
         return None
-    return source_bytes[comment.start_byte:comment.end_byte].decode(
-        "utf-8", errors="replace").strip()
+    # A doc comment of several line comments is one node per line: the
+    # comments right above, with no blank line between, are read with it.
+    first = comment
+    while (above := first.prev_sibling) is not None and above.type == "comment":
+        gap = source_bytes[above.end_byte:first.start_byte]
+        if gap.strip() or gap.count(b"\n") > 1:
+            break
+        first = above
+    return source_bytes[first.start_byte:comment.end_byte].decode(
+        "utf-8", errors="replace").replace("\r\n", "\n").strip()
 
 
 def _extract_doc_comment(source_bytes: bytes, node: Node) -> str | None:

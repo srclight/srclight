@@ -1010,3 +1010,23 @@ def test_a_quote_glued_to_a_word_opens_a_literal_only_after_a_keyword_or_prefix(
     assert not _digit_separator(b"case'{':", 4)
     assert not _digit_separator(b"u8'a'", 2)
     assert not _digit_separator(b"L'a'", 1)
+
+
+def test_a_doc_comment_of_several_line_comments_is_read_whole(tmp_path, db):
+    _index(tmp_path, db, {"notes.h": """\
+// Kept apart by a blank line.
+
+// The player who owns the current event. Player 0 until
+// an order was seen.
+int holder();
+""", "notes.cpp": """\
+/* A block. */
+// A line after it.
+int body() {
+    return 0;
+}
+"""})
+    docs = dict(db.conn.execute("SELECT name, doc_comment FROM symbols"))
+    assert docs["holder"] == ("// The player who owns the current event. Player 0 until\n"
+                              "// an order was seen.")
+    assert docs["body"] == "/* A block. */\n// A line after it."
