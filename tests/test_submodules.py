@@ -82,12 +82,12 @@ def test_git_history_of_a_submodule_file_is_read_in_the_submodule(with_submodule
 
 
 def test_paths_that_are_not_ascii_are_indexed(tmp_path):
-    _repo(tmp_path / "parts", {"outil.py": "def polir():\n    return 1\n"})
+    _repo(tmp_path / "parts", {"tool.py": "def polish():\n    return 1\n"})
     main = tmp_path / "main"
-    _repo(main, {"pièce.py": "def tailler():\n    return 1\n"})
-    _git(main, "submodule", "add", "-q", str(tmp_path / "parts"), "tiers/pièce")
+    _repo(main, {"naïve.py": "def trim():\n    return 1\n"})
+    _git(main, "submodule", "add", "-q", str(tmp_path / "parts"), "vendor/café")
     _git(main, "commit", "-q", "-m", "add submodule")
     db = _index(main)
     paths = {r[0].replace("\\", "/") for r in db.conn.execute("SELECT path FROM files")}
     db.close()
-    assert {"pièce.py", "tiers/pièce/outil.py"} <= paths
+    assert {"naïve.py", "vendor/café/tool.py"} <= paths
