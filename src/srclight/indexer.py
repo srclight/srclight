@@ -307,6 +307,43 @@ def _get_git_head(root: Path) -> str | None:
     return None
 
 
+def _shared_body(metadata: str | None) -> int | None:
+    """The shared-body mark the #if/#else recovery leaves in a symbol's metadata."""
+    if not metadata:
+        return None
+    try:
+        return json.loads(metadata).get("shared_body")
+    except (ValueError, AttributeError):
+        return None
+
+
+def _doc_comment_text(source_bytes: bytes, comment: Node, node: Node) -> str | None:
+    """The text of `comment` as `node`'s doc comment, or None if it is not one.
+
+    Read from the file rather than from the node: a node from the #if/#else
+    reparse would give the reparse's text. An #else, #elif or #endif in
+    between means the comment belongs to another branch than the definition;
+    only the reparse, with the directives blanked, can make such a comment
+    look adjacent. An opening #if in between is fine — the comment then
+    documents the whole conditional, the definition included.
+    """
+    if _BRANCH_END_RE.search(source_bytes, comment.end_byte, node.start_byte):
+        return None
+    # A doc comment of several line comments is one node per line: the
+    # comments right above, with no blank line between, are read with it —
+    # each on a line of its own, not trailing a statement (`int x; // x`).
+    first = comment
+    while (above := first.prev_sibling) is not None and above.type == "comment":
+        gap = source_bytes[above.end_byte:first.start_byte]
+        line_start = source_bytes.rfind(b"\n", 0, above.start_byte) + 1
+        if (gap.strip() or gap.count(b"\n") > 1
+                or source_bytes[line_start:above.start_byte].strip()):
+            break
+        first = above
+    return source_bytes[first.start_byte:comment.end_byte].decode(
+        "utf-8", errors="replace").strip()
+
+
 def _extract_doc_comment(source_bytes: bytes, node: Node) -> str | None:
     """Extract doc comment preceding a symbol node."""
     # Look at the previous sibling for a comment
@@ -316,11 +353,11 @@ def _extract_doc_comment(source_bytes: bytes, node: Node) -> str | None:
         # Look at previous unnamed siblings too
         prev_sib = node.prev_sibling
         if prev_sib and prev_sib.type == "comment":
-            return prev_sib.text.decode("utf-8", errors="replace").strip()
+            return _doc_comment_text(source_bytes, prev_sib, node)
         return None
 
     if prev.type == "comment":
-        return prev.text.decode("utf-8", errors="replace").strip()
+        return _doc_comment_text(source_bytes, prev, node)
 
     # Python: check for docstring (first child expression_statement with string)
     if node.type in ("function_definition", "class_definition"):
@@ -1357,6 +1394,455 @@ def _own_text(content: str, start_line: int, end_line: int,
     return "\n".join(lines)
 
 
+# Languages whose parse can break on a conditional that splits a brace across
+# its branches (see _first_branch_only).
+_PREPROCESSED_LANGS = frozenset({"c", "cpp"})
+
+_CONDITIONAL_RE = re.compile(
+    rb"^[ \t]*#[ \t]*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b", re.MULTILINE
+)
+
+# The directives that end a branch: whatever came before one of them belongs
+# to another branch than whatever comes after.
+_BRANCH_END_RE = re.compile(
+    rb"^[ \t]*#[ \t]*(elif|elifdef|elifndef|else|endif)\b", re.MULTILINE
+)
+
+# A character literal: one character or escape, or a short multi-character
+# constant ('RIFF'), closed on the same line.
+_CHAR_LITERAL_RE = re.compile(rb"'(?:\\[^\n]{1,8}?|[^'\\\n]{1,4})'")
+
+
+# What follows the quote of a C++ raw string: its delimiter, then `(`.
+_RAW_DELIMITER_RE = re.compile(rb'([^()\\\s]{0,16})\(')
+
+
+def _raw_string_prefix(source: bytes, quote: int) -> bool:
+    """Whether the quote at `quote` opens a C++ raw string: R, u8R, uR, UR or
+    LR right before it, not ending a longer identifier."""
+    if quote == 0 or source[quote - 1] != 0x52:  # R
+        return False
+    start = quote - 1
+    if source[start - 2:start] == b"u8":
+        start -= 2
+    elif start > 0 and source[start - 1] in (0x75, 0x55, 0x4C):  # u U L
+        start -= 1
+    before = source[start - 1] if start > 0 else 0x20
+    return not (chr(before).isalnum() or before == 0x5F)
+
+
+def _ends_with_backslash(source: bytes, newline: int) -> bool:
+    """Whether the line ending at `newline` ends in a backslash, CRLF too."""
+    j = newline - 1
+    if j >= 0 and source[j] == 0x0D:
+        j -= 1
+    return j >= 0 and source[j] == 0x5C
+
+
+def _digit_separator(source: bytes, i: int) -> bool:
+    """Whether the quote at `i` opens nothing because a word or a number is
+    glued to it: a digit separator, `1'000`, or the closing quote of a
+    multi-character constant too long to read as a literal, `'longtag'`.
+    After a keyword or an encoding prefix it opens a character literal:
+    `case'{':`, `L'x'`, `u8'x'`."""
+    j = i
+    while j > 0 and (chr(source[j - 1]).isalnum() or source[j - 1] == 0x5F):
+        j -= 1
+    word = source[j:i].decode("latin-1")
+    return bool(word) and word not in _BEFORE_A_CHARACTER
+
+
+# Words a character literal can be glued to: encoding prefixes, and the
+# keywords a value follows.
+_BEFORE_A_CHARACTER = frozenset({
+    "L", "u", "U", "u8", "case", "return", "else", "do", "throw", "sizeof",
+    "co_return", "co_yield", "and", "or", "not", "xor", "bitand", "bitor",
+    "compl", "not_eq", "and_eq", "or_eq", "xor_eq",
+})
+
+
+def _c_comment_bytes(source: bytes, literals: bool = False) -> bytearray:
+    """Mark the bytes of C/C++ comments with 1, everything else with 0 — and
+    with `literals`, the bytes of strings and character literals too.
+
+    Strings are stepped over, so a `/*` inside one opens nothing — raw
+    strings included, which may hold quotes and newlines. A quote opens a
+    character literal only when one closes it shortly after on the same
+    line: a digit separator (1'000) or the apostrophe of an #error message
+    is a lone quote, and taking it for an opening one would hide every
+    comment after it. A `//` comment ending in a backslash runs on into the
+    next line, as the preprocessor splices the two.
+    """
+    marks = bytearray(len(source))
+    i, n = 0, len(source)
+    while i < n:
+        c = source[i]
+        if c == 0x2F and i + 1 < n and source[i + 1] in (0x2A, 0x2F):  # /* or //
+            if source[i + 1] == 0x2A:
+                end = source.find(b"*/", i + 2)
+                end = n if end == -1 else end + 2
+            else:
+                end = source.find(b"\n", i + 2)
+                while end != -1 and _ends_with_backslash(source, end):
+                    end = source.find(b"\n", end + 1)
+                end = n if end == -1 else end
+            marks[i:end] = b"\x01" * (end - i)
+            i = end
+        elif c == 0x22 and _raw_string_prefix(source, i) and (
+                opening := _RAW_DELIMITER_RE.match(source, i + 1)):  # R"delim( ... )delim"
+            closing = b")" + opening.group(1) + b'"'
+            end = source.find(closing, opening.end())
+            end = n if end == -1 else end + len(closing)
+            if literals:
+                marks[i:end] = b"\x01" * (end - i)
+            i = end
+        elif c == 0x22:  # "
+            start = i
+            i += 1
+            while i < n and source[i] not in (0x22, 0x0A):
+                if source[i] == 0x5C:  # an escape; before a CRLF it splices both bytes
+                    i += 3 if source[i + 1:i + 3] == b"\r\n" else 2
+                else:
+                    i += 1
+            i = min(i + 1, n)
+            if literals:
+                marks[start:i] = b"\x01" * (i - start)
+        elif c == 0x27 and _digit_separator(source, i):  # 1'000
+            i += 1
+        elif c == 0x27:  # '
+            literal = _CHAR_LITERAL_RE.match(source, i)
+            if literal and literals:
+                marks[i:literal.end()] = b"\x01" * (literal.end() - i)
+            i = literal.end() if literal else i + 1
+        else:
+            i += 1
+    return marks
+
+
+def _first_branch_only(source: bytes) -> bytes:
+    """Keep the first branch of every #if chain and blank everything else.
+
+    tree-sitter does not run the preprocessor, so a function whose #if and
+    #else branches each open a brace — closed once, after #endif — reads as
+    two opening braces for one closing brace, and the parse gives up on it.
+    With the directives and the later branches blanked, the braces balance
+    again.
+
+    Blanked bytes become spaces and newlines stay, so offsets and line
+    numbers are those of the original: a node found in this text points at
+    the same bytes in the file.
+
+    Comments are never blanked. One that opens on a directive line, or in a
+    dropped branch, and closes elsewhere keeps both of its ends — blanking
+    one would leave the other half to be read as code. And a directive
+    written inside a comment is not a directive.
+    """
+    in_comment = _c_comment_bytes(source)
+
+    out = bytearray(source)
+    first_branch: list[bool] = []  # per open conditional: still in its first branch
+    continued = False  # the previous directive line ended with a backslash
+    pos = 0
+    for line in source.splitlines(keepends=True):
+        end = pos + len(line)
+        body = line.rstrip(b"\r\n")
+        directive = None if continued else _CONDITIONAL_RE.match(body)
+        if directive and in_comment[pos + len(body) - len(body.lstrip(b" \t"))]:
+            directive = None
+        if directive:
+            word = directive.group(1)
+            if word in (b"if", b"ifdef", b"ifndef"):
+                first_branch.append(True)
+            elif word == b"endif":
+                if first_branch:
+                    first_branch.pop()
+            elif first_branch:
+                first_branch[-1] = False
+        if continued or directive or not all(first_branch):
+            for i in range(pos, end):
+                if out[i] not in (0x0A, 0x0D) and not in_comment[i]:
+                    out[i] = 0x20
+        continued = bool(continued or directive) and body.endswith(b"\\")
+        pos = end
+    return bytes(out)
+
+
+_CALLABLE_KINDS_CPP = frozenset({"function", "method"})
+
+# Where a C/C++ definition sits at top level: file scope, a namespace or an
+# `extern "C"` block.
+_TOP_LEVEL_PARENTS = frozenset({"translation_unit", "declaration_list"})
+
+
+def _under_error(node: Node) -> bool:
+    """Whether error recovery put a node inside an ERROR node."""
+    parent = node.parent
+    while parent is not None:
+        if parent.type == "ERROR":
+            return True
+        parent = parent.parent
+    return False
+
+
+def _at_top_level(node: Node) -> bool:
+    parent = node.parent
+    if parent is not None and parent.type == "template_declaration":
+        parent = parent.parent
+    return parent is not None and parent.type in _TOP_LEVEL_PARENTS
+
+
+def _looks_like_a_function(node: Node) -> bool:
+    """Whether a top-level function definition has the shape of a real one: a
+    return type, or a qualified name (a constructor or destructor defined
+    outside its class). A loop macro read at file scope —
+    `FOR_EACH_ITEM(x) { ... }` — has neither."""
+    if node.type == "template_declaration":
+        node = next((c for c in node.named_children if c.type == "function_definition"), node)
+    if node.child_by_field_name("type") is not None:
+        return True
+    declarator = node.child_by_field_name("declarator")
+    while declarator is not None and declarator.type not in (
+            "identifier", "field_identifier", "qualified_identifier",
+            "destructor_name", "operator_name"):
+        inner = declarator.child_by_field_name("declarator")
+        if inner is None:
+            inner = next((c for c in declarator.named_children
+                          if c.type.endswith("declarator") or c.type.endswith("identifier")), None)
+        declarator = inner
+    return declarator is not None and declarator.type == "qualified_identifier"
+
+
+def _returns_a_type_it_defines(node: Node) -> bool:
+    """Whether a function definition's return type is a class, struct, union
+    or enum defined on the spot — `class X {...} f() {...}`, which is what a
+    reparse makes of a class closed at a stray brace and the function after
+    it."""
+    ret = node.child_by_field_name("type")
+    return ret is not None and ret.type.endswith("_specifier") and ret.child_by_field_name(
+        "body") is not None
+
+
+def _closes_for_real(node: Node) -> bool:
+    """Whether a definition ends on a closing token that is in the source,
+    rather than one tree-sitter made up because the braces never closed."""
+    last = node
+    while last.child_count:
+        last = last.children[-1]
+    return not last.is_missing
+
+
+def _brace_view(source: bytes) -> bytes:
+    """The source as its braces read: the first branch of each conditional,
+    with comments, strings, character literals and preprocessor lines
+    blanked — a brace in any of them is no block. Offsets are the source's."""
+    view = bytearray(_first_branch_only(source))
+    for run in re.finditer(rb"\x01+", _c_comment_bytes(source, literals=True)):
+        view[run.start():run.end()] = re.sub(
+            rb"[^\r\n]", b" ", bytes(view[run.start():run.end()]))
+    pos = 0
+    continued = False
+    for line in bytes(view).splitlines(keepends=True):
+        end = pos + len(line)
+        body = line.rstrip(b"\r\n")
+        if continued or body.lstrip(b" \t").startswith(b"#"):
+            for i in range(pos, pos + len(body)):
+                view[i] = 0x20
+            continued = body.endswith(b"\\")
+        pos = end
+    return bytes(view)
+
+
+def _brace_close(view: bytes, open_at: int) -> int | None:
+    """The end of the block whose `{` is at `open_at`, or None when it never
+    closes."""
+    depth = 0
+    for i in range(open_at, len(view)):
+        if view[i] == 0x7B:  # {
+            depth += 1
+        elif view[i] == 0x7D:  # }
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return None
+
+
+class _ExtendedNode:
+    """A definition node whose end its braces put further than the parse."""
+
+    def __init__(self, node: Node, end_byte: int, end_point: tuple[int, int]):
+        self._node = node
+        self.end_byte = end_byte
+        self.end_point = end_point
+
+    def __getattr__(self, name):
+        return getattr(self._node, name)
+
+
+def _extend_to_braces(symbols: list, source: bytes, view_of) -> list:
+    """Let a function end where its braces close.
+
+    A macro the parser cannot read — `PICK(< a, == b)`, or a bare `BLOCK_END`
+    standing for a brace — can make error recovery swallow a closing brace:
+    the function ends early and the rest of its body is left at file scope.
+    Only a function holding errors is checked — with the template around
+    it, if any — and it is extended only when no other definition starts in
+    the part it gains: an unbalanced brace in the text must never merge two
+    definitions. A declaration there proves nothing: the tail's statements
+    read at file scope, `Guard hold(lock);`, give prototypes.
+    """
+    view = None
+    blockers: list[int] = []
+    newlines: list[int] = []
+    extended = []
+    for sym in symbols:
+        node, kind, name = sym
+        function = node
+        if node.type == "template_declaration":
+            function = next((c for c in node.named_children
+                             if c.type == "function_definition"), node)
+        body = (function.child_by_field_name("body")
+                if function.type == "function_definition" and function.has_error else None)
+        if body is not None and body.type == "compound_statement":
+            if view is None:
+                view = view_of()
+                blockers = sorted(n.start_byte for n, k, _ in symbols
+                                  if k not in ("macro", "prototype"))
+                newlines = [m.start() for m in re.finditer(b"\n", source)]
+            close = (_brace_close(view, body.start_byte)
+                     if view[body.start_byte:body.start_byte + 1] == b"{" else None)
+            if close is not None and close > node.end_byte:
+                first = bisect.bisect_left(blockers, node.end_byte)
+                if first == len(blockers) or blockers[first] >= close:
+                    row = bisect.bisect_left(newlines, close)
+                    column = close - (newlines[row - 1] + 1 if row else 0)
+                    sym = (_ExtendedNode(node, close, (row, column)), kind, name)
+        extended.append(sym)
+    return extended
+
+
+def _extent_is_sound(node: Node) -> bool:
+    """Whether a definition from the #if/#else reparse can be trusted for its
+    extent.
+
+    A node without errors can. A long function nearly always holds something
+    tree-sitter cannot read — a call through a pointer to member function, a
+    macro — and such an error is local: it does not move the braces. So a
+    node with errors is trusted too, as long as it ends on a real closing
+    token, no closing brace inside it had to be made up, and no definition is
+    nested in its errors — the signs of braces that do not balance.
+    """
+    if node.type == "function_definition" and (
+            _returns_a_type_it_defines(node)
+            or (_at_top_level(node) and not _looks_like_a_function(node))):
+        return False
+    if not node.has_error:
+        return True
+    last = node
+    while last.child_count:
+        last = last.children[-1]
+    if last.is_missing or last.type not in ("}", ";"):
+        return False
+    stack = [child for child in node.children if child.has_error]
+    while stack:
+        child = stack.pop()
+        if child.type == "function_definition" or (child.is_missing and child.type == "}"):
+            return False
+        stack.extend(grandchild for grandchild in child.children
+                     if grandchild.has_error or grandchild.is_missing
+                     or grandchild.type == "function_definition")
+    return True
+
+
+# Words a C or C++ symbol can never be named. Error recovery can still hand
+# one to the extractor: `if (a == b) { ... }` cut off from its chain reads as
+# a function `if` taking `(a == b)`. C++ reserves more than C, where `new`,
+# `delete` or `class` are ordinary identifiers.
+_C_KEYWORDS = frozenset({
+    "auto", "break", "case", "char", "const", "continue", "default", "do",
+    "double", "else", "enum", "extern", "float", "for", "goto", "if", "inline",
+    "int", "long", "register", "restrict", "return", "short", "signed",
+    "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned",
+    "void", "volatile", "while", "_Alignas", "_Alignof", "_Atomic", "_Bool",
+    "_Complex", "_Generic", "_Imaginary", "_Noreturn", "_Static_assert",
+    "_Thread_local",
+})
+_CPP_KEYWORDS = _C_KEYWORDS | frozenset({
+    "alignas", "alignof", "and", "and_eq", "asm", "bitand", "bitor", "bool",
+    "catch", "char8_t", "char16_t", "char32_t", "class", "co_await",
+    "co_return", "co_yield", "compl", "concept", "const_cast", "consteval",
+    "constexpr", "constinit", "decltype", "delete", "dynamic_cast", "explicit",
+    "export", "false", "friend", "mutable", "namespace", "new", "noexcept",
+    "not", "not_eq", "nullptr", "operator", "or", "or_eq", "private",
+    "protected", "public", "reinterpret_cast", "requires", "static_assert",
+    "static_cast", "template", "this", "thread_local", "throw", "true", "try",
+    "typeid", "typename", "using", "virtual", "wchar_t", "xor", "xor_eq",
+})
+_RESERVED_NAMES = {"c": _C_KEYWORDS, "cpp": _CPP_KEYWORDS}
+
+
+_AFTER_PARAMS_WORDS = frozenset({
+    "const", "volatile", "override", "final", "noexcept", "throw", "try", "requires",
+    "mutable", "__attribute__",
+})
+
+
+def _macro_typed_declaration(def_node: Node, name: str) -> bool:
+    """Whether a "function" is a variable declared with a macro as its type:
+    no return type before the name, and after the parentheses another name
+    closed by `;`, `=`, `,` or `[` — `MACRO(f32, s16) mField;`."""
+    if def_node.child_by_field_name("type") is not None:
+        return False
+    # A constructor has no return type either: `Box() NOEXCEPT_M;` is one,
+    # its trailing macro an attribute.
+    parent = def_node.parent
+    while parent is not None and parent.type not in (
+            "class_specifier", "struct_specifier", "union_specifier", "translation_unit"):
+        parent = parent.parent
+    if parent is not None and parent.type != "translation_unit":
+        owner = parent.child_by_field_name("name")
+        if owner is not None and owner.text.decode("utf-8", errors="replace").rsplit(
+                "::", 1)[-1].split("<", 1)[0] == name:
+            return False
+    text = def_node.text.decode("utf-8", errors="replace")
+    m = re.match(
+        rf"\s*(?:(?:static|extern|inline|const|volatile)\s+)*{re.escape(name)}\s*\(",
+        text)
+    if m is None:
+        return False
+    depth, i = 1, m.end()
+    while i < len(text) and depth:
+        depth += {"(": 1, ")": -1}.get(text[i], 0)
+        i += 1
+    rest = text[i:]
+    if not rest.strip() and def_node.parent is not None:
+        # In a class body the parser may end the node at the parenthesis
+        # and leave the field's name to what follows.
+        parent = def_node.parent
+        rest = parent.text[def_node.end_byte - parent.start_byte:][:200].decode(
+            "utf-8", errors="replace")
+    after = re.match(r"\s*([A-Za-z_]\w*)\s*[;=,\[]", rest)
+    return after is not None and after.group(1) not in _AFTER_PARAMS_WORDS
+
+
+def _function_inside_a_function(node: Node, kind: str) -> bool:
+    """Whether a definition is a function read inside another function's
+    body, where C and C++ allow none: error recovery's work.
+
+    Only functions: a struct or an enum local to a function is legal C,
+    whatever its name. And nothing about errors: an export macro before a
+    real C function, or a stray token in an enum, puts an error in the C++
+    parse of perfectly real code.
+    """
+    if kind not in ("function", "method"):
+        return False
+    parent = node.parent
+    while parent is not None:
+        if parent.type == "compound_statement":
+            return True
+        parent = parent.parent
+    return False
+
+
 def _kind_from_capture(capture_name: str) -> str:
     """Map tree-sitter capture names to symbol kinds."""
     prefix = capture_name.split(".")[0]
@@ -1391,6 +1877,38 @@ def _kind_from_capture(capture_name: str) -> str:
         "impl": "impl",
         "template": "template",
         "field_fn": "method",  # method declarations in class bodies (headers)
+        # C++ methods defined inside their class body
+        "inline_method": "method",
+        "ptrinline": "method",
+        "ptrinline2": "method",
+        # An operator is a method or a free function depending on where it
+        # sits; _in_class_body turns these into methods inside a class.
+        "inline_op": "function",
+        "refop": "function",
+        "ptrop": "function",
+        "field_op": "method",
+        "reffield_op": "method",
+        "ptrfield_op": "method",
+        "opproto": "prototype",
+        "refopproto": "prototype",
+        "conv": "method",
+        "convdecl": "method",
+        "qconv": "method",
+        "ptrop2": "function",
+        "ptropproto": "prototype",
+        "ptropproto2": "prototype",
+        "ptrrefproto": "prototype",
+        "ptrreffield": "method",
+        "ptrreffn": "function",
+        "ptrrefinline": "method",
+        "ptrrefmethod": "method",
+        "inline_dtor": "method",
+        # C++ definitions and declarations returning a reference
+        "reffn": "function",
+        "refmethod": "method",
+        "refinline": "method",
+        "refproto": "prototype",
+        "reffield_fn": "method",
         "var": "function",     # arrow functions
         "var2": "function",
         "ctor": "function",    # C# constructors
@@ -1415,10 +1933,12 @@ def _get_enclosing_scope(node: Node) -> list[str]:
     defined inside namespace myapp { namespace util { class ConfigManager { ... } } }
     """
     scopes: list[str] = []
+    previous = node
     current = node.parent
     while current is not None:
         if current.type in (
             "namespace_definition", "class_specifier", "struct_specifier",
+            "union_specifier",
             "class_definition",  # Python
             "class_declaration", "namespace_declaration",  # C#
         ):
@@ -1426,13 +1946,16 @@ def _get_enclosing_scope(node: Node) -> list[str]:
             if name_node:
                 scopes.append(name_node.text.decode("utf-8", errors="replace"))
         elif current.type == "template_declaration":
-            # Look for named child inside the template
+            # Look for named child inside the template — unless the walk just
+            # came up through it: that class is already in the scopes, and
+            # adding it again named a template's members `Holder::Holder::f`.
             for child in current.children:
-                if child.type in ("class_specifier", "struct_specifier"):
+                if child.type in ("class_specifier", "struct_specifier", "union_specifier"):
                     name_node = child.child_by_field_name("name")
-                    if name_node:
+                    if name_node and child != previous:
                         scopes.append(name_node.text.decode("utf-8", errors="replace"))
                     break
+        previous = current
         current = current.parent
     scopes.reverse()
     return scopes
@@ -1472,6 +1995,82 @@ def _build_qualified_name(symbol_name: str | None, node: Node, lang: str) -> str
         return symbol_name
 
 
+_DECLARATOR_NAME_TYPES = frozenset({
+    "identifier", "field_identifier", "qualified_identifier", "operator_name",
+    "destructor_name", "type_identifier",
+})
+
+
+def _conversion_of(node: Node) -> Node | None:
+    """The operator_cast a name node stands for, through any number of
+    qualification levels (`ns::Box::operator int`), or None."""
+    while node is not None and node.type == "qualified_identifier":
+        node = node.child_by_field_name("name")
+    return node if node is not None and node.type == "operator_cast" else None
+
+
+def _names_a_conversion(node: Node) -> bool:
+    """Whether a name node is a conversion operator, qualified or not."""
+    return _conversion_of(node) is not None
+
+
+def _operator_cast_name(node: Node) -> str:
+    """`operator const char*() const` -> "operator const char*".
+
+    The name is everything before the conversion's own parameter list — found
+    in the tree, not by the first `(`, which may belong to the target type
+    (`operator Callback<void(int)>`) or to the scope. The target type alone
+    would drop its pointer, reference and const. A qualified definition keeps
+    its scope: `ns::Box::operator bool`.
+    """
+    cast = _conversion_of(node)
+    declarator = cast.child_by_field_name("declarator") if cast is not None else None
+    while declarator is not None and declarator.type != "abstract_function_declarator":
+        inner = declarator.child_by_field_name("declarator")
+        if inner is None:
+            inner = next((c for c in declarator.named_children
+                          if c.type.endswith("declarator")), None)
+        declarator = inner
+    parameters = (declarator.child_by_field_name("parameters")
+                  if declarator is not None else None)
+    end = parameters.start_byte if parameters is not None else node.end_byte
+    text = node.text[:end - node.start_byte]
+    return " ".join(text.decode("utf-8", errors="replace").split())
+
+
+def _declarator_name(node: Node | None) -> str | None:
+    """The name a C/C++ declarator declares, through any pointer, reference or
+    function declarator around it.
+
+    A reference_declarator holds its inner declarator without a field name,
+    so the walk falls back on its first named declarator child.
+    """
+    while node is not None:
+        if _names_a_conversion(node):
+            return _operator_cast_name(node)
+        if node.type in _DECLARATOR_NAME_TYPES:
+            return node.text.decode("utf-8", errors="replace")
+        inner = node.child_by_field_name("declarator")
+        if inner is None:
+            inner = next((child for child in node.named_children
+                          if child.type.endswith("declarator")
+                          or child.type in _DECLARATOR_NAME_TYPES
+                          or child.type == "operator_cast"), None)
+        node = inner
+    return None
+
+
+def _in_class_body(node: Node) -> bool:
+    """Whether a C++ definition sits in a class body — through a template, or
+    through the #if blocks a class body may hold — and so is a method,
+    whatever pattern matched it."""
+    parent = node.parent
+    while parent is not None and (parent.type == "template_declaration"
+                                  or parent.type.startswith("preproc_")):
+        parent = parent.parent
+    return parent is not None and parent.type == "field_declaration_list"
+
+
 def _extract_template_name(node: Node) -> str | None:
     """Extract the name from a template_declaration's inner declaration.
 
@@ -1484,22 +2083,14 @@ def _extract_template_name(node: Node) -> str | None:
             name_node = child.child_by_field_name("name")
             if name_node:
                 return name_node.text.decode("utf-8", errors="replace")
-        elif child.type == "function_definition":
+        elif child.type in ("function_definition", "declaration"):
+            # A function, a template variable or a forward declaration. The
+            # name can sit under pointer and reference declarators — reading
+            # the declarator's own text named `T& pick()` "& pick()".
             declarator = child.child_by_field_name("declarator")
             if declarator:
-                # Could be function_declarator -> identifier or qualified_identifier
-                inner = declarator.child_by_field_name("declarator")
-                if inner:
-                    return inner.text.decode("utf-8", errors="replace")
-                return declarator.text.decode("utf-8", errors="replace")
-        elif child.type == "declaration":
-            # Template variable or forward declaration
-            declarator = child.child_by_field_name("declarator")
-            if declarator:
-                inner = declarator.child_by_field_name("declarator")
-                if inner:
-                    return inner.text.decode("utf-8", errors="replace")
-                return declarator.text.decode("utf-8", errors="replace")
+                return (_declarator_name(declarator)
+                        or declarator.text.decode("utf-8", errors="replace"))
         elif child.type == "alias_declaration":
             name_node = child.child_by_field_name("name")
             if name_node:
@@ -1995,42 +2586,186 @@ class Indexer:
         tree = parser.parse(source)
         root = tree.root_node
 
-        cursor = QueryCursor(query)
-        matches = cursor.matches(root)
-
         # First pass: collect all symbol info
-        raw_symbols: list[tuple[Node, str, str | None]] = []  # (def_node, kind, name)
+        def collect(node: Node) -> list[tuple[Node, str, str | None]]:
+            found: list[tuple[Node, str, str | None]] = []  # (def_node, kind, name)
+            for _pattern_idx, match_captures in QueryCursor(query).matches(node):
+                def_node = None
+                symbol_name = None
+                kind = "unknown"
 
-        for _pattern_idx, match_captures in matches:
-            def_node = None
-            symbol_name = None
-            kind = "unknown"
+                for capture_name, nodes in match_captures.items():
+                    if capture_name.endswith(".def") and nodes:
+                        def_node = nodes[0]
+                        kind = _kind_from_capture(capture_name)
+                    elif capture_name.endswith(".name") and nodes:
+                        if _names_a_conversion(nodes[0]):
+                            symbol_name = _operator_cast_name(nodes[0])
+                        else:
+                            symbol_name = nodes[0].text.decode("utf-8", errors="replace")
 
-            for capture_name, nodes in match_captures.items():
-                if capture_name.endswith(".def") and nodes:
-                    def_node = nodes[0]
-                    kind = _kind_from_capture(capture_name)
-                elif capture_name.endswith(".name") and nodes:
-                    symbol_name = nodes[0].text.decode("utf-8", errors="replace")
+                if def_node is None:
+                    continue
 
-            if def_node is None:
-                continue
+                # In C++ the same shape defines a free function or a method; where
+                # it sits decides — a class body, a template one included.
+                if lang == "cpp" and kind == "function" and _in_class_body(def_node):
+                    kind = "method"
 
-            # For templates without a name, extract from the inner declaration
-            if symbol_name is None and kind == "template":
-                symbol_name = _extract_template_name(def_node)
+                # For templates without a name, extract from the inner declaration
+                if symbol_name is None and kind == "template":
+                    symbol_name = _extract_template_name(def_node)
 
-            # Error recovery inserts MISSING nodes whose text is empty, and a
-            # path left dangling by one — `M. = function() end` — ends on its
-            # separator. An empty name is not NULL, so it would slip past every
-            # IS NOT NULL filter and reach the name index.
-            if symbol_name == "" or (symbol_name or "").endswith((".", ":")):
-                continue
+                # Error recovery inserts MISSING nodes whose text is empty, and a
+                # path left dangling by one — `M. = function() end` — ends on its
+                # separator. An empty name is not NULL, so it would slip past every
+                # IS NOT NULL filter and reach the name index.
+                if symbol_name == "" or (symbol_name or "").endswith((".", ":")):
+                    continue
 
-            if lang == "lua" and _lua_nameless_definition(def_node):
-                continue
+                if lang == "lua" and _lua_nameless_definition(def_node):
+                    continue
 
-            raw_symbols.append((def_node, kind, symbol_name))
+                # A keyword-named definition is error recovery's work — a statement
+                # read as a definition — except for a macro, which may legally
+                # redefine a keyword. A C keyword names nothing in either language
+                # and is always dropped. A word only C++ reserves (`new`, `class`)
+                # is a valid C name, and C headers are often read as C++: it is
+                # dropped only as a function read inside another function's body
+                # (the `catch` of a try chain cut by #if).
+                if kind != "macro" and symbol_name in _RESERVED_NAMES.get(lang, ()) and (
+                        symbol_name in _C_KEYWORDS
+                        or _function_inside_a_function(def_node, kind)):
+                    continue
+
+                # `MACRO_TYPE(f32, s16) mField;` declares a variable whose type a
+                # macro spells; the parser reads the macro as a function.
+                if (lang in ("c", "cpp") and kind in ("function", "prototype")
+                        and symbol_name and _macro_typed_declaration(def_node, symbol_name)):
+                    continue
+
+                found.append((def_node, kind, symbol_name))
+            return found
+
+        raw_symbols = collect(root)
+
+        # A conditional that splits a brace across its branches breaks the
+        # parse: the definitions it catches are lost, cut short, or run on
+        # over the ones after them. Where the damage shows up is not reliable
+        # — an ERROR node, MISSING nodes, or loose top-level fragments that
+        # carry no error flag at all while the error surfaces elsewhere — so
+        # it is not located. The file is parsed a second time with only the
+        # first branch of each conditional, and a definition whose extent
+        # that second parse reads soundly is trusted (see _extent_is_sound).
+        #
+        # It completes the original parse and never replaces it wholesale:
+        # the reparse sees one branch, so a variant in an #else — one
+        # definition per platform, an alternative macro — exists only in the
+        # original. A definition both parses find keeps the reparse's extent
+        # when the two differ, since that is the one the braces give. They
+        # are the same definition when they share kind, name and start — or
+        # kind, name and end: a header written once per branch over one
+        # shared body starts the two symbols on different lines. A different
+        # name is never the same definition. When the name itself differs per
+        # branch, both names are real and both are kept; and an original that
+        # ran on to the end of another definition must not be taken for it.
+        recovered_nodes: set[int] = set()
+        shared_bodies: dict[int, int] = {}  # id(def_node) -> end byte of the shared body
+        if lang in _PREPROCESSED_LANGS and root.has_error and not _CONDITIONAL_RE.search(source):
+            raw_symbols = _extend_to_braces(raw_symbols, source, lambda: _brace_view(source))
+        elif (lang in _PREPROCESSED_LANGS and root.has_error
+                and _CONDITIONAL_RE.search(source)):
+            recovery_tree = parser.parse(_first_branch_only(source))
+            recovered = [sym for sym in collect(recovery_tree.root_node)
+                         if _extent_is_sound(sym[0])]
+            by_start = {(k, n, node.start_byte): i for i, (node, k, n) in enumerate(recovered)}
+            by_end = {(k, n, node.end_byte): i for i, (node, k, n) in enumerate(recovered)}
+            by_span = {(n, node.start_byte, node.end_byte): i
+                       for i, (node, _k, n) in enumerate(recovered)}
+            # Proof that an original ran on over something: a function the reparse
+            # reads at top level. A struct, an enum or a macro local to a function
+            # sits in its tail in both parses and proves nothing.
+            recovered_starts = sorted(node.start_byte for node, kind, _name in recovered
+                                      if kind in _CALLABLE_KINDS_CPP and _at_top_level(node)
+                                      and _looks_like_a_function(node))
+            used: set[int] = set()
+            merged = []
+            for sym in raw_symbols:
+                node, kind, name = sym
+                for key, index in (((kind, name, node.start_byte), by_start),
+                                   ((kind, name, node.end_byte), by_end)):
+                    i = index.get(key)
+                    if i is not None and i not in used:
+                        used.add(i)
+                        twin = recovered[i][0]
+                        # The reparse keeps each conditional's FIRST branch,
+                        # which is not always the live one (`#if 0`), and
+                        # can close one brace more than the real code. So it
+                        # may extend a definition the original parse cut
+                        # short, but it shortens one only when the original
+                        # demonstrably ran on: it never closed (tree-sitter
+                        # made its closing brace up), or the part the reparse
+                        # drops holds another function. A tail of mere
+                        # statements after a real closing brace means the
+                        # reparse ended too early.
+                        if (twin.start_byte, twin.end_byte) != (node.start_byte, node.end_byte):
+                            grows = (twin.start_byte <= node.start_byte
+                                     and twin.end_byte >= node.end_byte)
+                            first = bisect.bisect_left(recovered_starts, twin.end_byte)
+                            swallowed = (first < len(recovered_starts)
+                                         and recovered_starts[first] < node.end_byte)
+                            if (grows or not _closes_for_real(node)
+                                    or (swallowed and kind in _CALLABLE_KINDS_CPP)):
+                                sym = recovered[i]
+                                recovered_nodes.add(id(twin))
+                        elif _under_error(node) and not _under_error(twin):
+                            # Same extent, but the split elsewhere broke the
+                            # class around it in the original parse: only
+                            # the reparse knows the class it belongs to.
+                            sym = recovered[i]
+                            recovered_nodes.add(id(twin))
+                        break
+                else:
+                    # One definition read as two kinds: a class head broken
+                    # by a conditional (`class C #if X : public B #endif {`)
+                    # leaves its members at file scope in the original parse
+                    # — functions and prototypes — where the reparse reads
+                    # the class and its methods. Same name, same extent: the
+                    # same definition, named by the parse that read the class.
+                    i = by_span.get((name, node.start_byte, node.end_byte))
+                    if i is not None and i not in used:
+                        used.add(i)
+                        sym = recovered[i]
+                        recovered_nodes.add(id(sym[0]))
+                merged.append(sym)
+            added = [sym for i, sym in enumerate(recovered) if i not in used]
+            recovered_nodes.update(id(sym[0]) for sym in added)
+            raw_symbols = merged + added
+            # Extended once both parses are merged, so that no definition
+            # either of them kept is covered.
+            extended = _extend_to_braces(raw_symbols, source, lambda: _brace_view(source))
+            recovered_nodes.update(id(new[0]) for old, new in zip(raw_symbols, extended)
+                                   if new[0] is not old[0] and id(old[0]) in recovered_nodes)
+            raw_symbols = extended
+
+            # Symbols of one kind that end on the same byte under different
+            # names, one of them from the reparse, name one body: the name
+            # differs per branch, or an original ran on to the end of another
+            # definition. Each one's text holds the other's name, which the
+            # edge builder must not read as a call — so mark them here, where
+            # it is known, rather than guess later.
+            bodies: dict[tuple[str, int], list[tuple[Node, str, str | None]]] = {}
+            for sym in raw_symbols:
+                bodies.setdefault((sym[1], sym[0].end_byte), []).append(sym)
+            shared_bodies = {
+                id(sym[0]): end for (_kind, end), group in bodies.items()
+                if len({s[2] for s in group}) > 1
+                and any(id(s[0]) in recovered_nodes for s in group)
+                for sym in group
+            }
+            # Containers before what they contain: the second pass finds a
+            # parent among the symbols already inserted.
+            raw_symbols.sort(key=lambda sym: (sym[0].start_byte, -sym[0].end_byte))
 
         # Second pass: insert symbols and track parent-child relationships
         # Track container symbols (classes, structs, namespaces) by their byte ranges
@@ -2040,11 +2775,18 @@ class Indexer:
         count = 0
 
         for def_node, kind, symbol_name in raw_symbols:
-            content_text = def_node.text.decode("utf-8", errors="replace")
+            # From the file, not from the node: a node recovered from the
+            # reparse would otherwise store its body with the later branches
+            # blanked out.
+            body_bytes = source[def_node.start_byte:def_node.end_byte]
+            content_text = body_bytes.decode("utf-8", errors="replace")
             doc = _extract_doc_comment(source, def_node)
             sig = _extract_signature(source, def_node, lang)
+            if sig and id(def_node) in recovered_nodes:
+                # Read from the reparse, where the directives and the other
+                # branches left runs of blanks.
+                sig = " ".join(sig.split())
 
-            body_bytes = def_node.text
             body_h = hashlib.sha256(body_bytes).hexdigest()[:16]
 
             # Find parent: look for the tightest container that encloses this symbol
@@ -2074,6 +2816,8 @@ class Indexer:
                 body_hash=body_h,
                 line_count=def_node.end_point[0] - def_node.start_point[0] + 1,
                 parent_symbol_id=parent_id,
+                metadata=({"shared_body": shared_bodies[id(def_node)]}
+                          if id(def_node) in shared_bodies else None),
             )
 
             sym_id = self.db.insert_symbol(sym, rel_path)
@@ -2243,7 +2987,8 @@ class Indexer:
         excluded = _doc_languages()
         placeholders = ",".join("?" * len(excluded))
         rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.signature, f.path as file_path,
+            f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.signature, s.metadata,
+                      f.path as file_path,
                       (f.language IN ('c', 'cpp') AND s.kind IN ('class', 'struct', 'union'))
                        AS c_class,
                       instr(s.content, '{{') = 0 AS bodiless
@@ -2258,7 +3003,7 @@ class Indexer:
             name = row["name"]
             info = {"id": row["id"], "file": row["file_path"].replace("\\", "/"),
                     "kind": row["kind"], "qualified": row["qualified_name"],
-                    "signature": row["signature"],
+                    "signature": row["signature"], "body": _shared_body(row["metadata"]),
                     # `class Heap;`: a forward declaration, or a definition.
                     "forward": bool(row["c_class"] and row["bodiless"]),
                     "c_class_body": bool(row["c_class"] and not row["bodiless"])}
@@ -2374,8 +3119,8 @@ class Indexer:
         edge_count = 0
 
         content_rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.content, s.file_id,
-                      s.start_line, s.end_line, f.path as file_path, f.language
+            f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.content, s.metadata,
+                      s.file_id, s.start_line, s.end_line, f.path as file_path, f.language
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
@@ -2481,6 +3226,10 @@ class Indexer:
                     referenced_names.add(qualifier)
 
             imported = _imports_for(row["file_path"], row["language"])
+            # Names the #if/#else recovery put over one shared body each hold
+            # the other's name; the extractor marked them, and between them
+            # that is not a call.
+            body = _shared_body(row["metadata"])
             # In C and C++ the way a name is written narrows what it reaches,
             # and a name the symbol declares for itself is no reference.
             c_family = row["language"] in ("c", "cpp")
@@ -2554,7 +3303,9 @@ class Indexer:
                                 and t["kind"] in ("method", "prototype", "function", "template"))
                                if _is_constructor(t, ref_name)
                                else t["kind"] in _EDGE_TARGET_KINDS)
-                           and not _macro_misread(t)]
+                           and not _macro_misread(t)
+                           and not (body is not None and t["body"] == body
+                                    and t["file"] == source_file)]
                 targets = _without_forward_declarations(targets, source_file)
                 decided = None
                 if c_family and targets:

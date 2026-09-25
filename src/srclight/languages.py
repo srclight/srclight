@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from tree_sitter import Language
@@ -169,6 +170,170 @@ _CPP_QUERY = """
 (field_declaration
     declarator: (function_declarator
         declarator: (field_identifier) @field_fn.name)) @field_fn.def
+
+; A method defined inside its class body is named by a field_identifier —
+; neither an identifier (free function) nor a qualified_identifier (method
+; defined outside the class). The same goes for an operator or a destructor
+; defined there.
+(function_definition
+    declarator: (function_declarator
+        declarator: (field_identifier) @inline_method.name)) @inline_method.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (field_identifier) @ptrinline.name))) @ptrinline.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (field_identifier) @ptrinline2.name)))) @ptrinline2.def
+
+(function_definition
+    declarator: (function_declarator
+        declarator: (operator_name) @inline_op.name)) @inline_op.def
+
+(function_definition
+    declarator: (function_declarator
+        declarator: (destructor_name) @inline_dtor.name)) @inline_dtor.def
+
+; A `T&` (or `T&&`) return type wraps the declarator in a reference_declarator,
+; and its child carries no field name, so it is matched positionally.
+(function_definition
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (identifier) @reffn.name))) @reffn.def
+
+(function_definition
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (qualified_identifier) @refmethod.name))) @refmethod.def
+
+(function_definition
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (field_identifier) @refinline.name))) @refinline.def
+
+(declaration
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (identifier) @refproto.name))) @refproto.def
+
+(field_declaration
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (field_identifier) @reffield_fn.name))) @reffield_fn.def
+
+; Operators returning a reference or a pointer — `T& operator[]`,
+; `T* operator->`, `Stream& operator<<` — the most common operator shapes.
+; Whether a definition is a method or a free function is decided by where it
+; sits (see _in_class_body), not by the pattern.
+(function_definition
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (operator_name) @refop.name))) @refop.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (operator_name) @ptrop.name))) @ptrop.def
+
+; Operators declared in their class, and free operators declared.
+(field_declaration
+    declarator: (function_declarator
+        declarator: (operator_name) @field_op.name)) @field_op.def
+
+(field_declaration
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (operator_name) @reffield_op.name))) @reffield_op.def
+
+(field_declaration
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (operator_name) @ptrfield_op.name))) @ptrfield_op.def
+
+(declaration
+    declarator: (function_declarator
+        declarator: (operator_name) @opproto.name)) @opproto.def
+
+(declaration
+    declarator: (reference_declarator
+        (function_declarator
+            declarator: (operator_name) @refopproto.name))) @refopproto.def
+
+; A conversion operator, `operator bool() const`, is named by an operator_cast:
+; defined in its class, declared there (a plain declaration), or defined
+; outside it under a qualified name.
+(function_definition
+    declarator: (operator_cast) @conv.name) @conv.def
+
+(declaration
+    declarator: (operator_cast) @convdecl.name) @convdecl.def
+
+; Any qualified declarator directly under a definition is a conversion
+; operator — an ordinary method's sits under a function_declarator — however
+; many levels its qualification has (`ns::Box::operator int`).
+(function_definition
+    declarator: (qualified_identifier) @qconv.name) @qconv.def
+
+; `T** operator&()`, and a free operator declared returning a pointer.
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (operator_name) @ptrop2.name)))) @ptrop2.def
+
+(declaration
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (operator_name) @ptropproto.name))) @ptropproto.def
+
+(declaration
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (operator_name) @ptropproto2.name)))) @ptropproto2.def
+
+; `T*& f();` declared, at file scope or in a class.
+(declaration
+    declarator: (pointer_declarator
+        declarator: (reference_declarator
+            (function_declarator
+                declarator: (identifier) @ptrrefproto.name)))) @ptrrefproto.def
+
+(field_declaration
+    declarator: (pointer_declarator
+        declarator: (reference_declarator
+            (function_declarator
+                declarator: (field_identifier) @ptrreffield.name)))) @ptrreffield.def
+
+; A reference to a pointer, `T*& f()`: the pointer wraps the reference.
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (reference_declarator
+            (function_declarator
+                declarator: (identifier) @ptrreffn.name)))) @ptrreffn.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (reference_declarator
+            (function_declarator
+                declarator: (field_identifier) @ptrrefinline.name)))) @ptrrefinline.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (reference_declarator
+            (function_declarator
+                declarator: (qualified_identifier) @ptrrefmethod.name)))) @ptrrefmethod.def
+
+; Macros, as in C: a header read as C++ holds as many as one read as C.
+(preproc_function_def
+    name: (identifier) @macro.name) @macro.def
+
+(preproc_def
+    name: (identifier) @define.name) @define.def
 """
 
 _JS_QUERY = """
@@ -681,6 +846,31 @@ def detect_language_by_filename(path: Path) -> str | None:
     return _FILENAME_TO_LANG.get(path.name)
 
 
+# Strings and character literals first, so a `/*` inside one — "logs/*" —
+# opens no comment that would swallow the code up to the next `*/`.
+_C_COMMENT_RE = re.compile(
+    r'"(?:\\.|[^"\\\n])*"' r"|'(?:\\.|[^'\\\n])*'" r"|(/\*.*?\*/|//[^\n]*)",
+    re.DOTALL,
+)
+
+
+def _without_c_comments(text: str) -> str:
+    """The text with its comments removed: a comment may mention a class."""
+    return _C_COMMENT_RE.sub(lambda m: " " if m.group(1) else m.group(0), text)
+
+
+# Constructs that only C++ writes, looked for past a header's head.
+_CPP_CONSTRUCT_RE = re.compile(
+    r"^[ \t]*(?:template\s*<"
+    r"|(?:class|struct)\s+[A-Za-z_]\w*\s*(?:final\s*)?:\s*(?:public|protected|private|virtual)\b"
+    r"|class\s+[A-Za-z_]\w*\s*[{;]"
+    r"|namespace\s+[A-Za-z_]\w*\s*\{"
+    r"|(?:public|protected|private)\s*:"
+    r"|extern\s+\"C\+\+\")",
+    re.MULTILINE,
+)
+
+
 def detect_language(path: Path) -> str | None:
     """Detect language from file extension or filename."""
     # Check exact filename first (e.g. CMakeLists.txt)
@@ -699,6 +889,15 @@ def detect_language(path: Path) -> str | None:
     if suffix == ".h" and lang == "c":
         head = _read_head(path)
         if head and any(ind in head for ind in _CPP_INDICATORS):
+            return "cpp"
+        # A header may open with pages of C-compatible declarations and
+        # reach its first class far below the head. Read as C, the class and
+        # its inline methods vanish, so more of the file is looked at — for
+        # constructs no C header writes. Bounded: a header can be a
+        # generated table of any size.
+        if head and len(head) >= 4096:
+            head = _read_head(path, 4 << 20)
+        if head and _CPP_CONSTRUCT_RE.search(_without_c_comments(head)):
             return "cpp"
 
     return lang
