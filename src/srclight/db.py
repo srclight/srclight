@@ -792,8 +792,8 @@ class Database:
         return [self._row_to_symbol(r) for r in rows]
 
     def _names_a_type(self, qualified_name: str) -> bool:
-        """Whether a class, struct or union is indexed under exactly this
-        qualified name."""
+        """Whether a class, struct, union or class template is indexed under
+        exactly this qualified name."""
         assert self.conn is not None
         return self.conn.execute(
             """SELECT 1 FROM symbols

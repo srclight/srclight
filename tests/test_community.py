@@ -365,3 +365,49 @@ def test_an_entry_point_is_seen_in_a_later_flow_of_the_same_label(db):
     result = compute_impact(db, login, {}, flows)
     assert result["is_entry_point"] is True
     assert result["affected_flows"] == ["login -> validate_password"]
+
+
+def _symbol(db, file_id, path, kind, name, qualified, line):
+    return db.insert_symbol(SymbolRecord(
+        file_id=file_id, kind=kind, name=name, qualified_name=qualified,
+        start_line=line, end_line=line + 2, content=f"{name}()",
+    ), file_path=path)
+
+
+def test_impact_of_a_split_entity_leaves_out_its_internal_calls(db):
+    """A method declared in one file and defined in another is one entity.
+
+    The definition calling its own declaration is no dependent of it; the
+    callers of either half are.
+    """
+    from srclight.community import compute_impact
+
+    header = db.upsert_file(FileRecord(path="gauge.h", content_hash="h", mtime=1.0,
+                                       language="cpp", size=10, line_count=5))
+    source = db.upsert_file(FileRecord(path="gauge.cpp", content_hash="c", mtime=1.0,
+                                       language="cpp", size=10, line_count=20))
+    decl = _symbol(db, header, "gauge.h", "prototype", "refresh", "Gauge::refresh", 1)
+    defn = _symbol(db, source, "gauge.cpp", "method", "Gauge::refresh", "Gauge::refresh", 1)
+    via_decl = _symbol(db, source, "gauge.cpp", "function", "drawPanel", "drawPanel", 5)
+    via_defn = _symbol(db, source, "gauge.cpp", "function", "tickPanel", "tickPanel", 9)
+    db.insert_edge(EdgeRecord(source_id=defn, target_id=decl, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=via_decl, target_id=decl, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=via_defn, target_id=defn, edge_type="calls"))
+    db.commit()
+
+    result = compute_impact(db, defn, {}, [], also=[decl])
+
+    assert result["direct_dependents"] == 2
+    assert result["transitive_dependents"] == 2
+
+
+def test_impact_of_a_single_symbol_still_counts_its_recursive_call(db):
+    from srclight.community import compute_impact
+
+    source = db.upsert_file(FileRecord(path="walk.c", content_hash="w", mtime=1.0,
+                                       language="c", size=10, line_count=10))
+    walk = _symbol(db, source, "walk.c", "function", "walkTree", "walkTree", 1)
+    db.insert_edge(EdgeRecord(source_id=walk, target_id=walk, edge_type="calls"))
+    db.commit()
+
+    assert compute_impact(db, walk, {}, [])["direct_dependents"] == 1
