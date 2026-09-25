@@ -778,7 +778,10 @@ _IDENT_RE = re.compile(r"(?:[^\W\d]|\$)[\w$]*")
 
 
 _TEMPLATE_ARGS_RE = re.compile(r"<[^<>(){};|&]*(?:<[^<>(){};|&]*>[^<>(){};|&]*)*>")
-_C_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n]){1,4}\'')
+# Literals and comments, read left to right: `"http://x"` is a string, and
+# `// "a,b"` a comment.
+_SIGNATURE_NOISE_RE = re.compile(
+    r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n]){1,4}\'|//[^\n]*|/\*[\s\S]*?\*/')
 
 
 def _literals_as_values(original: str, masked: str) -> str:
@@ -787,10 +790,13 @@ def _literals_as_values(original: str, masked: str) -> str:
     Blanked, `f("x")` reads as a call with no argument. The literal's span
     is filled with `0`, which names nothing and is no bracket or comma. A
     span masking did not blank entirely is left alone: a quote in code, or
-    across a comment's edge, is no literal to restore.
+    across a comment's edge, is no literal to restore. Comments are read in
+    the same pass, so a literal inside one, `f(/* "x" */)`, stays blank.
     """
     out = None
-    for m in _C_LITERAL_RE.finditer(original):
+    for m in _SIGNATURE_NOISE_RE.finditer(original):
+        if m.group(0).startswith("/"):
+            continue
         if masked[m.start():m.end()].isspace():
             if out is None:
                 out = list(masked)
@@ -834,6 +840,9 @@ def _param_range(signature: str | None, name: str) -> tuple[int, float] | None:
     counted — or None when the signature cannot say."""
     if not signature:
         return None
+    # A comma in a comment or a default string, `s = "a,b"`, parts nothing.
+    signature = _SIGNATURE_NOISE_RE.sub(
+        lambda m: " " if m.group(0).startswith("/") else "0", signature)
     m = re.search(rf"(?<![\w$]){re.escape(name)}\s*\(", signature)
     if m is None:
         return None
@@ -994,7 +1003,10 @@ def _is_constructor(t: dict, name: str) -> bool:
     if t.get("kind") not in ("method", "prototype", "function", "template"):
         return False
     short = name.rsplit("::", 1)[-1]
-    return _without_template_args(t.get("qualified") or "").endswith(f"{short}::{short}")
+    own = f"{short}::{short}"
+    qualified = _without_template_args(t.get("qualified") or "")
+    # Whole names: `MyBox::Box` is a method, not a constructor of `Box`.
+    return qualified == own or qualified.endswith("::" + own)
 
 
 def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
