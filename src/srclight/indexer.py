@@ -869,6 +869,8 @@ class Indexer:
         """
         root = root or self.config.root
         root = root.resolve()
+        # Read by _build_embeddings, whose signature stays that of the hook.
+        self._on_phase = on_phase
         stats = IndexStats()
         start = time.monotonic()
 
@@ -1050,6 +1052,8 @@ class Indexer:
         # Build embeddings (optional, only if a model is configured or known)
         embed_model = resolve_embed_model(self.db, self.config)
         if embed_model:
+            if on_phase:
+                on_phase("Embedding new and changed symbols")
             stats.symbols_embedded = self._build_embeddings(embed_model)
             if stats.symbols_embedded > 0:
                 logger.info("Embedded %d symbols with %s", stats.symbols_embedded, embed_model)
@@ -1678,6 +1682,8 @@ class Indexer:
         """
         from .embeddings import embed_symbols, get_provider
 
+        on_phase = getattr(self, "_on_phase", None)
+
         try:
             provider = get_provider(model_spec)
         except (ValueError, ConnectionError) as e:
@@ -1725,12 +1731,13 @@ class Indexer:
             self.db.remember_embedding_model(provider.name)
 
             # Store embeddings
+            if on_phase:
+                on_phase(f"Saving {len(results)} embeddings")
             dims = provider.dimensions
+            body_hashes = {s["id"]: s["body_hash"] for s in symbols}
             for symbol_id, emb_bytes in results:
-                # Find body_hash from the symbols list
-                sym = next((s for s in symbols if s["id"] == symbol_id), None)
-                body_hash = sym["body_hash"] if sym else None
-                self.db.upsert_embedding(symbol_id, provider.name, dims, emb_bytes, body_hash)
+                self.db.upsert_embedding(symbol_id, provider.name, dims, emb_bytes,
+                                         body_hashes.get(symbol_id))
 
             self.db.commit()
         except Exception as e:
@@ -1747,6 +1754,8 @@ class Indexer:
         if results:
             try:
                 from .vector_cache import VectorCache
+                if on_phase:
+                    on_phase("Rebuilding the vector cache")
                 srclight_dir = self.config.root / ".srclight"
                 cache = VectorCache(srclight_dir)
                 cache.build_from_db(self.db.conn)
