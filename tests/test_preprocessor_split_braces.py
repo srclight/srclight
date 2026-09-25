@@ -999,3 +999,14 @@ int table_size = computeSize();
 }
 """})
     assert not any(n == "first" and e > 7 for n, _s, e in _symbols(db, "sep.cpp"))
+
+
+def test_a_quote_glued_to_a_word_opens_a_literal_only_after_a_keyword_or_prefix():
+    from srclight.indexer import _digit_separator
+
+    assert _digit_separator(b"n = 1'000;", 5)
+    assert _digit_separator(b"v = 0x8000'0000;", 10)
+    assert _digit_separator(b"TAG('w_check'), '{'", 12)
+    assert not _digit_separator(b"case'{':", 4)
+    assert not _digit_separator(b"u8'a'", 2)
+    assert not _digit_separator(b"L'a'", 1)
