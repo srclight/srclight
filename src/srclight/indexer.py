@@ -597,9 +597,11 @@ _DECL_QUALIFIERS = frozenset({
     "inline", "thread_local", "unsigned", "signed", "struct", "class", "union",
     "enum", "typename",
 })
+# A declaration: `Type name`, `ns::Type<int>* name`, followed by `=`, `;`,
+# `,`, `[` or `{`. The type is group 1, with its namespace if written.
 _LOCAL_DECL_RE = re.compile(
-    r"(?<![\w.>:])([A-Za-z_]\w*)(?:\s*<[^;{}()<>]*>)?[\s*&]+([A-Za-z_]\w*)\s*"
-    r"(?=(?:=(?!=))|[;,\[{])")
+    r"(?<![\w.>:])((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)(?:\s*<[^;{}()<>]*>)?[\s*&]+"
+    r"([A-Za-z_]\w*)\s*(?=(?:=(?!=))|[;,\[{])")
 _WORD_BEFORE_RE = re.compile(r"([A-Za-z_]\w*)\s*$")
 _MACRO_PARAMS_RE = re.compile(r"#\s*define\s+\w+\(([^)]*)\)")
 # Words a parameter's type may hold that are no name of its own.
@@ -739,7 +741,8 @@ def _declared_types(content: str, name: str, kind: str) -> dict[str, str]:
                 else:
                     part.append(ch)
     declared: list[tuple[str, str]] = [
-        (m.group(2), m.group(1)) for m in _LOCAL_DECL_RE.finditer(content)
+        (m.group(2), m.group(1).rsplit("::", 1)[-1].strip())
+        for m in _LOCAL_DECL_RE.finditer(content)
         if m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
         and _opens_a_declaration(content, m.start())]
     # A lambda's or a range-for's parameters: `[](Mat* x)`, `for (Mat* x : v)`.
@@ -943,8 +946,14 @@ def _reference_forms_all(content: str, names: set[str],
                 # Used as a type (`Angle a(1)`, `Angle* p`) it says nothing.
                 arities.setdefault(name, set()).add(None)
         member_access = before.endswith(("->", ".")) and not before.endswith("..")
+        # `x.get<int>()` calls; `x.count < 0` compares a field.
+        template_call = False
+        if after.startswith("<"):
+            args = _TEMPLATE_ARGS_RE.match(content, m.end() + len(ahead) - len(ahead.lstrip()))
+            template_call = args is not None and content[
+                args.end():args.end() + 80].lstrip().startswith("(")
         # `(*o->fn)(1)` and `CALL(o->fn)` call what the parenthesis closes on.
-        if member_access and not after.startswith(("(", "<", ")")):
+        if member_access and not (after.startswith(("(", ")")) or template_call):
             forms.add("field")  # `x.flags & mask`: a member read, no call
         elif after.startswith(("->", ".")) and not after.startswith("..."):
             forms.add("object")  # `current.pos`: a value, whatever else it names
