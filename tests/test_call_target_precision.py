@@ -1582,3 +1582,21 @@ struct Record {
 }
 """}, tmp_path)
     assert not any(a.endswith("Record") and b.endswith("owner") for a, b, _ in edges), edges
+
+
+def test_a_python_method_called_on_self_is_its_own_class_method(tmp_path):
+    body = "".join(
+        f"class Widget{i}:\n"
+        f"    def __init__(self):\n"
+        f"        self.render_item()\n\n"
+        f"    def render_item(self):\n"
+        f"        pass\n\n"
+        for i in range(12))
+    body += "class Plain(Widget0):\n    def show(self):\n        self.render_item()\n\n"
+    body += "def render_item():\n    pass\n"
+    edges = _edges({"ui/widgets.py": body}, tmp_path)
+    from_init = {(a, b, r) for a, b, r in edges if a.endswith(".__init__")}
+    assert from_init == {(f"Widget{i}.__init__", f"Widget{i}.render_item", "same_class")
+                         for i in range(12)}, sorted(from_init)[:5]
+    from_show = {b for a, b, _ in edges if a == "Plain.show"}
+    assert "render_item" not in from_show, from_show

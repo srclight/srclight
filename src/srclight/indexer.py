@@ -1033,6 +1033,30 @@ def _is_constructor(t: dict, name: str) -> bool:
     return qualified == own or qualified.endswith("::" + own)
 
 
+def _narrow_python_self_call(targets: list[dict], name: str, content: str,
+                             qualified: str, kind: str) -> tuple[list[dict], str | None]:
+    """In a Python method, `self.name()` and `cls.name()` reach a method:
+    the class's own when it has one, and never a module-level function.
+
+    Only when every use of the name in the body goes through `self` or
+    `cls`; a bare `name()` beside it may be the function.
+    """
+    if kind not in ("function", "method") or "." not in qualified:
+        return targets, None
+    uses = []
+    for m in re.finditer(rf"(?<!\w){re.escape(name)}\b", content):
+        receiver = re.search(r"(\w+)\s*\.\s*$", content[max(0, m.start() - 60):m.start()])
+        uses.append(receiver.group(1) if receiver else None)
+    if not uses or any(u not in ("self", "cls") for u in uses):
+        return targets, None
+    scope = qualified.rsplit(".", 1)[0]
+    own = [t for t in targets if t.get("qualified") == f"{scope}.{name}"]
+    if own:
+        return own, "same_class"
+    methods = [t for t in targets if "." in (t.get("qualified") or "")]
+    return (methods, None) if methods else (targets, None)
+
+
 def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
                       qualifiers: set[str], source_scope: str | None,
                       source_kind: str, source_in_c: bool = False,
@@ -2239,6 +2263,9 @@ class Indexer:
                         arities=arities_of.get(ref_name),
                         receiver_types={var_types.get(v) for v in receivers_of.get(ref_name, ())}
                         or None)
+                elif row["language"] == "python" and targets:
+                    targets, decided = _narrow_python_self_call(
+                        targets, ref_name, content, row["qualified_name"] or "", row["kind"])
                 if not targets:
                     continue
                 if decided:
