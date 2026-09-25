@@ -1882,7 +1882,9 @@ class Indexer:
         excluded = _doc_languages()
         placeholders = ",".join("?" * len(excluded))
         rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.signature, f.path as file_path
+            f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.signature, f.path as file_path,
+                      (f.language IN ('c', 'cpp') AND s.kind IN ('class', 'struct', 'union')
+                       AND instr(s.content, '{{') = 0) AS forward
                FROM symbols s JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
@@ -1894,14 +1896,20 @@ class Indexer:
             name = row["name"]
             info = {"id": row["id"], "file": row["file_path"].replace("\\", "/"),
                     "kind": row["kind"], "qualified": row["qualified_name"],
-                    "signature": row["signature"]}
+                    "signature": row["signature"], "forward": bool(row["forward"])}
             symbol_info[row["id"]] = info
             if name not in name_to_symbols:
                 name_to_symbols[name] = []
             name_to_symbols[name].append(info)
 
+        # A forward declaration, `class Heap;`, names the class defined
+        # elsewhere: beside that definition it is no target of its own, and
+        # a class declared ahead in many headers would look ambiguous.
+        defined_classes = {s["qualified"] for syms in name_to_symbols.values() for s in syms
+                           if s["kind"] in ("class", "struct", "union") and not s["forward"]}
         filtered_names = {
-            name: syms for name, syms in name_to_symbols.items()
+            name: [s for s in syms if not (s["forward"] and s["qualified"] in defined_classes)]
+            for name, syms in name_to_symbols.items()
             if not graph_name_excluded(name)
         }
         # A prototype is no target, but its signature is the function's too:

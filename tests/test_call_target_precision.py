@@ -1282,3 +1282,44 @@ def test_callee_note_counts_calls_after_operators_and_labels():
     for call in ("if (a && ", "x = y * ", "return a > ", "case 1: ", "default: ",
                  "v = ok ? a : "):
         assert not _declares_or_initializes(call), call
+
+
+def test_forward_declarations_do_not_make_a_defined_class_ambiguous(tmp_path):
+    # Declared ahead in many headers, defined in one: the declarations name
+    # the same class, and must not push it past the fan-out limit.
+    files = {"math/point.h": """\
+class Point_c {
+public:
+    Point_c() {}
+    Point_c(float a, float b, float c) {}
+    Point_c(const Point_c& o) {}
+    float x, y, z;
+};
+""", "game/rig.cpp": """\
+void aimRig(float fx, float fy, float fz) {
+    Point_c offset(fx, fy, fz);
+}
+"""}
+    for i in range(12):
+        files[f"part{i}/fwd.h"] = "class Point_c;\nclass Other_c { public: int n; };\n"
+    edges = _edges(files, tmp_path)
+    assert ("aimRig", "Point_c::Point_c", "unique_file") in edges
+    assert ("aimRig", "Point_c", "unique_file") in edges
+
+
+def test_callees_list_constructors_apart_from_their_class(serve):
+    server = serve({"angle.h": """\
+class Turn_c {
+public:
+    Turn_c() {}
+    Turn_c(short v) {}
+    short mV;
+};
+""", "use/use.cpp": """\
+void steer(Turn_c* t) {
+    Turn_c(5);
+}
+"""})
+    callees = json.loads(server.get_callees("steer"))["callees"]
+    kinds = {e["kind"] for e in callees if e["name"] in ("Turn_c", "Turn_c::Turn_c")}
+    assert "class" in kinds and kinds - {"class"}, callees
