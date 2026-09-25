@@ -1002,12 +1002,26 @@ def _short_signature(signature: str | None) -> str | None:
     return flat if len(flat) <= 200 else flat[:197] + "..."
 
 
+def _edge_name(s) -> str:
+    """The name an edge entry is listed under.
+
+    A constructor defined in its class is named like the class: listed by
+    its qualified name, `Box::Box`, it stays apart from the class itself.
+    """
+    short = re.escape((s.name or "").rsplit("::", 1)[-1])
+    qualified = getattr(s, "qualified_name", None) or ""
+    if (s.kind in ("method", "function", "prototype", "template")
+            and re.search(rf"(?:^|::){short}::{short}$", qualified)):
+        return qualified
+    return s.name
+
+
 def _dedup_edges(edges: list[dict]) -> list[dict]:
     """Deduplicate edges by symbol name, keeping the highest-confidence entry."""
     by_name: dict[str, dict] = {}
     for c in edges:
         s = c["symbol"]
-        name = s.name
+        name = _edge_name(s)
         confidence = c["confidence"]
         entry = {
             "name": name,
