@@ -149,16 +149,22 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
 
     indexer = Indexer(db, config)
 
+    line_open = [False]  # a progress line waits for its newline
+
     def on_progress(file: str, current: int, total: int):
         pct = (current / total * 100) if total > 0 else 0
         click.echo(f"\r  [{current}/{total}] {pct:5.1f}% {file[:60]:<60}", nl=False)
+        line_open[0] = True
 
     def on_phase(name: str):
-        click.echo()  # end the progress line
+        if line_open[0]:
+            click.echo()
+            line_open[0] = False
         click.echo(f"  {name}...")
 
     stats = indexer.index(root, on_progress=on_progress, on_phase=on_phase)
-    click.echo()  # newline after progress
+    if line_open[0]:
+        click.echo()
 
     click.echo()
     click.echo(f"  Files scanned:   {stats.files_scanned}")
@@ -602,16 +608,22 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
                 click.echo(f"    Embedding model: {resolved_model} ({origin})")
             indexer = Indexer(db, indexer_config)
 
+            line_open = [False]  # a progress line waits for its newline
+
             def on_progress(file: str, current: int, total: int):
                 pct = (current / total * 100) if total > 0 else 0
                 click.echo(f"\r    [{current}/{total}] {pct:5.1f}% {file[:55]:<55}", nl=False)
+                line_open[0] = True
 
             def on_phase(name: str):
-                click.echo()  # end the progress line
+                if line_open[0]:
+                    click.echo()
+                    line_open[0] = False
                 click.echo(f"    {name}...")
 
             stats = indexer.index(root, on_progress=on_progress, on_phase=on_phase)
-            click.echo()  # newline after progress
+            if line_open[0]:
+                click.echo()
 
             click.echo(f"    {stats.files_scanned} files, {stats.symbols_extracted} symbols, "
                         f"{stats.files_unchanged} unchanged, {stats.elapsed_seconds:.1f}s")

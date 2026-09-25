@@ -47,3 +47,28 @@ def test_the_embedding_steps_are_reported(tmp_path, monkeypatch):
     assert "Embedding new and changed symbols" in phases
     assert any(p.startswith("Saving ") and p.endswith(" embeddings") for p in phases), phases
     assert "Rebuilding the vector cache" in phases
+
+
+def test_the_cli_prints_no_blank_line_between_steps(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from srclight.cli import main
+
+    from srclight import embeddings as embeddings_mod
+    from srclight.embeddings import vector_to_bytes
+
+    class _Stub:
+        name = "stub:model"
+        dimensions = 3
+
+    monkeypatch.setattr(embeddings_mod, "get_provider", lambda spec, **kw: _Stub())
+    monkeypatch.setattr(embeddings_mod, "embed_symbols", lambda provider, symbols, on_progress=None: [
+        (s["id"], vector_to_bytes([0.1, 0.2, 0.3])) for s in symbols])
+    (tmp_path / "a.py").write_text("def alpha():\n    return beta()\n\n\ndef beta():\n    return 1\n")
+    result = CliRunner().invoke(main, ["index", str(tmp_path), "--embed", "stub:model"])
+    assert result.exit_code == 0, result.output
+    lines = result.output.split("\n")
+    steps = [i for i, line in enumerate(lines) if line.strip().endswith("...")]
+    assert steps, result.output
+    for i in steps:
+        assert lines[i - 1].strip(), result.output
