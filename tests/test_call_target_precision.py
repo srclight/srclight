@@ -1506,3 +1506,33 @@ void keepOne(const Boxer& b) {
 """}, tmp_path)
     ctor_callers = {a for a, b, _ in edges if b == "Boxer::Boxer"}
     assert "makeOne" in ctor_callers and "keepOne" not in ctor_callers
+
+
+def test_a_signature_counts_no_comma_inside_a_comment_or_a_literal():
+    from srclight.indexer import _param_range
+
+    assert _param_range("void f(int a, // width, px\n int b)", "f") == (2, 2)
+    assert _param_range("void f(int a, /* (x, y) */ int b)", "f") == (2, 2)
+    assert _param_range('void join(const char* s = "a,b")', "join") == (0, 1)
+    assert _param_range("void sep(char c = ',')", "sep") == (0, 1)
+
+
+def test_a_constructor_is_named_by_whole_names():
+    from srclight.indexer import _is_constructor
+
+    assert _is_constructor({"kind": "method", "qualified": "Box::Box"}, "Box")
+    assert _is_constructor({"kind": "method", "qualified": "ns::Box::Box"}, "Box")
+    assert not _is_constructor({"kind": "method", "qualified": "MyBox::Box"}, "Box")
+
+
+def test_a_literal_inside_a_comment_is_no_argument():
+    from srclight.indexer import _call_arity, _literals_as_values
+    from srclight.refmask import mask_noncode
+
+    text = 'reset(/* "hard" */);'
+    content = _literals_as_values(text, mask_noncode(text, "cpp"))
+    assert _call_arity(content, text.index("(")) == 0
+    text = 'reset("hard");'
+    content = _literals_as_values(text, mask_noncode(text, "cpp"))
+    assert _call_arity(content, text.index("(")) == 1
+
