@@ -723,8 +723,9 @@ def _ends_with_backslash(source: bytes, newline: int) -> bool:
     return j >= 0 and source[j] == 0x5C
 
 
-def _c_comment_bytes(source: bytes) -> bytearray:
-    """Mark the bytes of C/C++ comments with 1, everything else with 0.
+def _c_comment_bytes(source: bytes, literals: bool = False) -> bytearray:
+    """Mark the bytes of C/C++ comments with 1, everything else with 0 — and
+    with `literals`, the bytes of strings and character literals too.
 
     Strings are stepped over, so a `/*` inside one opens nothing — raw
     strings included, which may hold quotes and newlines. A quote opens a
@@ -753,17 +754,25 @@ def _c_comment_bytes(source: bytes) -> bytearray:
                 opening := _RAW_DELIMITER_RE.match(source, i + 1)):  # R"delim( ... )delim"
             closing = b")" + opening.group(1) + b'"'
             end = source.find(closing, opening.end())
-            i = n if end == -1 else end + len(closing)
+            end = n if end == -1 else end + len(closing)
+            if literals:
+                marks[i:end] = b"\x01" * (end - i)
+            i = end
         elif c == 0x22:  # "
+            start = i
             i += 1
             while i < n and source[i] not in (0x22, 0x0A):
                 if source[i] == 0x5C:  # an escape; before a CRLF it splices both bytes
                     i += 3 if source[i + 1:i + 3] == b"\r\n" else 2
                 else:
                     i += 1
-            i += 1
+            i = min(i + 1, n)
+            if literals:
+                marks[start:i] = b"\x01" * (i - start)
         elif c == 0x27:  # '
             literal = _CHAR_LITERAL_RE.match(source, i)
+            if literal and literals:
+                marks[i:literal.end()] = b"\x01" * (literal.end() - i)
             i = literal.end() if literal else i + 1
         else:
             i += 1
@@ -870,6 +879,85 @@ def _closes_for_real(node: Node) -> bool:
     while last.child_count:
         last = last.children[-1]
     return not last.is_missing
+
+
+def _brace_view(source: bytes) -> bytes:
+    """The source as its braces read: the first branch of each conditional,
+    with comments, strings, character literals and preprocessor lines
+    blanked — a brace in any of them is no block. Offsets are the source's."""
+    view = bytearray(_first_branch_only(source))
+    for i, mark in enumerate(_c_comment_bytes(source, literals=True)):
+        if mark and view[i] not in (0x0A, 0x0D):
+            view[i] = 0x20
+    pos = 0
+    continued = False
+    for line in bytes(view).splitlines(keepends=True):
+        end = pos + len(line)
+        body = line.rstrip(b"\r\n")
+        if continued or body.lstrip(b" \t").startswith(b"#"):
+            for i in range(pos, pos + len(body)):
+                view[i] = 0x20
+            continued = body.endswith(b"\\")
+        pos = end
+    return bytes(view)
+
+
+def _brace_close(view: bytes, open_at: int) -> int | None:
+    """The end of the block whose `{` is at `open_at`, or None when it never
+    closes."""
+    depth = 0
+    for i in range(open_at, len(view)):
+        if view[i] == 0x7B:  # {
+            depth += 1
+        elif view[i] == 0x7D:  # }
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return None
+
+
+class _ExtendedNode:
+    """A definition node whose end its braces put further than the parse."""
+
+    def __init__(self, node: Node, end_byte: int, end_point: tuple[int, int]):
+        self._node = node
+        self.end_byte = end_byte
+        self.end_point = end_point
+
+    def __getattr__(self, name):
+        return getattr(self._node, name)
+
+
+def _extend_to_braces(found: list, source: bytes, view_of) -> list:
+    """Let a function end where its braces close.
+
+    A macro the parser cannot read — `PICK(< a, == b)`, or a bare `BLOCK_END`
+    standing for a brace — can make error recovery swallow a closing brace:
+    the function ends early and the rest of its body is left at file scope.
+    Only a definition holding errors is checked, and it is extended only
+    when no other definition starts in the part it gains: an unbalanced
+    brace in the text must never merge two definitions.
+    """
+    view = None
+    starts = None
+    extended = []
+    for sym in found:
+        node, kind, _name = sym
+        body = node.child_by_field_name("body") if node.type == "function_definition" else None
+        if node.has_error and body is not None and body.type == "compound_statement":
+            if view is None:
+                view = view_of()
+                starts = sorted(n.start_byte for n, k, _ in found if k != "macro")
+            close = (_brace_close(view, body.start_byte)
+                     if view[body.start_byte:body.start_byte + 1] == b"{" else None)
+            if close is not None and close > node.end_byte:
+                first = bisect.bisect_left(starts, node.end_byte)
+                if first == len(starts) or starts[first] >= close:
+                    row = source.count(b"\n", 0, close)
+                    column = close - (source.rfind(b"\n", 0, close) + 1)
+                    sym = (_ExtendedNode(node, close, (row, column)), kind, _name)
+        extended.append(sym)
+    return extended
 
 
 def _extent_is_sound(node: Node) -> bool:
@@ -1620,7 +1708,16 @@ class Indexer:
                     continue
 
                 found.append((def_node, kind, symbol_name))
+            if lang in _PREPROCESSED_LANGS:
+                found = _extend_to_braces(found, source, brace_view)
             return found
+
+        view_cache: list[bytes] = []
+
+        def brace_view() -> bytes:
+            if not view_cache:
+                view_cache.append(_brace_view(source))
+            return view_cache[0]
 
         raw_symbols = collect(root)
 

@@ -842,3 +842,80 @@ def test_a_class_with_its_base_under_if_yields_each_member_once(tmp_path, db):
     spans = [(r[0], r[3]) for r in rows]
     assert len(spans) == len(set(spans)) == 3
     assert ("shiftGear", "Stick_c::shiftGear") in {(r[0], r[1]) for r in rows}
+
+
+# A macro the parser cannot read can make its error recovery swallow a
+# closing brace and end the function early: the rest of the body is left at
+# file scope. The braces still say where the function ends.
+MACRO_CUT_SHORT = """\
+#define PICK(a, b) a
+#define BLOCK_END }
+
+void Meter_c::draw() {
+    if (ready) {
+        if (level PICK(< limit + 1, == limit)) {
+            level = -1;
+        }
+    }
+    if (glow > 0.0f) {
+        drawGlow(3);
+    }
+}
+
+void manage() {
+    if (!stopped) {
+        if (!paused) {
+            if (pending) {
+            }
+            BLOCK_END
+            if (!isReady(1)) {
+            } else {
+                clearReady(1);
+            }
+            if (!stepAll()) {
+            }
+        }
+    }
+}
+
+void after() {
+    drawGlow(1);
+}
+"""
+
+
+def test_a_macro_the_parser_cannot_read_does_not_cut_a_function_short(tmp_path, db):
+    _index(tmp_path, db, {"meter.cpp": MACRO_CUT_SHORT})
+    symbols = _symbols(db, "meter.cpp")
+    assert ("Meter_c::draw", 4, 13) in symbols
+    assert ("manage", 15, 29) in symbols
+    assert ("after", 31, 33) in symbols
+
+
+def test_a_function_extended_by_its_braces_calls_from_its_tail(tmp_path, db):
+    _index(tmp_path, db, {"meter.cpp": MACRO_CUT_SHORT + "void drawGlow(int n) {\n}\n"})
+    callers = {r[0] for r in db.conn.execute(
+        """SELECT a.name FROM symbol_edges e JOIN symbols a ON a.id = e.source_id
+           JOIN symbols b ON b.id = e.target_id WHERE b.name = 'drawGlow'""")}
+    assert "Meter_c::draw" in callers
+
+
+def test_unbalanced_braces_never_extend_a_function_over_the_next(tmp_path, db):
+    _index(tmp_path, db, {"open.cpp": """\
+#define PICK(a, b) a
+void first() {
+    if (level PICK(< limit, == limit)) {
+    }
+#if NEW_PATH
+    if (x) {
+#endif
+    step();
+}
+
+void second() {
+    step();
+}
+"""})
+    symbols = _symbols(db, "open.cpp")
+    assert ("second", 11, 13) in symbols
+    assert not any(n == "first" and end >= 11 for n, _s, end in symbols)
