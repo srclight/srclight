@@ -473,11 +473,13 @@ def compute_impact(
     is_entry_point = False
     for flow in flows:
         step_ids = {s["symbol_id"] for s in flow["steps"]}
-        # Several ids can sit in one flow, and flows can share a label.
-        if ids & step_ids and flow["label"] not in affected_flow_labels:
-            affected_flow_labels.append(flow["label"])
+        # Several ids can sit in one flow, and flows can share a label: the
+        # label is listed once, but every flow is checked for its entry.
+        if ids & step_ids:
             if flow["entry_symbol_id"] in ids:
                 is_entry_point = True
+            if flow["label"] not in affected_flow_labels:
+                affected_flow_labels.append(flow["label"])
 
     # Risk scoring
     n_direct = len(direct_ids)
