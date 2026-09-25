@@ -1237,3 +1237,48 @@ void build() {
            JOIN symbols b ON b.id = e.target_id WHERE a.name = 'build' AND b.kind = 'prototype'""")}
     db.close()
     assert sigs == {"Box_c(int w, int h)"}
+
+
+def test_a_namespace_qualified_type_use_reaches_no_constructor(tmp_path):
+    edges = _edges({"tint.h": """\
+namespace paint {
+class Tint {
+public:
+    Tint(int r, int g) {}
+};
+}
+""", "use/use.cpp": """\
+void shade(paint::Tint* p) {
+}
+
+void make() {
+    paint::Tint(1, 2);
+}
+"""}, tmp_path)
+    ctor_callers = {a for a, b, _ in edges if b == "paint::Tint::Tint"}
+    assert "make" in ctor_callers and "shade" not in ctor_callers
+
+
+def test_a_class_named_like_its_namespace_keeps_its_edges(tmp_path):
+    edges = _edges({"gadget.h": """\
+namespace Gadget {
+class Gadget {
+public:
+    int size;
+};
+}
+""", "use/use.cpp": """\
+void tint(Gadget* p) {
+}
+"""}, tmp_path)
+    assert ("tint", "Gadget::Gadget") in _pairs(edges)
+
+
+def test_callee_note_counts_calls_after_operators_and_labels():
+    from srclight.server import _declares_or_initializes
+
+    assert _declares_or_initializes("{\n    Timer ")
+    assert _declares_or_initializes("Box(int v) : ")
+    for call in ("if (a && ", "x = y * ", "return a > ", "case 1: ", "default: ",
+                 "v = ok ? a : "):
+        assert not _declares_or_initializes(call), call

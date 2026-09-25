@@ -964,7 +964,12 @@ def _without_template_args(qualified: str) -> str:
 
 
 def _is_constructor(t: dict, name: str) -> bool:
-    return _without_template_args(t.get("qualified") or "").endswith(f"{name}::{name}")
+    """Whether a target is a constructor of the class `name` (qualified or
+    not). A class named like its namespace, `Gadget::Gadget`, is none."""
+    if t.get("kind") not in ("method", "prototype", "function", "template"):
+        return False
+    short = name.rsplit("::", 1)[-1]
+    return _without_template_args(t.get("qualified") or "").endswith(f"{short}::{short}")
 
 
 def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
