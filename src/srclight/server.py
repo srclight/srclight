@@ -1007,12 +1007,18 @@ def _edge_name(s) -> str:
 
     A constructor defined in its class is named like the class: listed by
     its qualified name, `Box::Box`, it stays apart from the class itself.
+    A class template's constructor, `Bag<T>::Bag` or `Bag::Bag::Bag` in
+    its class, is listed once as `Bag::Bag`.
     """
-    short = re.escape((s.name or "").rsplit("::", 1)[-1])
-    qualified = getattr(s, "qualified_name", None) or ""
+    from .indexer import _without_template_args
+
+    plain = _without_template_args(s.name or "").rsplit("::", 1)[-1]
+    short = re.escape(plain)
+    qualified = _without_template_args(getattr(s, "qualified_name", None) or "")
     if (s.kind in ("method", "function", "prototype", "template")
             and re.search(rf"(?:^|::){short}::{short}$", qualified)):
-        return qualified
+        return re.sub(rf"(?:^|(?<=::)){short}(?:::{short})+$",
+                      lambda _: f"{plain}::{plain}", qualified)
     return s.name
 
 

@@ -1307,6 +1307,103 @@ void aimRig(float fx, float fy, float fz) {
     assert ("aimRig", "Point_c", "unique_file") in edges
 
 
+def test_a_template_constructor_is_listed_once_by_its_plain_name():
+    from srclight.server import _edge_name
+
+    class S:
+        def __init__(self, name, qualified, kind="method"):
+            self.name, self.qualified_name, self.kind = name, qualified, kind
+
+    assert _edge_name(S("Bag", "Bag::Bag::Bag")) == "Bag::Bag"
+    assert _edge_name(S("Bag<T>::Bag", "Bag<T>::Bag")) == "Bag::Bag"
+    assert _edge_name(S("Box", "ns::Box::Box")) == "ns::Box::Box"
+    assert _edge_name(S("Box", "Box", "class")) == "Box"
+    assert _edge_name(S("~Box", "Box::~Box")) == "~Box"
+
+
+def test_forward_declarations_do_not_count_toward_the_graph_note(serve):
+    files = {"math/point.h": """\
+class Point_c {
+public:
+    float x;
+};
+""", "game/rig.cpp": """\
+void aimRig(Point_c* p) {
+}
+"""}
+    for i in range(12):
+        files[f"part{i}/fwd.h"] = "class Point_c;\n"
+    answer = json.loads(serve(files).get_callers("Point_c"))
+    assert "aimRig" in {c["name"] for c in answer["callers"]}
+    assert "graph_note" not in answer, answer.get("graph_note")
+
+
+def test_a_forward_declaration_is_no_target_through_its_namespace(tmp_path):
+    files = {"geo/shape.h": """\
+namespace geo {
+class Shape_c {
+public:
+    int sides;
+};
+}
+""", "draw/pen.h": """\
+namespace geo {
+class Shape_c;
+}
+""", "draw/pen.cpp": """\
+void outline(const geo::Shape_c* s) {
+}
+"""}
+    edges = _edges(files, tmp_path)
+    targets = {(b, r) for a, b, r in edges if a == "outline"}
+    assert targets == {("geo::Shape_c", "unique_file")}, targets
+
+
+def test_a_forward_declaration_in_the_same_file_still_tells_the_class(tmp_path):
+    # The file declares the class it means; the name alone is defined too
+    # often elsewhere to tell.
+    files = {"ui/panel.h": """\
+class Skin_c;
+
+class Panel_c {
+public:
+    virtual void apply(Skin_c* skin) = 0;
+};
+""", "ui/skin/skin.h": """\
+class Skin_c {
+public:
+    int tone;
+};
+"""}
+    for i in range(11):
+        files[f"actor{i}/a.cpp"] = f"enum Skin_c {{ Plain{i}, Other{i} }};\n"
+    edges = _edges(files, tmp_path)
+    assert any(a == "Panel_c::apply" and b == "Skin_c" for a, b, _ in edges), edges
+
+
+def test_a_class_of_another_language_does_not_replace_a_forward_declaration(tmp_path):
+    db_root = tmp_path / "edges"
+    edges = _edges({"ffi/handle.h": """\
+class Handle_c;
+void useHandle(Handle_c* h);
+""", "ffi/handle.cpp": """\
+#include "handle.h"
+void useHandle(Handle_c* h) {
+}
+""", "script/model.py": """\
+class Handle_c:
+    pass
+"""}, tmp_path)
+    db = Database(db_root / "index.db")
+    db.open()
+    files = {r[0].replace("\\", "/") for r in db.conn.execute(
+        """SELECT f.path FROM symbol_edges e JOIN symbols a ON a.id = e.source_id
+           JOIN symbols b ON b.id = e.target_id JOIN files f ON f.id = b.file_id
+           WHERE a.name = 'useHandle' AND b.name = 'Handle_c'""")}
+    db.close()
+    assert files == {"ffi/handle.h"}, files
+
+
 def test_callees_list_constructors_apart_from_their_class(serve):
     server = serve({"angle.h": """\
 class Turn_c {

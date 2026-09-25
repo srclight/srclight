@@ -1883,8 +1883,9 @@ class Indexer:
         placeholders = ",".join("?" * len(excluded))
         rows = self.db.conn.execute(
             f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.signature, f.path as file_path,
-                      (f.language IN ('c', 'cpp') AND s.kind IN ('class', 'struct', 'union')
-                       AND instr(s.content, '{{') = 0) AS forward
+                      (f.language IN ('c', 'cpp') AND s.kind IN ('class', 'struct', 'union'))
+                       AS c_class,
+                      instr(s.content, '{{') = 0 AS bodiless
                FROM symbols s JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
@@ -1896,22 +1897,30 @@ class Indexer:
             name = row["name"]
             info = {"id": row["id"], "file": row["file_path"].replace("\\", "/"),
                     "kind": row["kind"], "qualified": row["qualified_name"],
-                    "signature": row["signature"], "forward": bool(row["forward"])}
+                    "signature": row["signature"],
+                    # `class Heap;`: a forward declaration, or a definition.
+                    "forward": bool(row["c_class"] and row["bodiless"]),
+                    "c_class_body": bool(row["c_class"] and not row["bodiless"])}
             symbol_info[row["id"]] = info
             if name not in name_to_symbols:
                 name_to_symbols[name] = []
             name_to_symbols[name].append(info)
 
-        # A forward declaration, `class Heap;`, names the class defined
-        # elsewhere: beside that definition it is no target of its own, and
-        # a class declared ahead in many headers would look ambiguous.
-        defined_classes = {s["qualified"] for syms in name_to_symbols.values() for s in syms
-                           if s["kind"] in ("class", "struct", "union") and not s["forward"]}
         filtered_names = {
-            name: [s for s in syms if not (s["forward"] and s["qualified"] in defined_classes)]
-            for name, syms in name_to_symbols.items()
+            name: syms for name, syms in name_to_symbols.items()
             if not graph_name_excluded(name)
         }
+
+        def _without_forward_declarations(targets: list[dict], source_file: str) -> list[dict]:
+            """A forward declaration, `class Heap;`, names a class defined
+            elsewhere: beside that definition among the candidates it is no
+            target of its own — a class declared ahead in many headers would
+            look ambiguous. Declared in the calling file, it tells which
+            class the file means, and stays."""
+            defined = {t["qualified"] for t in targets if t["c_class_body"]}
+            return [t for t in targets
+                    if not (t["forward"] and t["qualified"] in defined
+                            and t["file"] != source_file)]
         # A prototype is no target, but its signature is the function's too:
         # default arguments are often written there only.
         prototype_signatures: dict[str, list[str]] = {}
@@ -2144,6 +2153,7 @@ class Indexer:
                                if _is_constructor(t, ref_name)
                                else t["kind"] in _EDGE_TARGET_KINDS)
                            and not _macro_misread(t)]
+                targets = _without_forward_declarations(targets, source_file)
                 decided = None
                 if c_family and targets:
                     forms, qualifiers = forms_of.get(ref_name, (set(), set()))

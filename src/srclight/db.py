@@ -732,7 +732,11 @@ class Database:
         return sorted(n for n in names if not short_form(n))
 
     def count_graph_targets(self, name: str) -> int:
-        """How many symbols a call written `name` could land on."""
+        """How many symbols a call written `name` could land on.
+
+        A C/C++ forward declaration, `class Heap;`, of a class defined in the
+        index lands on that definition: it is not counted.
+        """
         assert self.conn is not None
         from .indexer import _doc_languages
 
@@ -741,7 +745,14 @@ class Database:
             f"""SELECT COUNT(*) FROM symbols s JOIN files f ON s.file_id = f.id
                WHERE s.name = ? AND s.kind IN
                ('function','method','class','struct','enum','interface','template')
-               AND f.language NOT IN ({",".join("?" * len(excluded))})""",
+               AND f.language NOT IN ({",".join("?" * len(excluded))})
+               AND NOT (f.language IN ('c', 'cpp') AND s.kind IN ('class', 'struct')
+                        AND instr(s.content, '{{') = 0
+                        AND EXISTS (SELECT 1 FROM symbols d JOIN files g ON d.file_id = g.id
+                                    WHERE d.qualified_name = s.qualified_name
+                                    AND d.kind IN ('class', 'struct', 'union')
+                                    AND g.language IN ('c', 'cpp')
+                                    AND instr(d.content, '{{') > 0))""",
             (name, *excluded),
         ).fetchone()[0]
 
