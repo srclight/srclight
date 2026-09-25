@@ -944,6 +944,17 @@ def _macro_typed_declaration(def_node: Node, name: str) -> bool:
     closed by `;`, `=`, `,` or `[` — `MACRO(f32, s16) mField;`."""
     if def_node.child_by_field_name("type") is not None:
         return False
+    # A constructor has no return type either: `Box() NOEXCEPT_M;` is one,
+    # its trailing macro an attribute.
+    parent = def_node.parent
+    while parent is not None and parent.type not in (
+            "class_specifier", "struct_specifier", "union_specifier", "translation_unit"):
+        parent = parent.parent
+    if parent is not None and parent.type != "translation_unit":
+        owner = parent.child_by_field_name("name")
+        if owner is not None and owner.text.decode("utf-8", errors="replace").rsplit(
+                "::", 1)[-1].split("<", 1)[0] == name:
+            return False
     text = def_node.text.decode("utf-8", errors="replace")
     m = re.match(
         rf"\s*(?:(?:static|extern|inline|const|volatile)\s+)*{re.escape(name)}\s*\(",

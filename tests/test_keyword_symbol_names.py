@@ -190,3 +190,20 @@ def test_a_class_field_typed_by_a_macro_is_no_prototype(tmp_path):
     db.close()
     assert not any(n == "PICK_TYPE" and k != "macro" for n, k in kinds)
     assert any(n == "redraw" for n, _ in kinds)
+
+
+def test_a_constructor_declared_with_a_trailing_macro_is_kept(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.h").write_text(
+        "#define NOEXCEPT_M\n#define DEPRECATED_M\n"
+        "class Holder {\npublic:\n    Holder() NOEXCEPT_M;\n    Holder(int x) DEPRECATED_M;\n"
+        "    explicit Holder(float) DEPRECATED_M;\n    int x;\n};\n")
+    db = Database(root / "index.db")
+    db.open()
+    db.initialize()
+    Indexer(db, IndexConfig(root=root)).index()
+    ctors = db.conn.execute(
+        "SELECT COUNT(*) FROM symbols WHERE name = 'Holder' AND kind <> 'class'").fetchone()[0]
+    db.close()
+    assert ctors == 3
