@@ -122,6 +122,15 @@ def test_bitwise_complement_does_not_hide_the_name(indexed):
     assert "mask_value" in _calls(indexed, "clear_mask")
 
 
+def test_a_function_without_a_qualified_name_does_not_stop_the_graph(indexed, cpp_project):
+    """Every symbol is checked for a macro misread up front, not only the
+    candidates of a call; one stored without a qualified name must pass."""
+    indexed.conn.execute(
+        "UPDATE symbols SET qualified_name = NULL WHERE name = 'lookup_slot'")
+    Indexer(indexed, IndexConfig(root=cpp_project, disable_embeddings=True))._build_edges()
+    assert "mask_value" in _calls(indexed, "clear_mask")
+
+
 # --- property: the matcher agrees with a reference alternation ---------------
 
 def _reference_matcher(names):
@@ -207,6 +216,26 @@ REFERENCE_CASES = [
         {"handle", "handler", "handle_event"},
         "handle_event(); handler(); handle();",
         id="names-that-are-prefixes-of-each-other",
+    ),
+    pytest.param(
+        # Reached from the run after the `~`, and still bound by the boundary
+        # before the `~` itself.
+        {"~Widget", "~Widget<T>", "Widget", "~WidgetPool"},
+        "x~Widget; x~Widget<T>; x~WidgetPool; ~Widget(); p->~Widget(); x~Widgets;",
+        id="destructor-names-are-reached-from-their-class-run",
+    ),
+    pytest.param(
+        # Prefixes of different lengths before the same run.
+        {"1. Setup", ". Setup", "Setup", "~Setup", "~~Setup"},
+        "a1. Setup; x. Setup; y~Setup; z~~Setup; Setup;",
+        id="prefixed-names-before-the-same-run",
+    ),
+    pytest.param(
+        # A prefix ending in a digit: no run starts after it, so the name
+        # is searched for directly, beside one reached from its run.
+        {"~1x", "~x", "~"},
+        "a~1x; b~x; c~;",
+        id="prefix-ending-in-a-digit",
     ),
 ]
 

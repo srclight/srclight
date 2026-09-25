@@ -49,6 +49,31 @@ def test_the_embedding_steps_are_reported(tmp_path, monkeypatch):
     assert "Rebuilding the vector cache" in phases
 
 
+def test_a_log_record_ends_the_progress_line_first():
+    """The call graph's summary is logged while the progress line is still
+    open; printed there, it continued that line."""
+    import logging
+
+    from srclight.cli import _ProgressLine
+
+    seen = []
+
+    class _Probe(logging.Handler):
+        def emit(self, record):
+            seen.append(line.open)
+
+    probe = _Probe()
+    logging.getLogger().addHandler(probe)
+    try:
+        with _ProgressLine("  ", 10) as line:
+            line.progress("a.c", 1, 2)
+            logging.getLogger("srclight.indexer").warning("Call graph: 1 edges in 0s")
+    finally:
+        logging.getLogger().removeHandler(probe)
+    assert seen == [False]
+    assert not probe.filters
+
+
 def test_the_cli_prints_no_blank_line_between_steps(tmp_path, monkeypatch):
     from click.testing import CliRunner
 

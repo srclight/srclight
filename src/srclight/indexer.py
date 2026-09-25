@@ -761,6 +761,44 @@ def _parameter_name(param: str) -> str | None:
     return words[-1]
 
 
+def _open_paren_after(text: str, name: str) -> int | None:
+    """Where the list opened by the first `name(` in `text` starts: just past
+    its `(`, spaces allowed before it and no identifier character, or `$`, just
+    before the name. None when there is no such call.
+
+    What `re.search(rf"(?<![\\w$]){re.escape(name)}\\s*\\(", text)` finds,
+    without compiling a pattern per name: every symbol has its own name, so
+    those patterns overflow the `re` cache and each one is compiled anew.
+    """
+    at = text.find(name)
+    while at != -1:
+        if at == 0 or (text[at - 1] != "$" and _IS_WORD_CHAR(text[at - 1]) is None):
+            i = at + len(name)
+            while i < len(text) and text[i].isspace():
+                i += 1
+            if i < len(text) and text[i] == "(":
+                return i + 1
+        at = text.find(name, at + 1)
+    return None
+
+
+def _standalone_at(text: str, name: str) -> int | None:
+    """Where `name` first stands on its own in `text`: no identifier
+    character or `:` just before it, no identifier character just after.
+
+    What `re.search(rf"(?<![\\w:]){re.escape(name)}(?![\\w])", text)` finds,
+    without a pattern per name (see _open_paren_after).
+    """
+    at = text.find(name)
+    while at != -1:
+        end = at + len(name)
+        if ((at == 0 or (text[at - 1] != ":" and _IS_WORD_CHAR(text[at - 1]) is None))
+                and (end == len(text) or _IS_WORD_CHAR(text[end]) is None)):
+            return at
+        at = text.find(name, at + 1)
+    return None
+
+
 def _parameter_names(content: str, name: str, kind: str) -> set[str]:
     """The parameter names of a C/C++ function or function-like macro, read
     from its text: the first parenthesised list after its own name."""
@@ -768,17 +806,17 @@ def _parameter_names(content: str, name: str, kind: str) -> set[str]:
         m = _MACRO_PARAMS_RE.search(content)
         return {p.strip() for p in m.group(1).split(",") if p.strip().isidentifier()} if m else set()
     short = name.rsplit("::", 1)[-1]
-    m = re.search(rf"(?<![\w$]){re.escape(short)}\s*\(", content)
-    if m is None:
+    opened = _open_paren_after(content, short)
+    if opened is None:
         return set()
-    depth, i = 1, m.end()
+    depth, i = 1, opened
     while i < len(content) and depth:
         depth += {"(": 1, ")": -1}.get(content[i], 0)
         i += 1
     found: set[str] = set()
     depth, part = 0, []
     # `<` and `>` are no brackets here: in a default argument they compare.
-    for ch in content[m.end():i - 1] + ",":
+    for ch in content[opened:i - 1] + ",":
         if ch in "([{":
             depth += 1
         elif ch in ")]}":
@@ -818,20 +856,33 @@ def _type_of_declaration(text: str, declared: str) -> str | None:
     return None if kind in _TYPE_WORDS else kind
 
 
+@functools.lru_cache(maxsize=8)
+def _local_declarations(content: str) -> tuple[tuple[str, str], ...]:
+    """The `(type, variable)` pairs a C/C++ text declares, in order.
+
+    Kept for the last few texts: the call graph asks for both the names and
+    the types a symbol declares, one right after the other.
+    """
+    return tuple(
+        (m.group(1), m.group(2)) for m in _LOCAL_DECL_RE.finditer(content)
+        if m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
+        and _opens_a_declaration(content, m.start()))
+
+
 def _declared_types(content: str, name: str, kind: str) -> dict[str, str]:
     """The class each variable a C/C++ symbol declares is of — its
     parameters and its locals — where the declaration writes it."""
     types: dict[str, str] = {}
     if kind not in ("class", "struct", "union", "enum", "macro"):
         short = name.rsplit("::", 1)[-1]
-        m = re.search(rf"(?<![\w$]){re.escape(short)}\s*\(", content)
-        if m is not None:
-            depth, i = 1, m.end()
+        opened = _open_paren_after(content, short)
+        if opened is not None:
+            depth, i = 1, opened
             while i < len(content) and depth:
                 depth += {"(": 1, ")": -1}.get(content[i], 0)
                 i += 1
             depth, part = 0, []
-            for ch in content[m.end():i - 1] + ",":
+            for ch in content[opened:i - 1] + ",":
                 if ch in "([{":
                     depth += 1
                 elif ch in ")]}":
@@ -846,10 +897,8 @@ def _declared_types(content: str, name: str, kind: str) -> dict[str, str]:
                 else:
                     part.append(ch)
     declared: list[tuple[str, str]] = [
-        (m.group(2), m.group(1).rsplit("::", 1)[-1].strip())
-        for m in _LOCAL_DECL_RE.finditer(content)
-        if m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
-        and _opens_a_declaration(content, m.start())]
+        (var, type_.rsplit("::", 1)[-1].strip())
+        for type_, var in _local_declarations(content)]
     # A lambda's or a range-for's parameters: `[](Mat* x)`, `for (Mat* x : v)`.
     declared += [(m.group(2), m.group(1)) for m in _INNER_PARAM_RE.finditer(content)
                  if m.group(1) not in _NOT_A_TYPE and m.group(1) not in _TYPE_WORDS]
@@ -872,10 +921,7 @@ def _declared_names(content: str, name: str, kind: str) -> set[str]:
     `blendColor()`."""
     names = set() if kind in ("class", "struct", "union", "enum") else _parameter_names(
         content, name, kind)
-    for m in _LOCAL_DECL_RE.finditer(content):
-        if (m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
-                and _opens_a_declaration(content, m.start())):
-            names.add(m.group(2))
+    names.update(var for _, var in _local_declarations(content))
     return names
 
 
@@ -972,14 +1018,14 @@ def _param_range(signature: str | None, name: str) -> tuple[int, float] | None:
     # A comma in a comment or a default string, `s = "a,b"`, parts nothing.
     signature = _SIGNATURE_NOISE_RE.sub(
         lambda m: " " if m.group(0).startswith("/") else "0", signature)
-    m = re.search(rf"(?<![\w$]){re.escape(name)}\s*\(", signature)
-    if m is None:
+    opened = _open_paren_after(signature, name)
+    if opened is None:
         return None
-    depth, i = 1, m.end()
+    depth, i = 1, opened
     while i < len(signature) and depth:
         depth += {"(": 1, ")": -1}.get(signature[i], 0)
         i += 1
-    params = signature[m.end():i - 1].strip()
+    params = signature[opened:i - 1].strip()
     if params in ("", "void"):
         return (0, 0)
     params = _without_template_commas(params)
@@ -1119,6 +1165,8 @@ _MEMBER_KINDS = frozenset({"method", "template"})
 
 
 def _without_template_args(qualified: str) -> str:
+    if "<" not in qualified:  # most names, and this runs per candidate target
+        return qualified
     while True:
         stripped = re.sub(r"<[^<>]*>", "", qualified)
         if stripped == qualified:
@@ -1284,17 +1332,26 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
     case that proves it -- accepting `Registry<T>::Lookup` must leave
     `Inner::Leaf` still findable.
     """
-    # Names that do not begin with an identifier character (extraction can
-    # produce a few). They cannot be reached from an identifier run, so they
-    # are located directly.
+    # Names that do not begin with an identifier character. Most still hold
+    # one after a few punctuation characters -- a destructor `~Widget`, a
+    # numbered title `1. Setup` -- and are reached from that run: an occurrence
+    # of `~Widget` is an occurrence of the run `Widget` with `~` before it.
+    # Only the rest, with no run that can start after their prefix, are
+    # located directly.
     unanchored: list[str] = []
     grouping: dict[str, list[str]] = {}
+    prefixed: dict[str, dict[int, list[str]]] = {}
     for name in names:
         head = _LEADING_RUN_RE.match(name)
-        if head is None:
+        if head is not None:
+            grouping.setdefault(head.group(0), []).append(name)
+            continue
+        inner = _LEADING_RUN_RE.search(name)
+        if inner is None or _IS_WORD_CHAR(name[inner.start() - 1]) is not None:
             unanchored.append(name)
         else:
-            grouping.setdefault(head.group(0), []).append(name)
+            (prefixed.setdefault(inner.group(0), {})
+             .setdefault(inner.start(), []).append(name))
     # Longest first, so the first candidate that matches at a position is the
     # one the alternation would have chosen. Frozen into tuples: the scan hands
     # these lists straight to the caller's walk, and a shared list that anything
@@ -1303,6 +1360,15 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
         head: tuple(sorted(candidates, key=len, reverse=True))
         for head, candidates in grouping.items()
     }
+    # Per run, the prefixed names that end their prefix where it starts: the
+    # longest prefix first, as it starts furthest back and the walk goes in
+    # order. Names with the same prefix length start at the same position, so
+    # they share a tuple, longest first like a bucket.
+    before_run = {
+        run: tuple((length, tuple(sorted(candidates, key=len, reverse=True)))
+                   for length, candidates in sorted(by_length.items(), reverse=True))
+        for run, by_length in prefixed.items()
+    }
 
     def anchored_candidates(content: str):
         """Identifier runs, in order, with the names that could start there.
@@ -1310,12 +1376,19 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
         The lookbehind in _IDENT_RUN_RE has already established the leading
         boundary — the run begins on an identifier character and the character
         before it is not a word character — so the walk need only check where
-        each candidate ENDS.
+        each candidate ENDS. A prefixed name starts before its run, on a
+        character that is not the start of any run, so the boundary there is
+        checked here, as it is for the names located directly.
         """
         for run in _IDENT_RUN_RE.finditer(content):
-            names_here = buckets.get(run.group(0))
+            word, start = run.group(0), run.start()
+            for length, names_here in before_run.get(word, ()):
+                at = start - length
+                if at >= 0 and _on_boundary(content, at):
+                    yield at, names_here
+            names_here = buckets.get(word)
             if names_here is not None:
-                yield run.start(), names_here
+                yield start, names_here
 
     def all_candidates(content: str):
         """The same, plus the names that no identifier run can reach.
@@ -2978,6 +3051,9 @@ class Indexer:
         assert self.db.conn is not None
         from .db import is_vendored_path
 
+        # Asked for both ends of every edge: once per file is enough.
+        is_vendored_path = functools.lru_cache(maxsize=None)(is_vendored_path)
+
         # Clear all existing edges (full rebuild)
         self.db.conn.execute("DELETE FROM symbol_edges")
 
@@ -3057,12 +3133,17 @@ class Indexer:
 
         def _macro_misread(t: dict) -> bool:
             # A constructor opens with its class's name, `Box(int)`: a macro
-            # of that name makes it no misread.
+            # of that name makes it no misread. Every symbol is asked, so one
+            # stored without a qualified name must not stop the graph.
+            short = (t.get("qualified") or "").rsplit("::", 1)[-1]
             return (t["kind"] in ("function", "method", "prototype")
-                    and not _is_constructor(t, t.get("qualified", "").rsplit("::", 1)[-1])
-                    and t.get("qualified", "").rsplit("::", 1)[-1] in macro_names
-                    and (t.get("signature") or "").lstrip().startswith(
-                        t.get("qualified", "").rsplit("::", 1)[-1] + "("))
+                    and not _is_constructor(t, short)
+                    and short in macro_names
+                    and (t.get("signature") or "").lstrip().startswith(short + "("))
+
+        # It depends on the target alone, and each is a candidate of many calls.
+        for info in symbol_info.values():
+            info["macro_misread"] = _macro_misread(info)
 
         member_aliases: set[str] = set()
         for name, syms in name_to_symbols.items():
@@ -3254,10 +3335,10 @@ class Indexer:
                 own_blanked = content
                 short_own = source_name.rsplit("::", 1)[-1]
                 for own in dict.fromkeys((source_name, short_own)):
-                    found = re.search(rf"(?<![\w:]){re.escape(own)}(?![\w])", own_blanked)
-                    if found:
-                        own_blanked = (own_blanked[:found.start()] + "#" * len(own)
-                                       + own_blanked[found.end():])
+                    found = _standalone_at(own_blanked, own)
+                    if found is not None:
+                        own_blanked = (own_blanked[:found] + "#" * len(own)
+                                       + own_blanked[found + len(own):])
                         break
                 receivers_of: dict[str, set] = {}
                 forms_of = _reference_forms_all(
@@ -3303,7 +3384,7 @@ class Indexer:
                                 and t["kind"] in ("method", "prototype", "function", "template"))
                                if _is_constructor(t, ref_name)
                                else t["kind"] in _EDGE_TARGET_KINDS)
-                           and not _macro_misread(t)
+                           and not t["macro_misread"]
                            and not (body is not None and t["body"] == body
                                     and t["file"] == source_file)]
                 targets = _without_forward_declarations(targets, source_file)
