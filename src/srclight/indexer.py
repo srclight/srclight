@@ -254,11 +254,38 @@ def _git_tracked_files(root: Path) -> set[str] | None:
             ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
             cwd=root, capture_output=True, text=True, timeout=30,
         )
-        if result.returncode == 0:
-            return {line for line in result.stdout.splitlines() if line}
+        if result.returncode != 0:
+            return None
+        files = {line for line in result.stdout.splitlines() if line}
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return None
+        return None
+    # A submodule is listed as its directory alone; the files it holds are
+    # listed from inside it, when it is checked out. `--recurse-submodules`
+    # cannot be combined with `--others`.
+    for sub in _git_submodule_paths(root):
+        if not (root / sub / ".git").exists():
+            continue
+        inner = _git_tracked_files(root / sub)
+        if inner is not None:
+            files.discard(sub)
+            files.update(f"{sub}/{rel}" for rel in inner)
+    return files
+
+
+def _git_submodule_paths(root: Path) -> list[str]:
+    """The paths of the submodules a repository records (gitlinks)."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--stage"],
+            cwd=root, capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    if result.returncode != 0:
+        return []
+    # `<mode> <object> <stage>\t<path>`; a gitlink's mode is 160000.
+    return [line.split("\t", 1)[1] for line in result.stdout.splitlines()
+            if line.startswith("160000 ") and "\t" in line]
 
 
 def _get_git_head(root: Path) -> str | None:
