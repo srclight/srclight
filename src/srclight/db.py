@@ -642,18 +642,23 @@ class Database:
         Edges hang off the definition, so an unordered LIMIT 1 landing on the
         prototype makes callers and callees come back empty. Rank definitions
         first, then prefer the row that carries edges.
+
+        A function defined inside a namespace block is named bare, `f`, its
+        qualified name `ns::f`: the qualified name finds it too, after any
+        symbol named that way.
         """
         assert self.conn is not None
         row = self.conn.execute(
             """SELECT s.*, f.path as file_path FROM symbols s
                JOIN files f ON s.file_id = f.id
-               WHERE s.name = ?
-               ORDER BY CASE s.kind WHEN 'prototype' THEN 1 ELSE 0 END,
+               WHERE s.name = ? OR s.qualified_name = ?
+               ORDER BY CASE WHEN s.name = ? THEN 0 ELSE 1 END,
+                        CASE s.kind WHEN 'prototype' THEN 1 ELSE 0 END,
                         (SELECT count(*) FROM symbol_edges e
                           WHERE e.target_id = s.id OR e.source_id = s.id) DESC,
                         s.id
                LIMIT 1""",
-            (name,),
+            (name, name, name),
         ).fetchone()
         if row is None:
             return None
@@ -760,14 +765,15 @@ class Database:
         """Get all symbols matching exact name, with LIKE fallback."""
         assert self.conn is not None
 
-        # Try exact match first
+        # Try exact match first: the name, or the qualified name of a symbol
+        # defined inside a namespace block (`ns::f`, named `f`).
         rows = self.conn.execute(
             """SELECT s.*, f.path as file_path FROM symbols s
                JOIN files f ON s.file_id = f.id
-               WHERE s.name = ?
-               ORDER BY f.path, s.start_line
+               WHERE s.name = ? OR s.qualified_name = ?
+               ORDER BY CASE WHEN s.name = ? THEN 0 ELSE 1 END, f.path, s.start_line
                LIMIT ?""",
-            (name, limit),
+            (name, name, name, limit),
         ).fetchall()
 
         if rows:
