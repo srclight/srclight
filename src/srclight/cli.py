@@ -75,6 +75,43 @@ def main(verbose: bool):
     )
 
 
+def parse_extension_overrides(values: tuple[str, ...]) -> dict[str, str]:
+    """Turn `--ext EXT=LANGUAGE` values into {extension: language}.
+
+    The extension is normalised (`INC` and `.inc` are the same thing) and the
+    language must be one srclight parses, so a typo fails here rather than
+    leaving the files silently unread. The single value `none` clears a
+    declaration an index already holds.
+    """
+    from .languages import LANGUAGES, SKIP_LANGUAGE, normalize_extension
+
+    if len(values) == 1 and values[0].strip().lower() == "none":
+        return {}
+
+    overrides: dict[str, str] = {}
+    for value in values:
+        ext, sep, lang = value.partition("=")
+        ext, lang = ext.strip(), lang.strip().lower()
+        if not sep or not ext or not lang:
+            raise ValueError(f"Malformed --ext value '{value}': expected EXT=LANGUAGE")
+        if lang != SKIP_LANGUAGE and lang not in LANGUAGES:
+            raise ValueError(
+                f"Unknown language '{lang}' in --ext value '{value}': expected "
+                f"{SKIP_LANGUAGE} or one of {', '.join(sorted(LANGUAGES))}"
+            )
+        normalized = normalize_extension(ext)
+        # Detection looks up Path.suffix, which is only the last component:
+        # a declaration on `.d.ts` would be stored, echoed back, and never
+        # match a file. Better rejected than confirmed as a no-op.
+        if "." in normalized[1:]:
+            raise ValueError(
+                f"Multi-part extension '{ext}' in --ext value '{value}': only a final "
+                f"suffix can be matched (use '.ts', not '.d.ts')"
+            )
+        overrides[normalized] = lang
+    return overrides
+
+
 @main.command()
 @click.argument("path", default=".", type=click.Path(exists=True))
 @click.option("--db", "db_path", type=click.Path(), help="Database path (default: .srclight/index.db)")
@@ -88,8 +125,13 @@ def main(verbose: bool):
 @click.option("--forget-embed-model", is_flag=True, default=False,
               help="Stop embedding this index for good: later runs, git hooks included, "
                    "leave embeddings alone until --embed is passed again.")
+@click.option("--ext", "ext_overrides", multiple=True, metavar="EXT=LANGUAGE",
+              help="Read an extra extension as the given language (e.g. --ext .inc=cpp), "
+                   "or --ext .inc=skip to leave it unread. Repeatable. Recorded in the "
+                   "index, so later runs and the git hooks keep the same rule; pass "
+                   "--ext none to clear.")
 def index(path: str, db_path: str | None, embed_model: str | None, no_embed: bool,
-          forget_embed_model: bool):
+          forget_embed_model: bool, ext_overrides: tuple[str, ...]):
     """Index a codebase for AI-powered search."""
     from .db import Database
     from .indexer import EMBED_MODEL_ENV, IndexConfig, Indexer, resolve_embed_model
@@ -125,10 +167,22 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
             note += f"; --embed {embed_model} ignored"
         click.echo(note)
 
+    try:
+        declared = parse_extension_overrides(ext_overrides) if ext_overrides else None
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
     config = IndexConfig(
         root=root, embed_model=embed_model,
         disable_embeddings=no_embed or forget_embed_model,
+        extension_overrides=declared,
     )
+    if declared:
+        click.echo("Extra extensions: "
+                   + ", ".join(f"{e} -> {lang}" for e, lang in sorted(declared.items())))
+    elif declared == {}:
+        click.echo("Extra extensions: cleared")
     # Resolve once and pin the result: resolving again inside the indexer, after
     # the file pass, can disagree with what we printed here — a checkout that
     # drops every embedded file cascade-deletes its embeddings mid-run.
@@ -149,12 +203,22 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
 
     indexer = Indexer(db, config)
 
+    line_open = [False]  # a progress line waits for its newline
+
     def on_progress(file: str, current: int, total: int):
         pct = (current / total * 100) if total > 0 else 0
         click.echo(f"\r  [{current}/{total}] {pct:5.1f}% {file[:60]:<60}", nl=False)
+        line_open[0] = True
 
-    stats = indexer.index(root, on_progress=on_progress)
-    click.echo()  # newline after progress
+    def on_phase(name: str):
+        if line_open[0]:
+            click.echo()
+            line_open[0] = False
+        click.echo(f"  {name}...")
+
+    stats = indexer.index(root, on_progress=on_progress, on_phase=on_phase)
+    if line_open[0]:
+        click.echo()
 
     click.echo()
     click.echo(f"  Files scanned:   {stats.files_scanned}")
@@ -598,12 +662,22 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
                 click.echo(f"    Embedding model: {resolved_model} ({origin})")
             indexer = Indexer(db, indexer_config)
 
+            line_open = [False]  # a progress line waits for its newline
+
             def on_progress(file: str, current: int, total: int):
                 pct = (current / total * 100) if total > 0 else 0
                 click.echo(f"\r    [{current}/{total}] {pct:5.1f}% {file[:55]:<55}", nl=False)
+                line_open[0] = True
 
-            stats = indexer.index(root, on_progress=on_progress)
-            click.echo()  # newline after progress
+            def on_phase(name: str):
+                if line_open[0]:
+                    click.echo()
+                    line_open[0] = False
+                click.echo(f"    {name}...")
+
+            stats = indexer.index(root, on_progress=on_progress, on_phase=on_phase)
+            if line_open[0]:
+                click.echo()
 
             click.echo(f"    {stats.files_scanned} files, {stats.symbols_extracted} symbols, "
                         f"{stats.files_unchanged} unchanged, {stats.elapsed_seconds:.1f}s")

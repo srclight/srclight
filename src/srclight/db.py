@@ -388,6 +388,32 @@ class EdgeRecord:
 logger = logging.getLogger("srclight.db")
 
 
+def add_symbol_lines(conn: sqlite3.Connection, results: list[dict[str, Any]],
+                     schema: str | None = None) -> None:
+    """Set `line` and `end_line` on search hits, looked up by `symbol_id`.
+
+    ``schema`` names an attached database. A hit whose symbol has since gone
+    is left without lines — and so is one whose id a reindex gave to another
+    symbol meanwhile: the name must still agree. Hits that have lines keep
+    them.
+    """
+    ids = [r["symbol_id"] for r in results if "symbol_id" in r and "line" not in r]
+    table = f"[{schema}].symbols" if schema else "symbols"
+    lines: dict[int, tuple[str, int, int]] = {}
+    for start in range(0, len(ids), 500):
+        batch = ids[start:start + 500]
+        placeholders = ",".join("?" * len(batch))
+        for row in conn.execute(
+                f"SELECT id, name, start_line, end_line FROM {table}"
+                f" WHERE id IN ({placeholders})",
+                batch):
+            lines[row[0]] = (row[1], row[2], row[3])
+    for r in results:
+        found = lines.get(r.get("symbol_id"))
+        if found is not None and found[0] == r.get("name"):
+            r["line"], r["end_line"] = found[1], found[2]
+
+
 class Database:
     """SQLite database for Srclight index."""
 
@@ -620,6 +646,62 @@ class Database:
                 f"DELETE FROM {table} WHERE rowid = ?", (symbol_id,)
             )
 
+    def take_embeddings_for_file(self, file_id: int) -> dict[str, list[tuple]]:
+        """The embeddings of a file's symbols, keyed by the text they embed.
+
+        Reparsing a file deletes its symbols, and their embeddings go with
+        them. A symbol that comes back with the same text to embed — name,
+        signature, documentation, content — has the same embedding; kept
+        here, it is given back instead of computed again.
+        """
+        from .embeddings import prepare_embedding_text
+
+        assert self.conn is not None
+        kept: dict[str, list[tuple]] = {}
+        for row in self.conn.execute(
+                """SELECT s.name, s.qualified_name, s.signature, s.doc_comment, s.content,
+                          e.model, e.dimensions, e.embedding, e.body_hash
+                   FROM symbols s JOIN symbol_embeddings e ON e.symbol_id = s.id
+                   WHERE s.file_id = ?
+                     -- only an embedding known to match its symbol's text: a
+                     -- stale one would be carried over as current for good
+                     AND e.body_hash IS s.body_hash""", (file_id,)):
+            text = prepare_embedding_text(dict(row))
+            kept.setdefault(text, []).append(
+                (row["model"], row["dimensions"], row["embedding"], row["body_hash"]))
+        return kept
+
+    def restore_embeddings_for_file(self, file_id: int, kept: dict[str, list[tuple]]) -> int:
+        """Give a reparsed file's symbols the embeddings of the symbols they
+        were, where the text to embed is unchanged. Returns how many."""
+        from .embeddings import prepare_embedding_text
+
+        assert self.conn is not None
+        if not kept:
+            return 0
+        restored = 0
+        rows = self.conn.execute(
+            """SELECT id, name, qualified_name, signature, doc_comment, content, body_hash
+               FROM symbols WHERE file_id = ?""", (file_id,)).fetchall()
+        for row in rows:
+            waiting = kept.get(prepare_embedding_text(dict(row)))
+            if not waiting:
+                continue
+            model, dimensions, embedding, _old_hash = waiting.pop()
+            self.conn.execute(
+                """INSERT OR REPLACE INTO symbol_embeddings
+                   (symbol_id, model, dimensions, embedding, body_hash)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (row["id"], model, dimensions, embedding, row["body_hash"]))
+            restored += 1
+        if restored:
+            # Symbol ids changed: a vector cache keyed on them must reload.
+            self.conn.execute(
+                """INSERT INTO schema_info (key, value) VALUES ('embedding_cache_version', '1')
+                   ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)""",
+            )
+        return restored
+
     def delete_symbols_for_file(self, file_id: int) -> None:
         """Delete all symbols for a file (edges, FTS entries, then symbols)."""
         assert self.conn is not None
@@ -808,13 +890,15 @@ class Database:
         return self._row_to_symbol(row)
 
     def symbols_in_file(self, path: str) -> list[SymbolRecord]:
+        """The symbols of a file, its path written with either separator:
+        paths are stored as the OS writes them, while git gives `a/b`."""
         assert self.conn is not None
         rows = self.conn.execute(
             """SELECT s.*, f.path as file_path FROM symbols s
                JOIN files f ON s.file_id = f.id
-               WHERE f.path = ?
+               WHERE f.path IN (?, ?, ?)
                ORDER BY s.start_line""",
-            (path,),
+            (path, path.replace("/", "\\"), path.replace("\\", "/")),
         ).fetchall()
         return [self._row_to_symbol(r) for r in rows]
 
@@ -1049,7 +1133,11 @@ class Database:
 
         # vendored is a within-rung penalty now, not an infinite primary key
         results.sort(key=lambda r: (r.get("rank", 0), r.get("name") or ""))
-        return results[:limit]
+        results = results[:limit]
+        # The tiers read FTS tables, which carry no position: a hit named its
+        # file but not where in it.
+        add_symbol_lines(self.conn, results)
+        return results
 
     # --- Edges ---
 
@@ -1508,6 +1596,115 @@ class Database:
             "model": model_row["model"] if model_row else None,
             "dimensions": model_row["dimensions"] if model_row else None,
         }
+
+    # --- Scan gaps ---
+
+    def set_unindexed_extensions(self, counts: dict[str, int]) -> None:
+        """Record the extensions the last index run walked past.
+
+        What an index never read is what its answers cannot mention, so the
+        record travels with the index rather than being recomputed by every
+        caller who thinks to doubt a result.
+        """
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('unindexed_extensions', ?)",
+            (json.dumps(counts, sort_keys=True),),
+        )
+        self.conn.commit()
+
+    def get_unindexed_extensions(self) -> dict[str, int]:
+        """Extensions seen but not indexed, as {extension: file count}.
+
+        Empty when the last run indexed everything it walked, and also when
+        the index predates this record — an old index cannot claim a gap it
+        never measured.
+        """
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'unindexed_extensions'"
+        ).fetchone()
+        if row is None:
+            return {}
+        try:
+            data = json.loads(row["value"])
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def set_oversize_skipped(self, count: int) -> None:
+        """Record how many files the last run skipped for exceeding the size limit."""
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('oversize_skipped', ?)",
+            (str(int(count)),),
+        )
+        self.conn.commit()
+
+    def get_oversize_skipped(self) -> int:
+        """Files skipped for size by the last run. Zero when none were, or when unrecorded."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'oversize_skipped'"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return 0
+
+    def set_failed_files(self, count: int) -> None:
+        """Record how many files the last run could not read or parse."""
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('failed_files', ?)",
+            (str(int(count)),),
+        )
+        self.conn.commit()
+
+    def get_failed_files(self) -> int:
+        """Files the last run failed on. Zero when none did, or when unrecorded."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'failed_files'"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return 0
+
+    def set_extension_overrides(self, overrides: dict[str, str]) -> None:
+        """Record the extra extensions this index reads, as {extension: language}.
+
+        Stored with the index because the git hooks reindex with no flags: an
+        override that lived only in the command line would be lost on the
+        next commit, and the files would quietly drop back out.
+        """
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('extension_overrides', ?)",
+            (json.dumps(overrides, sort_keys=True),),
+        )
+        self.conn.commit()
+
+    def get_extension_overrides(self) -> dict[str, str]:
+        """The extra extensions this index reads. Empty when none were declared."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'extension_overrides'"
+        ).fetchone()
+        if row is None:
+            return {}
+        try:
+            data = json.loads(row["value"])
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items()}
 
     # --- Index State ---
 

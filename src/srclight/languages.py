@@ -508,7 +508,8 @@ LANGUAGES: dict[str, LanguageConfig] = {
     ),
     "cpp": LanguageConfig(
         name="cpp",
-        extensions=(".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h", ".mm"),
+        extensions=(".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h", ".mm",
+                    ".inl", ".ipp", ".tcc"),
         loader="tree_sitter_cpp",
         symbol_query=_CPP_QUERY,
     ),
@@ -625,27 +626,110 @@ _FILENAME_TO_LANG: dict[str, str] = {
 }
 
 
+_CPP_INDICATORS = ("class ", "namespace ", "template", "::", "std::")
+
+# Suffixes the content decides, because the same suffix carries different
+# languages in different projects. `.h` is C or C++; `.inc` is an include
+# fragment — a C++ project fills it with method definitions, a PHP project
+# with PHP.
+SNIFFED_EXTENSIONS = (".h", ".inc")
+
+
+def _read_head(path: Path, size: int = 4096) -> str | None:
+    """Read the first `size` characters, or None if the file cannot be read.
+
+    Reads from the open file rather than decoding it whole and slicing: a
+    `.inc` or `.h` can be a generated data table of any size, and detection
+    runs before the indexer's size limit, so nothing else bounds this.
+    """
+    try:
+        with path.open(errors="replace") as fh:
+            return fh.read(size)
+    except OSError:
+        return None
+
+
+def _sniff_include_fragment(path: Path) -> str:
+    """Decide what language a `.inc` fragment holds.
+
+    Fragments are included at file scope and hold real definitions, so they
+    parse like any other source file. C is the fallback: the C grammar covers
+    the plain-function case, and a fragment it does not fit — an assembler
+    table, a Makefile snippet — is unlikely to yield much, though
+    tree-sitter's error recovery means "little" is not "nothing". A project
+    that keeps such fragments can declare `--ext .inc=skip`, which leaves
+    them unread and reports them as a gap.
+    """
+    head = _read_head(path)
+    if head is None:
+        return "c"
+    # `<?=` is the short echo tag, valid PHP on its own — a template
+    # fragment may never write the long form.
+    if "<?php" in head or "<?=" in head:
+        return "php"
+    if any(ind in head for ind in _CPP_INDICATORS):
+        return "cpp"
+    return "c"
+
+
+def detect_language_by_filename(path: Path) -> str | None:
+    """Language for a whole-filename rule (e.g. CMakeLists.txt), or None.
+
+    Exposed so callers that layer their own rules on top can keep this one
+    ahead of anything keyed on the extension alone.
+    """
+    return _FILENAME_TO_LANG.get(path.name)
+
+
 def detect_language(path: Path) -> str | None:
     """Detect language from file extension or filename."""
     # Check exact filename first (e.g. CMakeLists.txt)
-    lang = _FILENAME_TO_LANG.get(path.name)
+    lang = detect_language_by_filename(path)
     if lang:
         return lang
 
     suffix = path.suffix.lower()
+
+    if suffix == ".inc":
+        return _sniff_include_fragment(path)
+
     lang = _EXT_TO_LANG.get(suffix)
 
     # Heuristic: .h files — check for C++ indicators
     if suffix == ".h" and lang == "c":
-        try:
-            content = path.read_text(errors="replace")[:4096]
-            cpp_indicators = ("class ", "namespace ", "template", "::", "std::")
-            if any(ind in content for ind in cpp_indicators):
-                return "cpp"
-        except OSError:
-            pass
+        head = _read_head(path)
+        if head and any(ind in head for ind in _CPP_INDICATORS):
+            return "cpp"
 
     return lang
+
+
+# A declaration value meaning "do not read this extension at all". Detection
+# for an ambiguous suffix like `.inc` always yields some language, so without
+# this a project that uses `.inc` for Makefile or SQL fragments has no way to
+# keep them out of the index.
+SKIP_LANGUAGE = "skip"
+
+
+def normalize_extension(ext: str) -> str:
+    """Canonical form of an extension: lower-case, leading dot.
+
+    Detection looks a suffix up in lower case with its dot, so a declaration
+    written any other way would be stored and then never match a file.
+    """
+    ext = ext.strip().lower()
+    return ext if ext.startswith(".") else "." + ext
+
+
+def code_extensions() -> tuple[str, ...]:
+    """Every suffix the indexer reads as source code, sorted.
+
+    Callers use it to see what an index covers without discovering the gaps
+    by comparing a result against a grep.
+    """
+    exts = {ext for config in LANGUAGES.values() for ext in config.extensions}
+    exts.update(SNIFFED_EXTENSIONS)
+    return tuple(sorted(exts))
 
 
 def get_language(name: str) -> Language | None:
