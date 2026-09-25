@@ -240,6 +240,35 @@ def test_workspace_index_status_reports_oversize_files(tmp_path, monkeypatch):
     assert res["projects"][0]["oversize_skipped"] == 1
 
 
+def test_workspace_index_status_reports_failed_files(tmp_path, monkeypatch):
+    """A project whose last run could not read some files says so per project,
+    as index_status does for a single project."""
+    import srclight.workspace as ws_mod
+    monkeypatch.setattr(ws_mod, "WORKSPACES_DIR", tmp_path / "workspaces")
+
+    project = tmp_path / "alpha"
+    project.mkdir()
+    (project / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    (project / ".srclight").mkdir()
+    project_db = Database(project / ".srclight" / "index.db")
+    project_db.open()
+    project_db.initialize()
+    Indexer(project_db, IndexConfig(root=project)).index()
+    project_db.set_failed_files(2)
+    project_db.commit()
+    project_db.close()
+
+    config = ws_mod.WorkspaceConfig(name="gaps")
+    config.add_project("alpha", str(project))
+    monkeypatch.setattr(server, "_workspace_name", "gaps")
+    monkeypatch.setattr(server, "_workspace_db", None)
+    monkeypatch.setattr(server, "_workspace_config_mtime", None)
+
+    res = json.loads(_run(server.index_status()))
+
+    assert res["projects"][0]["failed_files"] == 2
+
+
 def test_a_document_format_this_install_cannot_read_is_a_gap(tmp_path, db, monkeypatch):
     """`pip install srclight` without the extras still has to say so.
 

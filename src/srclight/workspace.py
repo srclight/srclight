@@ -450,14 +450,8 @@ class WorkspaceDB:
         # And the extra extensions it was told to read, so a workspace answer
         # can name them as indexed.
         overrides = self._read_json_setting(schema, "extension_overrides")
-        oversize = 0
-        row = q(f"SELECT value FROM [{schema}].schema_info "
-                f"WHERE key = 'oversize_skipped'").fetchone()
-        if row:
-            try:
-                oversize = int(row["value"])
-            except (TypeError, ValueError):
-                oversize = 0
+        oversize = self._read_count_setting(schema, "oversize_skipped")
+        failed = self._read_count_setting(schema, "failed_files")
         embedded, model, dimensions = 0, None, None
         if q(f"SELECT name FROM [{schema}].sqlite_master "
               f"WHERE type='table' AND name='symbol_embeddings'").fetchone():
@@ -471,8 +465,18 @@ class WorkspaceDB:
             "languages": languages, "kinds": kinds, "last_indexed": last_indexed,
             "embedded": embedded, "model": model, "dimensions": dimensions,
             "unindexed_extensions": unindexed, "extension_overrides": overrides,
-            "oversize_skipped": oversize,
+            "oversize_skipped": oversize, "failed_files": failed,
         }
+
+    def _read_count_setting(self, schema: str, key: str) -> int:
+        """A count the last index run recorded in schema_info, 0 when absent."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            f"SELECT value FROM [{schema}].schema_info WHERE key = ?", (key,)).fetchone()
+        try:
+            return int(row["value"]) if row else 0
+        except (TypeError, ValueError):
+            return 0
 
     def _read_json_setting(self, schema: str, key: str) -> dict:
         """Read one JSON-valued schema_info row from an attached project."""
@@ -592,6 +596,8 @@ class WorkspaceDB:
                 "extension_overrides": st.get("extension_overrides", {}),
                 # Files this project's last run refused on size.
                 "oversize_skipped": st.get("oversize_skipped", 0),
+                # Files this project's last run could not read.
+                "failed_files": st.get("failed_files", 0),
             })
 
         # Also list unindexed projects

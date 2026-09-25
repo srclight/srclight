@@ -1234,6 +1234,9 @@ class Indexer:
         # and lost its own run: no busy_timeout is set.
         # The coverage record goes with it, for the same reason: an index
         # whose gaps changed would otherwise keep serving the old tally.
+        # Every run walks the whole tree — the content-hash skip happens
+        # later — so this replaces the previous record rather than adding to
+        # it, and a gap that has been closed disappears.
         self.db.set_unindexed_extensions(unindexed_exts)
         self.db.set_oversize_skipped(oversize_skipped)
         self.db.set_failed_files(failed_files)
@@ -1257,11 +1260,6 @@ class Indexer:
         # reindex that only removed files, both land here.
         if (stats.files_indexed or stats.files_removed) and not stats.symbols_embedded:
             self._invalidate_sidecar()
-
-        # Every run walks the whole tree — the content-hash skip happens
-        # later — so this replaces the previous record rather than adding to
-        # it, and a gap that has been closed disappears.
-
 
         # Update index state
         git_head = _get_git_head(root)
