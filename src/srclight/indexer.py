@@ -726,7 +726,7 @@ def _ends_with_backslash(source: bytes, newline: int) -> bool:
 def _digit_separator(source: bytes, i: int) -> bool:
     """Whether the quote at `i` opens nothing because a word or a number is
     glued to it: a digit separator, `1'000`, or the closing quote of a
-    multi-character constant too long to read as a literal, `'w_mcheck'`.
+    multi-character constant too long to read as a literal, `'longtag'`.
     After a keyword or an encoding prefix it opens a character literal:
     `case'{':`, `L'x'`, `u8'x'`."""
     j = i
