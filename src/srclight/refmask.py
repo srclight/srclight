@@ -13,6 +13,9 @@ under-mask a line, which the measure gate will show if it matters.
 
 from __future__ import annotations
 
+import functools
+import re
+
 __all__ = ["mask_noncode"]
 
 _HASH_LANGS = {"python", "shell", "bash", "ruby", "yaml", "toml", "perl"}
@@ -40,6 +43,14 @@ def _long_bracket_end(content: str, i: int) -> int | None:
     return len(content) if end == -1 else end + len(close)
 
 
+@functools.lru_cache(maxsize=None)
+def _next_opener(openers: str):
+    """A search for the next character that can open a comment or a string.
+    Every other character is code, and scanning it one step at a time made
+    this the slowest part of building the call graph."""
+    return re.compile("[" + re.escape(openers) + "]").search
+
+
 def mask_noncode(content: str, language: str, *, mask_strings: bool = True) -> str:
     """Blank comments and strings, keeping every offset.
 
@@ -62,6 +73,8 @@ def mask_noncode(content: str, language: str, *, mask_strings: bool = True) -> s
 
     out = list(content)
     i, n = 0, len(content)
+    next_opener = _next_opener(
+        "'\"" + "/" * use_slash + "#" * use_hash + "-" * use_dash + "[" * use_long_brackets)
 
     def blank(a: int, b: int) -> None:
         for j in range(a, b):
@@ -69,6 +82,10 @@ def mask_noncode(content: str, language: str, *, mask_strings: bool = True) -> s
                 out[j] = " "
 
     while i < n:
+        found = next_opener(content, i)
+        if found is None:
+            break
+        i = found.start()
         ch = content[i]
         two = content[i:i + 2]
         # python triple-quoted strings

@@ -856,6 +856,19 @@ def _type_of_declaration(text: str, declared: str) -> str | None:
     return None if kind in _TYPE_WORDS else kind
 
 
+@functools.lru_cache(maxsize=8)
+def _local_declarations(content: str) -> tuple[tuple[str, str], ...]:
+    """The `(type, variable)` pairs a C/C++ text declares, in order.
+
+    Kept for the last few texts: the call graph asks for both the names and
+    the types a symbol declares, one right after the other.
+    """
+    return tuple(
+        (m.group(1), m.group(2)) for m in _LOCAL_DECL_RE.finditer(content)
+        if m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
+        and _opens_a_declaration(content, m.start()))
+
+
 def _declared_types(content: str, name: str, kind: str) -> dict[str, str]:
     """The class each variable a C/C++ symbol declares is of — its
     parameters and its locals — where the declaration writes it."""
@@ -884,10 +897,8 @@ def _declared_types(content: str, name: str, kind: str) -> dict[str, str]:
                 else:
                     part.append(ch)
     declared: list[tuple[str, str]] = [
-        (m.group(2), m.group(1).rsplit("::", 1)[-1].strip())
-        for m in _LOCAL_DECL_RE.finditer(content)
-        if m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
-        and _opens_a_declaration(content, m.start())]
+        (var, type_.rsplit("::", 1)[-1].strip())
+        for type_, var in _local_declarations(content)]
     # A lambda's or a range-for's parameters: `[](Mat* x)`, `for (Mat* x : v)`.
     declared += [(m.group(2), m.group(1)) for m in _INNER_PARAM_RE.finditer(content)
                  if m.group(1) not in _NOT_A_TYPE and m.group(1) not in _TYPE_WORDS]
@@ -910,10 +921,7 @@ def _declared_names(content: str, name: str, kind: str) -> set[str]:
     `blendColor()`."""
     names = set() if kind in ("class", "struct", "union", "enum") else _parameter_names(
         content, name, kind)
-    for m in _LOCAL_DECL_RE.finditer(content):
-        if (m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
-                and _opens_a_declaration(content, m.start())):
-            names.add(m.group(2))
+    names.update(var for _, var in _local_declarations(content))
     return names
 
 
