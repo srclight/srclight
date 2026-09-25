@@ -761,6 +761,44 @@ def _parameter_name(param: str) -> str | None:
     return words[-1]
 
 
+def _open_paren_after(text: str, name: str) -> int | None:
+    """Where the list opened by the first `name(` in `text` starts: just past
+    its `(`, spaces allowed before it and no identifier character, or `$`, just
+    before the name. None when there is no such call.
+
+    What `re.search(rf"(?<![\\w$]){re.escape(name)}\\s*\\(", text)` finds,
+    without compiling a pattern per name: every symbol has its own name, so
+    those patterns overflow the `re` cache and each one is compiled anew.
+    """
+    at = text.find(name)
+    while at != -1:
+        if at == 0 or (text[at - 1] != "$" and _IS_WORD_CHAR(text[at - 1]) is None):
+            i = at + len(name)
+            while i < len(text) and text[i].isspace():
+                i += 1
+            if i < len(text) and text[i] == "(":
+                return i + 1
+        at = text.find(name, at + 1)
+    return None
+
+
+def _standalone_at(text: str, name: str) -> int | None:
+    """Where `name` first stands on its own in `text`: no identifier
+    character or `:` just before it, no identifier character just after.
+
+    What `re.search(rf"(?<![\\w:]){re.escape(name)}(?![\\w])", text)` finds,
+    without a pattern per name (see _open_paren_after).
+    """
+    at = text.find(name)
+    while at != -1:
+        end = at + len(name)
+        if ((at == 0 or (text[at - 1] != ":" and _IS_WORD_CHAR(text[at - 1]) is None))
+                and (end == len(text) or _IS_WORD_CHAR(text[end]) is None)):
+            return at
+        at = text.find(name, at + 1)
+    return None
+
+
 def _parameter_names(content: str, name: str, kind: str) -> set[str]:
     """The parameter names of a C/C++ function or function-like macro, read
     from its text: the first parenthesised list after its own name."""
@@ -768,17 +806,17 @@ def _parameter_names(content: str, name: str, kind: str) -> set[str]:
         m = _MACRO_PARAMS_RE.search(content)
         return {p.strip() for p in m.group(1).split(",") if p.strip().isidentifier()} if m else set()
     short = name.rsplit("::", 1)[-1]
-    m = re.search(rf"(?<![\w$]){re.escape(short)}\s*\(", content)
-    if m is None:
+    opened = _open_paren_after(content, short)
+    if opened is None:
         return set()
-    depth, i = 1, m.end()
+    depth, i = 1, opened
     while i < len(content) and depth:
         depth += {"(": 1, ")": -1}.get(content[i], 0)
         i += 1
     found: set[str] = set()
     depth, part = 0, []
     # `<` and `>` are no brackets here: in a default argument they compare.
-    for ch in content[m.end():i - 1] + ",":
+    for ch in content[opened:i - 1] + ",":
         if ch in "([{":
             depth += 1
         elif ch in ")]}":
@@ -824,14 +862,14 @@ def _declared_types(content: str, name: str, kind: str) -> dict[str, str]:
     types: dict[str, str] = {}
     if kind not in ("class", "struct", "union", "enum", "macro"):
         short = name.rsplit("::", 1)[-1]
-        m = re.search(rf"(?<![\w$]){re.escape(short)}\s*\(", content)
-        if m is not None:
-            depth, i = 1, m.end()
+        opened = _open_paren_after(content, short)
+        if opened is not None:
+            depth, i = 1, opened
             while i < len(content) and depth:
                 depth += {"(": 1, ")": -1}.get(content[i], 0)
                 i += 1
             depth, part = 0, []
-            for ch in content[m.end():i - 1] + ",":
+            for ch in content[opened:i - 1] + ",":
                 if ch in "([{":
                     depth += 1
                 elif ch in ")]}":
@@ -972,14 +1010,14 @@ def _param_range(signature: str | None, name: str) -> tuple[int, float] | None:
     # A comma in a comment or a default string, `s = "a,b"`, parts nothing.
     signature = _SIGNATURE_NOISE_RE.sub(
         lambda m: " " if m.group(0).startswith("/") else "0", signature)
-    m = re.search(rf"(?<![\w$]){re.escape(name)}\s*\(", signature)
-    if m is None:
+    opened = _open_paren_after(signature, name)
+    if opened is None:
         return None
-    depth, i = 1, m.end()
+    depth, i = 1, opened
     while i < len(signature) and depth:
         depth += {"(": 1, ")": -1}.get(signature[i], 0)
         i += 1
-    params = signature[m.end():i - 1].strip()
+    params = signature[opened:i - 1].strip()
     if params in ("", "void"):
         return (0, 0)
     params = _without_template_commas(params)
@@ -1119,6 +1157,8 @@ _MEMBER_KINDS = frozenset({"method", "template"})
 
 
 def _without_template_args(qualified: str) -> str:
+    if "<" not in qualified:  # most names, and this runs per candidate target
+        return qualified
     while True:
         stripped = re.sub(r"<[^<>]*>", "", qualified)
         if stripped == qualified:
@@ -3003,6 +3043,9 @@ class Indexer:
         assert self.db.conn is not None
         from .db import is_vendored_path
 
+        # Asked for both ends of every edge: once per file is enough.
+        is_vendored_path = functools.lru_cache(maxsize=None)(is_vendored_path)
+
         # Clear all existing edges (full rebuild)
         self.db.conn.execute("DELETE FROM symbol_edges")
 
@@ -3088,6 +3131,10 @@ class Indexer:
                     and t.get("qualified", "").rsplit("::", 1)[-1] in macro_names
                     and (t.get("signature") or "").lstrip().startswith(
                         t.get("qualified", "").rsplit("::", 1)[-1] + "("))
+
+        # It depends on the target alone, and each is a candidate of many calls.
+        for info in symbol_info.values():
+            info["macro_misread"] = _macro_misread(info)
 
         member_aliases: set[str] = set()
         for name, syms in name_to_symbols.items():
@@ -3279,10 +3326,10 @@ class Indexer:
                 own_blanked = content
                 short_own = source_name.rsplit("::", 1)[-1]
                 for own in dict.fromkeys((source_name, short_own)):
-                    found = re.search(rf"(?<![\w:]){re.escape(own)}(?![\w])", own_blanked)
-                    if found:
-                        own_blanked = (own_blanked[:found.start()] + "#" * len(own)
-                                       + own_blanked[found.end():])
+                    found = _standalone_at(own_blanked, own)
+                    if found is not None:
+                        own_blanked = (own_blanked[:found] + "#" * len(own)
+                                       + own_blanked[found + len(own):])
                         break
                 receivers_of: dict[str, set] = {}
                 forms_of = _reference_forms_all(
@@ -3328,7 +3375,7 @@ class Indexer:
                                 and t["kind"] in ("method", "prototype", "function", "template"))
                                if _is_constructor(t, ref_name)
                                else t["kind"] in _EDGE_TARGET_KINDS)
-                           and not _macro_misread(t)
+                           and not t["macro_misread"]
                            and not (body is not None and t["body"] == body
                                     and t["file"] == source_file)]
                 targets = _without_forward_declarations(targets, source_file)
