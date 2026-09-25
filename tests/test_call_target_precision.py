@@ -1420,3 +1420,89 @@ void steer(Turn_c* t) {
     callees = json.loads(server.get_callees("steer"))["callees"]
     kinds = {e["kind"] for e in callees if e["name"] in ("Turn_c", "Turn_c::Turn_c")}
     assert "class" in kinds and kinds - {"class"}, callees
+
+
+def _edge_signatures(tmp_path, source: str, target: str) -> set:
+    db = Database(tmp_path / "edges" / "index.db")
+    db.open()
+    sigs = {r[0] for r in db.conn.execute(
+        """SELECT b.signature FROM symbol_edges e JOIN symbols a ON a.id = e.source_id
+           JOIN symbols b ON b.id = e.target_id WHERE a.name = ? AND b.name = ?""",
+        (source, target))}
+    db.close()
+    return sigs
+
+
+def test_a_string_argument_counts_as_an_argument(tmp_path):
+    _edges({"log/log.cpp": """\
+void emitLine() {
+}
+
+void emitLine(const char* text) {
+}
+""", "use/use.cpp": """\
+void driver() {
+    emitLine("hello");
+}
+"""}, tmp_path)
+    assert _edge_signatures(tmp_path, "driver", "emitLine") == {"void emitLine(const char* text)"}
+
+
+def test_a_forward_declaration_in_the_calling_file_leads_to_the_definition(tmp_path):
+    db_root = tmp_path / "edges"
+    _edges({"heap/heap.h": """\
+class HeapArena {
+public:
+    int used;
+};
+""", "use/user.cpp": """\
+class HeapArena;
+
+int useArena(HeapArena* arena) {
+    return 0;
+}
+"""}, tmp_path)
+    db = Database(db_root / "index.db")
+    db.open()
+    files = {r[0].replace("\\", "/") for r in db.conn.execute(
+        """SELECT f.path FROM symbol_edges e JOIN symbols a ON a.id = e.source_id
+           JOIN symbols b ON b.id = e.target_id JOIN files f ON f.id = b.file_id
+           WHERE a.name = 'useArena' AND b.name = 'HeapArena'""")}
+    db.close()
+    assert files == {"heap/heap.h"}, files
+
+
+def test_a_constructor_written_with_its_full_namespace_path_is_reached(tmp_path):
+    edges = _edges({"gfx/tint.h": """\
+namespace app {
+namespace gfx {
+class Tinter {
+public:
+    Tinter(int r, int g) {}
+};
+}
+}
+""", "use/use.cpp": """\
+void paintOne() {
+    app::gfx::Tinter(1, 2);
+}
+"""}, tmp_path)
+    assert ("paintOne", "app::gfx::Tinter::Tinter") in _pairs(edges)
+
+
+def test_a_construction_with_braces_calls_the_constructor(tmp_path):
+    edges = _edges({"box.h": """\
+class Boxer {
+public:
+    Boxer(int w, int h) {}
+};
+""", "use/use.cpp": """\
+Boxer makeOne() {
+    return Boxer{1, 2};
+}
+
+void keepOne(const Boxer& b) {
+}
+"""}, tmp_path)
+    ctor_callers = {a for a, b, _ in edges if b == "Boxer::Boxer"}
+    assert "makeOne" in ctor_callers and "keepOne" not in ctor_callers

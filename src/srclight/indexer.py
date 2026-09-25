@@ -779,6 +779,24 @@ _IDENT_RE = re.compile(r"(?:[^\W\d]|\$)[\w$]*")
 
 
 _TEMPLATE_ARGS_RE = re.compile(r"<[^<>(){};|&]*(?:<[^<>(){};|&]*>[^<>(){};|&]*)*>")
+_C_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n]){1,4}\'')
+
+
+def _literals_as_values(original: str, masked: str) -> str:
+    """Put back a value where masking blanked a string or character literal.
+
+    Blanked, `f("x")` reads as a call with no argument. The literal's span
+    is filled with `0`, which names nothing and is no bracket or comma. A
+    span masking did not blank entirely is left alone: a quote in code, or
+    across a comment's edge, is no literal to restore.
+    """
+    out = None
+    for m in _C_LITERAL_RE.finditer(original):
+        if masked[m.start():m.end()].isspace():
+            if out is None:
+                out = list(masked)
+            out[m.start():m.end()] = "0" * (m.end() - m.start())
+    return masked if out is None else "".join(out)
 
 
 def _call_arity(content: str, paren: int) -> int:
@@ -899,7 +917,11 @@ def _reference_forms_all(content: str, names: set[str],
             # The argument count of each call; None where the name is not
             # called there (a function pointer, a declaration).
             declared = _CONSTRUCTED_VAR_RE.match(ahead)
-            if after.startswith("("):
+            if after.startswith("(") or (
+                    # `T{1, 2}` constructs a T; `class T {` and a base,
+                    # `public T {`, open a body.
+                    after.startswith("{") and not before.endswith(("->", ".", "::"))
+                    and not _OPENS_A_BODY_RE.search(before)):
                 arities.setdefault(name, set()).add(
                     _call_arity(content, m.end() + len(ahead) - len(ahead.lstrip())))
             elif declared and declared.group(1) not in _NOT_A_TYPE and not before.endswith(
@@ -942,6 +964,10 @@ def _reference_forms_all(content: str, names: set[str],
             forms.add("bare")
     return found
 
+
+# Before a name followed by `{` that opens a body rather than constructing.
+_OPENS_A_BODY_RE = re.compile(
+    r"(?<![\w$])(?:class|struct|union|enum|namespace|public|private|protected|virtual|final)$")
 
 # After a type's name: a variable constructed with arguments, `a(1, 2)` or `a{1}`.
 _CONSTRUCTED_VAR_RE = re.compile(r"\s+([A-Za-z_]\w*)\s*[({]")
@@ -1947,11 +1973,17 @@ class Indexer:
             elsewhere: beside that definition among the candidates it is no
             target of its own — a class declared ahead in many headers would
             look ambiguous. Declared in the calling file, it tells which
-            class the file means, and stays."""
+            class the file means: the candidates narrow to that class and
+            its members."""
             defined = {t["qualified"] for t in targets if t["c_class_body"]}
-            return [t for t in targets
-                    if not (t["forward"] and t["qualified"] in defined
-                            and t["file"] != source_file)]
+            meant = {t["qualified"] for t in targets
+                     if t["forward"] and t["qualified"] in defined and t["file"] == source_file}
+            kept = [t for t in targets if not (t["forward"] and t["qualified"] in defined)]
+            if len(meant) == 1:
+                (qualified,) = meant
+                kept = [t for t in kept if (t["c_class_body"] and t["qualified"] == qualified)
+                        or (t["qualified"] or "").startswith(qualified + "::")]
+            return kept
         # A prototype is no target, but its signature is the function's too:
         # default arguments are often written there only.
         prototype_signatures: dict[str, list[str]] = {}
@@ -2125,6 +2157,9 @@ class Indexer:
             # Mask comments/strings BEFORE scanning: a name that appears only in
             # prose is not a reference (12.8% of sampled edges were this class).
             content = mask_noncode(row["content"], row["language"] or "")
+            if row["language"] in ("c", "cpp"):
+                # A literal is still an argument: `f("x")` passes one.
+                content = _literals_as_values(row["content"], content)
             if row["kind"] not in _CALLABLE_KINDS:
                 content = _own_text(
                     content, row["start_line"], _text_end(row),
@@ -2183,9 +2218,14 @@ class Indexer:
                 wanted = {n for n in referenced_names if "::" in n}
                 if wanted:
                     for m in _QUALIFIED_CALL_RE.finditer(own_blanked):
-                        if m.group(1) in wanted:
-                            arities_of.setdefault(m.group(1), set()).add(
-                                _call_arity(own_blanked, m.start(2)) if m.group(2) else None)
+                        # The matcher may know the name by its last parts
+                        # only: `app::gfx::Tinter(1)` is a call to `gfx::Tinter`.
+                        parts = m.group(1).split("::")
+                        for k in range(len(parts) - 1):
+                            written = "::".join(parts[k:])
+                            if written in wanted:
+                                arities_of.setdefault(written, set()).add(
+                                    _call_arity(own_blanked, m.start(2)) if m.group(2) else None)
                 # A parameter or local hides the name written bare only:
                 # `x.name()`, `::name()` and `C::name()` still call.
                 for declared in _declared_names(content, source_name, row["kind"]):
