@@ -659,6 +659,92 @@ class Database:
             return None
         return self._row_to_symbol(row)
 
+    def get_graph_symbols(self, name: str) -> list[SymbolRecord]:
+        """The symbols whose graph edges answer for `name`.
+
+        A C++ method declared in its class and defined outside it is two
+        symbols: the declaration, named `f` with qualified name `C::f`, and
+        the definition, named `C::f`. Calls written `obj->f()` land on the
+        declaration; the body scanned for callees is the definition's. So a
+        qualified name stands for every symbol it names — by name or by
+        qualified name — and their edges together are the method's. A bare
+        name resolves as get_symbol_by_name does.
+
+        A qualified name also matches the end of a longer qualified name:
+        every qualified name carries the enclosing namespace, while the
+        definition's own name is only class-qualified, so `C::f` must reach
+        `ns::C::f`. The same class in two namespaces then answers for both,
+        which callers see through `matched_symbols`.
+        """
+        assert self.conn is not None
+        if "::" not in name:
+            sym = self.get_symbol_by_name(name)
+            return [sym] if sym is not None else []
+        # And the reverse: under `using namespace ns;` a definition's
+        # qualified name is `C::f` while its declaration's is `ns::C::f`, so
+        # `ns::C::f` must reach a qualified name equal to one of its tails.
+        # Only the qualified name: the plain name of a definition is `C::f`
+        # in every namespace, and matching it would pull in `other::C::f`.
+        # A tail is that short form only when its scope is no type of its
+        # own: with a global `C` in the index, `C::f` is another class's
+        # method, not `ns::C::f` written under `using namespace ns`.
+        parts = name.split("::")
+        tails = [t for t in ("::".join(parts[i:]) for i in range(1, len(parts) - 1))
+                 if not self._names_a_type(t.rsplit("::", 1)[0])]
+        tail = "::" + name
+        marks = ",".join("?" * len(tails)) or "NULL"
+        rows = self.conn.execute(
+            f"""SELECT s.*, f.path as file_path FROM symbols s
+               JOIN files f ON s.file_id = f.id
+               WHERE s.name = ? OR s.qualified_name = ?
+                  OR substr(s.qualified_name, -?) = ?
+                  OR s.qualified_name IN ({marks})
+               ORDER BY s.id""",
+            (name, name, len(tail), tail, *tails),
+        ).fetchall()
+        return [self._row_to_symbol(r) for r in rows]
+
+    def _names_a_type(self, qualified_name: str) -> bool:
+        """Whether a class, struct or union is indexed under exactly this
+        qualified name."""
+        assert self.conn is not None
+        return self.conn.execute(
+            """SELECT 1 FROM symbols
+               WHERE qualified_name = ? AND kind IN ('class', 'struct', 'union', 'template')
+               LIMIT 1""",
+            (qualified_name,),
+        ).fetchone() is not None
+
+    def graph_entity_names(self, syms: list[SymbolRecord]) -> list[str]:
+        """The distinct entities a set of graph symbols stands for, by name.
+
+        `C::f` beside `ns::C::f` is one method written two ways — a definition
+        under `using namespace ns` — unless a type `C` exists of its own, in
+        which case they are two methods of two classes and both are named.
+        """
+        names = {sym.qualified_name or sym.name for sym in syms}
+
+        def short_form(n: str) -> bool:
+            return ("::" in n
+                    and any(o != n and o.endswith("::" + n) for o in names)
+                    and not self._names_a_type(n.rsplit("::", 1)[0]))
+
+        return sorted(n for n in names if not short_form(n))
+
+    def count_graph_targets(self, name: str) -> int:
+        """How many symbols a call written `name` could land on."""
+        assert self.conn is not None
+        from .indexer import _doc_languages
+
+        excluded = sorted(_doc_languages())
+        return self.conn.execute(
+            f"""SELECT COUNT(*) FROM symbols s JOIN files f ON s.file_id = f.id
+               WHERE s.name = ? AND s.kind IN
+               ('function','method','class','struct','enum','interface','template')
+               AND f.language NOT IN ({",".join("?" * len(excluded))})""",
+            (name, *excluded),
+        ).fetchone()[0]
+
     def get_symbols_by_name(self, name: str, limit: int = 20) -> list[SymbolRecord]:
         """Get all symbols matching exact name, with LIKE fallback."""
         assert self.conn is not None
@@ -1147,9 +1233,12 @@ class Database:
                 "confidence": 0.7,
             })
 
-        # Also check for explicit 'tests' edges if any exist
-        sym = self.get_symbol_by_name(symbol_name)
-        if sym and sym.id:
+        # Also check for explicit 'tests' edges if any exist — on every symbol
+        # the name stands for, as the other graph queries do.
+        seen = {r["symbol"].id for r in results if r["symbol"].id}
+        for sym in self.get_graph_symbols(symbol_name):
+            if not sym.id:
+                continue
             edge_rows = self.conn.execute(
                 """SELECT s.*, f.path as file_path, e.edge_type, e.confidence
                    FROM symbol_edges e
@@ -1159,10 +1248,10 @@ class Database:
                    ORDER BY s.name""",
                 (sym.id,),
             ).fetchall()
-            seen = {r["symbol"].id for r in results if r["symbol"].id}
             for r in edge_rows:
                 s = self._row_to_symbol(r)
                 if s.id not in seen:
+                    seen.add(s.id)
                     results.append({
                         "symbol": s,
                         "edge_type": r["edge_type"],

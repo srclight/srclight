@@ -798,7 +798,8 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
             for schema, project_name in batch:
                 try:
                     rows = wdb.conn.execute(
-                        f"""SELECT s.name, s.kind, s.signature, s.start_line, s.end_line, s.doc_comment
+                        f"""SELECT s.name, s.qualified_name, s.kind, s.signature, s.start_line,
+                                  s.end_line, s.doc_comment
                            FROM [{schema}].symbols s
                            JOIN [{schema}].files f ON s.file_id = f.id
                            WHERE f.path = ?
@@ -807,6 +808,8 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
                     ).fetchall()
                     all_results.extend({
                         "name": r["name"],
+                        **({"qualified_name": r["qualified_name"]}
+                           if r["qualified_name"] and r["qualified_name"] != r["name"] else {}),
                         "kind": r["kind"],
                         "signature": r["signature"],
                         "line": r["start_line"],
@@ -831,6 +834,9 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
     for sym in symbols:
         result.append({
             "name": sym.name,
+            # Three `CheckFlag`s of three classes read alike without it.
+            **({"qualified_name": sym.qualified_name}
+               if sym.qualified_name and sym.qualified_name != sym.name else {}),
             "kind": sym.kind,
             "signature": sym.signature,
             "line": sym.start_line,
@@ -844,6 +850,136 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
 
 
 # --- Tier 2: Graph tools ---
+
+
+def _union_edges(syms, fetch) -> list[dict]:
+    """The edges of every symbol a graph query resolved to, each one once.
+
+    Overloads and a declaration/definition pair share their callers: name
+    resolution links one call to each of them, and listing it once per
+    symbol would repeat the same location.
+    """
+    seen: set[tuple] = set()
+    edges: list[dict] = []
+    for sym in syms:
+        for edge in fetch(sym.id):
+            key = (edge["symbol"].id, edge["edge_type"])
+            if key not in seen:
+                seen.add(key)
+                edges.append(edge)
+    return edges
+
+
+def _matched_symbols(db: Database, syms, incoming: bool = True) -> dict:
+    """Name what a qualified name was resolved to, when it was more than one.
+
+    `C::f` reaches `ns::C::f` — and the same class in another namespace, or a
+    global class of that name. The merged answer is only honest if it says
+    what it merged. For the calls into a symbol, it also says when the graph
+    cannot hold them all.
+    """
+    names = db.graph_entity_names(syms)
+    context = {"matched_symbols": names} if len(names) > 1 else {}
+    if incoming:
+        context.update(_graph_coverage(db, syms))
+    return context
+
+
+def _graph_coverage(db: Database, syms) -> dict:
+    """Say when calls to a name are missing from the graph by design.
+
+    An empty caller list reads as "nobody calls this". For a name the graph
+    leaves out, or keeps only the calls the evidence decides, it means no
+    such thing — and the answer has to say so.
+    """
+    from .indexer import GRAPH_MAX_FANOUT, graph_name_excluded
+
+    for name in sorted({sym.name.rsplit("::", 1)[-1] for sym in syms}):
+        search = f"find_pattern(r'\\b{re.escape(name)}\\s*\\(') lists the call sites."
+        if graph_name_excluded(name):
+            # A call written with the class, `C::name()`, names one member and
+            # is kept.
+            from .indexer import _without_template_args
+            qualified = sorted({
+                "::".join(_without_template_args(sym.qualified_name or sym.name).split("::")[-2:])
+                for sym in syms if "::" in (sym.qualified_name or sym.name)})
+            if qualified:
+                return {"graph_note": (
+                    f"Only calls written `{qualified[0]}(...)` are in the graph: `{name}` "
+                    f"alone is too short or too common to tell a call from a variable. "
+                    f"{search}")}
+            return {"graph_note": (
+                f"Calls to `{name}` are not in the graph: the name is too short or "
+                f"too common to tell a call from a variable. {search}")}
+        defined = db.count_graph_targets(name)
+        if defined > GRAPH_MAX_FANOUT:
+            return {"graph_note": (
+                f"`{name}` is defined {defined} times. A call that only the name "
+                f"could resolve — `p->{name}()` with the type of `p` unknown — is "
+                f"left out, so callers may be missing. {search}")}
+    return {}
+
+
+_CALL_SITE_RE = re.compile(r"(?<![\w$])([A-Za-z_]\w*)\s*\(")
+
+
+def _callee_coverage(db: Database, syms, result: list[dict]) -> dict:
+    """Name the calls a body makes that the graph leaves out by design.
+
+    A callee list that silently skips `update()` and `calc()` reads as a
+    body that never calls them. The names it calls but the graph excludes —
+    too common, or defined too often to tell which one — are listed. Only
+    a callable's body is read, and in C/C++ what reads as a declaration
+    (`Timer refresh(5)`) or a member initializer (`: refresh(0)`) is no call.
+    """
+    from .indexer import _NOT_A_TYPE, GRAPH_MAX_FANOUT, graph_name_excluded
+    from .refmask import mask_noncode
+
+    listed = {e["name"].rsplit("::", 1)[-1] for e in result}
+    called: set[str] = set()
+    for sym in syms:
+        if not sym.content or sym.kind not in ("function", "method", "template", "macro"):
+            continue
+        row = db.conn.execute(
+            "SELECT language FROM files WHERE path = ?", (sym.file_path,)).fetchone()
+        language = (row[0] if row else "") or ""
+        text = mask_noncode(sym.content, language)
+        own = sym.name.rsplit("::", 1)[-1]
+        head_seen = False
+        for m in _CALL_SITE_RE.finditer(text):
+            name = m.group(1)
+            if name == own and not head_seen:
+                head_seen = True  # the definition's own name, not a call
+                continue
+            if language in ("c", "cpp"):
+                before = text[max(0, m.start() - 80):m.start()].rstrip()
+                word = re.search(r"([A-Za-z_]\w*)$", before)
+                if before.endswith(":") and not before.endswith("::"):
+                    continue  # a member initializer
+                if (before.endswith(("*", "&", ">")) and not before.endswith("->")) or (
+                        word and word.group(1) not in _NOT_A_TYPE):
+                    continue  # `Type name(...)`: a declaration
+            called.add(name)
+    missing = []
+    for name in sorted(called - listed):
+        defined = db.count_graph_targets(name)
+        if defined and (graph_name_excluded(name) or defined > GRAPH_MAX_FANOUT):
+            missing.append(name)
+    if not missing:
+        return {}
+    shown = ", ".join(f"`{n}`" for n in missing[:15]) + (" …" if len(missing) > 15 else "")
+    return {"graph_note": (
+        f"Calls to {shown} are not listed: these names are too common, or defined more "
+        f"than {GRAPH_MAX_FANOUT} times, for the graph to tell which one is called. "
+        f"find_pattern can locate the call sites.")}
+
+
+def _short_signature(signature: str | None) -> str | None:
+    """A signature on one line, cut at 200 characters."""
+    if not signature:
+        return None
+    flat = " ".join(signature.split())
+    return flat if len(flat) <= 200 else flat[:197] + "..."
 
 
 def _dedup_edges(edges: list[dict]) -> list[dict]:
@@ -861,12 +997,23 @@ def _dedup_edges(edges: list[dict]) -> list[dict]:
             "edge_type": c["edge_type"],
             "confidence": confidence,
         }
+        # Which overload the edge reaches: its line alone does not say.
+        signature = _short_signature(s.signature)
+        if signature:
+            entry["signature"] = signature
+        # name_only: the call names a symbol of this name, and nothing tells
+        # which of its homonyms it is — the receiver's type is not known.
+        if c.get("resolution"):
+            entry["resolution"] = c["resolution"]
         if name not in by_name:
             by_name[name] = entry
-            by_name[name]["_locations"] = [(s.file_path, s.start_line)]
+            by_name[name]["_locations"] = [(s.file_path, s.start_line, signature)]
         else:
-            by_name[name]["_locations"].append((s.file_path, s.start_line))
+            if (s.file_path, s.start_line, signature) not in by_name[name]["_locations"]:
+                by_name[name]["_locations"].append((s.file_path, s.start_line, signature))
             if confidence > by_name[name]["confidence"]:
+                by_name[name].pop("resolution", None)
+                by_name[name].pop("signature", None)
                 by_name[name].update(entry)
                 by_name[name]["_locations"] = by_name[name]["_locations"]
 
@@ -874,7 +1021,8 @@ def _dedup_edges(edges: list[dict]) -> list[dict]:
     for entry in by_name.values():
         locations = entry.pop("_locations")
         if len(locations) > 1:
-            entry["locations"] = [{"file": f, "line": l} for f, l in locations]
+            entry["locations"] = [{"file": f, "line": l, **({"signature": g} if g else {})}
+                                  for f, l, g in locations]
         result.append(entry)
 
     result.sort(key=lambda r: (
@@ -910,29 +1058,34 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        syms = db.get_graph_symbols(symbol_name)
+        if not syms:
             db.close()
             return _symbol_not_found_error(symbol_name, project)
-        callers = db.get_callers(sym.id)
+        callers = _union_edges(syms, db.get_callers)
         result = _dedup_edges(callers)
+        matched = _matched_symbols(db, syms)
         db.close()
         return json.dumps({
             "project": project,
             "symbol": symbol_name,
             "caller_count": len(result),
             "callers": result,
+            **matched,
         }, indent=2)
 
     db = _get_db()
-    sym = db.get_symbol_by_name(symbol_name)
-    if sym is None:
+    # A qualified method name stands for its declaration and its definition:
+    # calls land on the one, the scanned body is the other's.
+    syms = db.get_graph_symbols(symbol_name)
+    if not syms:
         return _symbol_not_found_error(symbol_name)
 
-    callers = db.get_callers(sym.id)
+    callers = _union_edges(syms, db.get_callers)
     result = _dedup_edges(callers)
 
-    payload = {"symbol": symbol_name, "caller_count": len(result), "callers": result}
+    payload = {"symbol": symbol_name, "caller_count": len(result), "callers": result,
+               **_matched_symbols(db, syms)}
     # A stale caller file makes the whole edge list suspect — stamp the union.
     _stamp_freshness(payload, (c.get("file") or c.get("file_path")
                                for c in result if isinstance(c, dict)))
@@ -963,29 +1116,34 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        syms = db.get_graph_symbols(symbol_name)
+        if not syms:
             db.close()
             return _symbol_not_found_error(symbol_name, project)
-        callees = db.get_callees(sym.id)
+        callees = _union_edges(syms, db.get_callees)
         result = _dedup_edges(callees)
+        matched = {**_matched_symbols(db, syms, incoming=False),
+                   **_callee_coverage(db, syms, result)}
         db.close()
         return json.dumps({
             "project": project,
             "symbol": symbol_name,
             "callee_count": len(result),
             "callees": result,
+            **matched,
         }, indent=2)
 
     db = _get_db()
-    sym = db.get_symbol_by_name(symbol_name)
-    if sym is None:
+    syms = db.get_graph_symbols(symbol_name)
+    if not syms:
         return _symbol_not_found_error(symbol_name)
 
-    callees = db.get_callees(sym.id)
+    callees = _union_edges(syms, db.get_callees)
     result = _dedup_edges(callees)
 
-    payload = {"symbol": symbol_name, "callee_count": len(result), "callees": result}
+    payload = {"symbol": symbol_name, "callee_count": len(result), "callees": result,
+               **_matched_symbols(db, syms, incoming=False),
+               **_callee_coverage(db, syms, result)}
     _stamp_freshness(payload, (c.get("file") or c.get("file_path")
                                for c in result if isinstance(c, dict)))
     return json.dumps(payload, indent=2)
@@ -1142,18 +1300,21 @@ def get_dependents(symbol_name: str, transitive: bool = False, project: str | No
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        syms = db.get_graph_symbols(symbol_name)
+        if not syms:
             db.close()
             return _symbol_not_found_error(symbol_name, project)
-        deps = db.get_dependents(sym.id, transitive=transitive)
+        deps = _union_edges(syms, lambda i: db.get_dependents(i, transitive=transitive))
+        matched = _matched_symbols(db, syms)
         db.close()
     else:
         db = _get_db()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        # The same symbols get_callers answers for, or the two disagree.
+        syms = db.get_graph_symbols(symbol_name)
+        if not syms:
             return _symbol_not_found_error(symbol_name)
-        deps = db.get_dependents(sym.id, transitive=transitive)
+        deps = _union_edges(syms, lambda i: db.get_dependents(i, transitive=transitive))
+        matched = _matched_symbols(db, syms)
 
     result = _dedup_edges(deps)
     return json.dumps({
@@ -1161,6 +1322,7 @@ def get_dependents(symbol_name: str, transitive: bool = False, project: str | No
         "transitive": transitive,
         "dependent_count": len(result),
         "dependents": result,
+        **matched,
     }, indent=2)
 
 
@@ -2936,8 +3098,8 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        syms = db.get_graph_symbols(symbol_name)
+        if not syms:
             db.close()
             return _symbol_not_found_error(symbol_name, project)
         # Build sym_to_community map from stored data
@@ -2949,12 +3111,14 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
         flows = db.get_execution_flows()
         # Reconstruct flow step dicts for compute_impact
         flow_dicts = _reconstruct_flows(db, flows)
-        result = compute_impact(db, sym.id, sym_to_comm, flow_dicts)
+        result = compute_impact(db, syms[0].id, sym_to_comm, flow_dicts,
+                                also=[s.id for s in syms[1:]])
+        matched = _matched_symbols(db, syms)
         db.close()
     else:
         db = _get_db()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        syms = db.get_graph_symbols(symbol_name)
+        if not syms:
             return _symbol_not_found_error(symbol_name)
         communities = db.get_communities()
         sym_to_comm = {}
@@ -2963,12 +3127,15 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
                 sym_to_comm[m["id"]] = c["id"]
         flows = db.get_execution_flows()
         flow_dicts = _reconstruct_flows(db, flows)
-        result = compute_impact(db, sym.id, sym_to_comm, flow_dicts)
+        result = compute_impact(db, syms[0].id, sym_to_comm, flow_dicts,
+                                also=[s.id for s in syms[1:]])
+        matched = _matched_symbols(db, syms)
 
     return json.dumps({
         "symbol": symbol_name,
         "project": project,
         **result,
+        **matched,
     }, indent=2)
 
 
