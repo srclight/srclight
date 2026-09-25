@@ -869,6 +869,16 @@ _CALLABLE_KINDS_CPP = frozenset({"function", "method"})
 _TOP_LEVEL_PARENTS = frozenset({"translation_unit", "declaration_list"})
 
 
+def _under_error(node: Node) -> bool:
+    """Whether error recovery put a node inside an ERROR node."""
+    parent = node.parent
+    while parent is not None:
+        if parent.type == "ERROR":
+            return True
+        parent = parent.parent
+    return False
+
+
 def _at_top_level(node: Node) -> bool:
     parent = node.parent
     if parent is not None and parent.type == "template_declaration":
@@ -1826,6 +1836,12 @@ class Indexer:
                                     or (swallowed and kind in _CALLABLE_KINDS_CPP)):
                                 sym = recovered[i]
                                 recovered_nodes.add(id(twin))
+                        elif _under_error(node) and not _under_error(twin):
+                            # Same extent, but the split elsewhere broke the
+                            # class around it in the original parse: only
+                            # the reparse knows the class it belongs to.
+                            sym = recovered[i]
+                            recovered_nodes.add(id(twin))
                         break
                 else:
                     # One definition read as two kinds: a class head broken

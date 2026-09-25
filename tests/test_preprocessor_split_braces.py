@@ -1043,3 +1043,28 @@ void reset(void) {
     docs = dict(db.conn.execute("SELECT name, doc_comment FROM symbols"))
     assert docs["reset"] == "// doc of reset"
 
+
+
+def test_members_parsed_alike_in_both_parses_keep_their_class(tmp_path, db):
+    _index(tmp_path, db, {"holder.h": """\
+template <class T>
+class Holder {
+public:
+    T& get() {
+        return v;
+    }
+    void set(T x) {
+#if FAST
+        if (x) {
+#else
+        if (x && ok()) {
+#endif
+            v = x;
+        }
+    }
+    T v;
+};
+"""})
+    names = {r[0]: r[1] for r in db.conn.execute(
+        "SELECT name, qualified_name FROM symbols WHERE name IN ('get', 'set')")}
+    assert names == {"get": "Holder::get", "set": "Holder::set"}, names
