@@ -70,6 +70,32 @@ def _discover() -> None:
         logger.debug("Pillow not installed — image extraction disabled")
 
 
+# Document formats whose ignore pattern is CONDITIONAL: `*.pdf` sits in the
+# indexer's default ignore list next to `*.zip` and `*.exe`, but unlike them
+# it is there only because the extractor that reads it may be missing — the
+# indexer drops the pattern when the extra is installed. Every other ignored
+# extension is excluded on purpose.
+#
+# Only formats carrying such a pattern belong here. A `.docx` or `.html` with
+# no extractor is already counted as a gap by the ordinary "no language for
+# this suffix" path, and listing it here would do nothing but confuse the two
+# cases. Hand-maintained because the classes that would name these suffixes
+# are exactly the ones that fail to import — see
+# tests/test_scan_gaps.py::test_every_conditionally_ignored_format_has_a_pattern.
+CONDITIONALLY_IGNORED_DOCUMENT_EXTENSIONS = (".pdf",)
+
+
+def unreadable_document_extensions() -> tuple[str, ...]:
+    """Conditionally-ignored suffixes this install cannot read.
+
+    A file ignored ONLY by one of these patterns is unread for want of an
+    extra, not by intent, so it counts as a gap.
+    """
+    return tuple(
+        e for e in CONDITIONALLY_IGNORED_DOCUMENT_EXTENSIONS if e not in DOCUMENT_EXTENSIONS
+    )
+
+
 def detect_document_language(suffix: str) -> str | None:
     """Return the language name for a document extension, or None."""
     return DOCUMENT_EXTENSIONS.get(suffix.lower())

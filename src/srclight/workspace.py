@@ -444,6 +444,14 @@ class WorkspaceDB:
             for r in q(f"SELECT kind, COUNT(*) as n FROM [{schema}].symbols GROUP BY kind")
         }
         last_indexed = q(f"SELECT MAX(indexed_at) as t FROM [{schema}].files").fetchone()["t"]
+        # What the project's last index run walked past. Read here so a
+        # per-project answer can say what it never scanned.
+        unindexed = self._read_json_setting(schema, "unindexed_extensions")
+        # And the extra extensions it was told to read, so a workspace answer
+        # can name them as indexed.
+        overrides = self._read_json_setting(schema, "extension_overrides")
+        oversize = self._read_count_setting(schema, "oversize_skipped")
+        failed = self._read_count_setting(schema, "failed_files")
         embedded, model, dimensions = 0, None, None
         if q(f"SELECT name FROM [{schema}].sqlite_master "
               f"WHERE type='table' AND name='symbol_embeddings'").fetchone():
@@ -456,7 +464,33 @@ class WorkspaceDB:
             "files": files, "symbols": symbols, "edges": edges,
             "languages": languages, "kinds": kinds, "last_indexed": last_indexed,
             "embedded": embedded, "model": model, "dimensions": dimensions,
+            "unindexed_extensions": unindexed, "extension_overrides": overrides,
+            "oversize_skipped": oversize, "failed_files": failed,
         }
+
+    def _read_count_setting(self, schema: str, key: str) -> int:
+        """A count the last index run recorded in schema_info, 0 when absent."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            f"SELECT value FROM [{schema}].schema_info WHERE key = ?", (key,)).fetchone()
+        try:
+            return int(row["value"]) if row else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _read_json_setting(self, schema: str, key: str) -> dict:
+        """Read one JSON-valued schema_info row from an attached project."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            f"SELECT value FROM [{schema}].schema_info WHERE key = ?", (key,)
+        ).fetchone()
+        if not row:
+            return {}
+        try:
+            loaded = json.loads(row["value"])
+        except (TypeError, ValueError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
 
     def _collect_stats(self, project_filter: str | None = None) -> dict[str, dict[str, Any]]:
         """project_name -> stats for every indexable project (or one).
@@ -555,6 +589,15 @@ class WorkspaceDB:
                 "last_file_change": st.get("last_file_change", st["last_indexed"]),
                 "embedded_symbols": st["embedded"],
                 "embedding_coverage": round(st["embedded"] / st["symbols"], 4) if st["symbols"] else 0.0,
+                # {extension: file count} this project holds and the index
+                # never read. Empty means the run covered what it walked.
+                "unindexed_extensions": st.get("unindexed_extensions", {}),
+                # Extra extensions declared for this project, {extension: language}.
+                "extension_overrides": st.get("extension_overrides", {}),
+                # Files this project's last run refused on size.
+                "oversize_skipped": st.get("oversize_skipped", 0),
+                # Files this project's last run could not read.
+                "failed_files": st.get("failed_files", 0),
             })
 
         # Also list unindexed projects
@@ -582,7 +625,8 @@ class WorkspaceDB:
         """
         assert self.conn is not None
         from .db import (
-            _IDENT_RE, RUNG_NONE, is_vendored_path, match_rung, split_identifier,
+            _IDENT_RE, RUNG_NONE, add_symbol_lines, is_vendored_path, match_rung,
+            split_identifier,
         )
 
         results: list[dict[str, Any]] = []
@@ -777,6 +821,14 @@ class WorkspaceDB:
                     seen_ids.add(key)
             except sqlite3.OperationalError as e:
                 self._fts_leg_failed(schema, "docs", e)
+
+            # Lines are read now, while the schema is attached: past
+            # MAX_ATTACH projects a later pass would attach them all again.
+            try:
+                add_symbol_lines(
+                    self.conn, [r for r in results if r["project"] == project_name], schema)
+            except sqlite3.DatabaseError:
+                pass  # a project that cannot be read keeps its hits, lineless
 
         # Collapse repeats. One row per (project, name, kind), carrying how many
         # it stands for. A human's eye skips a duplicate; an agent reads it as
