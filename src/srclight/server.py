@@ -923,6 +923,31 @@ def _graph_coverage(db: Database, syms) -> dict:
 _CALL_SITE_RE = re.compile(r"(?<![\w$])([A-Za-z_]\w*)\s*\(")
 
 
+_TYPE_BEFORE_NAME_RE = re.compile(
+    r"(?:^|[;{}])\s*(?:(?:const|static|constexpr|volatile|register)\s+)*"
+    r"[A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?(?:\s*[*&]+\s*|\s+)$")
+_TYPE_WORD_RE = re.compile(
+    r"\s*(?:(?:const|static|constexpr|volatile|register)\s+)*([A-Za-z_][\w:]*)")
+
+
+def _declares_or_initializes(before: str) -> bool:
+    """Whether a `name(` preceded by `before` is no call: a variable
+    constructed on the spot (`Timer t(5);`, a statement of its own) or the
+    first member initializer of a constructor (`Foo(int v) : m(v)`). A `:`
+    after `case`, `default` or a `?` and an operator before the name
+    (`a && f()`, `x * f()`) leave it a call."""
+    from .indexer import _NOT_A_TYPE
+
+    stripped = before.rstrip()
+    if stripped.endswith(":") and not stripped.endswith("::"):
+        return stripped[:-1].rstrip().endswith(")")
+    match = _TYPE_BEFORE_NAME_RE.search(before)
+    if match is None:
+        return False
+    type_word = _TYPE_WORD_RE.match(before[match.start():].lstrip(";{} \t\r\n"))
+    return type_word is not None and type_word.group(1) not in _NOT_A_TYPE
+
+
 def _callee_coverage(db: Database, syms, result: list[dict]) -> dict:
     """Name the calls a body makes that the graph leaves out by design.
 
@@ -951,14 +976,9 @@ def _callee_coverage(db: Database, syms, result: list[dict]) -> dict:
             if name == own and not head_seen:
                 head_seen = True  # the definition's own name, not a call
                 continue
-            if language in ("c", "cpp"):
-                before = text[max(0, m.start() - 80):m.start()].rstrip()
-                word = re.search(r"([A-Za-z_]\w*)$", before)
-                if before.endswith(":") and not before.endswith("::"):
-                    continue  # a member initializer
-                if (before.endswith(("*", "&", ">")) and not before.endswith("->")) or (
-                        word and word.group(1) not in _NOT_A_TYPE):
-                    continue  # `Type name(...)`: a declaration
+            if language in ("c", "cpp") and _declares_or_initializes(
+                    text[max(0, m.start() - 120):m.start()]):
+                continue
             called.add(name)
     missing = []
     for name in sorted(called - listed):
