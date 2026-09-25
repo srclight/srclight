@@ -790,12 +790,17 @@ _FILENAME_TO_LANG: dict[str, str] = {
 }
 
 
-_C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+# Strings and character literals first, so a `/*` inside one — "logs/*" —
+# opens no comment that would swallow the code up to the next `*/`.
+_C_COMMENT_RE = re.compile(
+    r'"(?:\\.|[^"\\\n])*"' r"|'(?:\\.|[^'\\\n])*'" r"|(/\*.*?\*/|//[^\n]*)",
+    re.DOTALL,
+)
 
 
 def _without_c_comments(text: str) -> str:
     """The text with its comments removed: a comment may mention a class."""
-    return _C_COMMENT_RE.sub(" ", text)
+    return _C_COMMENT_RE.sub(lambda m: " " if m.group(1) else m.group(0), text)
 
 
 # Constructs that only C++ writes, looked for past a header's head.

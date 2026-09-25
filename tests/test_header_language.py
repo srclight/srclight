@@ -48,3 +48,9 @@ def test_blank_lines_do_not_slow_detection_down(tmp_path):
     start = time.monotonic()
     assert detect_language(path) == "c"
     assert time.monotonic() - start < 1.0
+
+
+def test_a_comment_opener_inside_a_string_hides_nothing(tmp_path):
+    text = ('#define LOG_GLOB "logs/*"\n' + C_PREAMBLE
+            + "class Sink_c : public Base_c {\npublic:\n    void flush();\n};\n/* end */\n")
+    assert detect_language(_header(tmp_path, text)) == "cpp"
