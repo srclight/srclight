@@ -3133,12 +3133,13 @@ class Indexer:
 
         def _macro_misread(t: dict) -> bool:
             # A constructor opens with its class's name, `Box(int)`: a macro
-            # of that name makes it no misread.
+            # of that name makes it no misread. Every symbol is asked, so one
+            # stored without a qualified name must not stop the graph.
+            short = (t.get("qualified") or "").rsplit("::", 1)[-1]
             return (t["kind"] in ("function", "method", "prototype")
-                    and not _is_constructor(t, t.get("qualified", "").rsplit("::", 1)[-1])
-                    and t.get("qualified", "").rsplit("::", 1)[-1] in macro_names
-                    and (t.get("signature") or "").lstrip().startswith(
-                        t.get("qualified", "").rsplit("::", 1)[-1] + "("))
+                    and not _is_constructor(t, short)
+                    and short in macro_names
+                    and (t.get("signature") or "").lstrip().startswith(short + "("))
 
         # It depends on the target alone, and each is a candidate of many calls.
         for info in symbol_info.values():

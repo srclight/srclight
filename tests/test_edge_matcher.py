@@ -122,6 +122,15 @@ def test_bitwise_complement_does_not_hide_the_name(indexed):
     assert "mask_value" in _calls(indexed, "clear_mask")
 
 
+def test_a_function_without_a_qualified_name_does_not_stop_the_graph(indexed, cpp_project):
+    """Every symbol is checked for a macro misread up front, not only the
+    candidates of a call; one stored without a qualified name must pass."""
+    indexed.conn.execute(
+        "UPDATE symbols SET qualified_name = NULL WHERE name = 'lookup_slot'")
+    Indexer(indexed, IndexConfig(root=cpp_project, disable_embeddings=True))._build_edges()
+    assert "mask_value" in _calls(indexed, "clear_mask")
+
+
 # --- property: the matcher agrees with a reference alternation ---------------
 
 def _reference_matcher(names):
