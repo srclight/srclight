@@ -662,7 +662,10 @@ class Database:
                 """SELECT s.name, s.qualified_name, s.signature, s.doc_comment, s.content,
                           e.model, e.dimensions, e.embedding, e.body_hash
                    FROM symbols s JOIN symbol_embeddings e ON e.symbol_id = s.id
-                   WHERE s.file_id = ?""", (file_id,)):
+                   WHERE s.file_id = ?
+                     -- only an embedding known to match its symbol's text: a
+                     -- stale one would be carried over as current for good
+                     AND e.body_hash IS s.body_hash""", (file_id,)):
             text = prepare_embedding_text(dict(row))
             kept.setdefault(text, []).append(
                 (row["model"], row["dimensions"], row["embedding"], row["body_hash"]))

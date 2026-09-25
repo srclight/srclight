@@ -72,3 +72,25 @@ def test_a_duplicate_symbol_takes_one_embedding_each(tmp_path):
            WHERE s.name = 'same'""").fetchone()[0]
     db.close()
     assert kept == count
+
+
+def test_a_stale_embedding_is_not_carried_over(tmp_path):
+    """An embedding written for another text — a vector computed before a
+    reparse and stored after it — must not be kept as current."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "mod.c"
+    source.write_text("int keep_me(int v) {\n    return v;\n}\n")
+    db = Database(root / "index.db")
+    db.open()
+    db.initialize()
+    indexer = Indexer(db, IndexConfig(root=root))
+    indexer.index()
+    sid = db.conn.execute("SELECT id FROM symbols WHERE name = 'keep_me'").fetchone()[0]
+    db.upsert_embedding(sid, "fake-model", 4, b"stale!!!", "an-older-body-hash")
+    db.commit()
+    source.write_text("int keep_me(int v) {\n    return v;\n}\n\nint other_one(void) {\n    return 0;\n}\n")
+    indexer.index()
+    needing = {r["name"] for r in db.get_symbols_needing_embeddings("fake-model")}
+    db.close()
+    assert "keep_me" in needing
