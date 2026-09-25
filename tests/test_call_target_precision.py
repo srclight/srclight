@@ -1536,3 +1536,37 @@ def test_a_literal_inside_a_comment_is_no_argument():
     content = _literals_as_values(text, mask_noncode(text, "cpp"))
     assert _call_arity(content, text.index("(")) == 1
 
+
+
+OWNER_FUNCTIONS = {
+    "a/menu.cpp": "namespace game { namespace menu {\nint owner() { return 0; }\n} }\n",
+    "b/event.cpp": "namespace game { namespace event {\nint owner() { return 1; }\n} }\n",
+}
+
+
+def test_a_field_compared_after_a_member_access_is_no_template_call(tmp_path):
+    edges = _edges({**OWNER_FUNCTIONS, "c/track.cpp": """\
+struct Track { int owner; };
+bool claimed(Track* slot) {
+    return slot->owner < 0 || slot->owner > 3;
+}
+
+int firstOwner(Holder* h) {
+    return h->owner<int>();
+}
+"""}, tmp_path)
+    targets = {b for a, b, _ in edges if a == "claimed"}
+    assert not {t for t in targets if t.endswith("owner")}, targets
+    assert any(a == "firstOwner" and b.endswith("owner") for a, b, _ in edges), edges
+
+
+def test_a_field_with_a_namespace_qualified_type_is_a_declaration(tmp_path):
+    edges = _edges({**OWNER_FUNCTIONS, "c/record.h": """\
+namespace flow {
+struct Record {
+    mods::Module* owner = nullptr;
+    int count;
+};
+}
+"""}, tmp_path)
+    assert not any(a.endswith("Record") and b.endswith("owner") for a, b, _ in edges), edges
