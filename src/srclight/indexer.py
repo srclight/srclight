@@ -250,13 +250,15 @@ def _git_tracked_files(root: Path) -> set[str] | None:
     Returns relative paths as strings.
     """
     try:
+        # -z: paths come raw, not quoted and escaped as `"pi\303\250ce.py"`.
         result = subprocess.run(
-            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
-            cwd=root, capture_output=True, text=True, timeout=30,
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            cwd=root, capture_output=True, text=True, encoding="utf-8",
+            errors="surrogateescape", timeout=30,
         )
         if result.returncode != 0:
             return None
-        files = {line for line in result.stdout.splitlines() if line}
+        files = {path for path in result.stdout.split("\0") if path}
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
     # A submodule is listed as its directory alone; the files it holds are
@@ -276,16 +278,17 @@ def _git_submodule_paths(root: Path) -> list[str]:
     """The paths of the submodules a repository records (gitlinks)."""
     try:
         result = subprocess.run(
-            ["git", "ls-files", "--stage"],
-            cwd=root, capture_output=True, text=True, timeout=30,
+            ["git", "ls-files", "-z", "--stage"],
+            cwd=root, capture_output=True, text=True, encoding="utf-8",
+            errors="surrogateescape", timeout=30,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return []
     if result.returncode != 0:
         return []
     # `<mode> <object> <stage>\t<path>`; a gitlink's mode is 160000.
-    return [line.split("\t", 1)[1] for line in result.stdout.splitlines()
-            if line.startswith("160000 ") and "\t" in line]
+    return [entry.split("\t", 1)[1] for entry in result.stdout.split("\0")
+            if entry.startswith("160000 ") and "\t" in entry]
 
 
 def _get_git_head(root: Path) -> str | None:

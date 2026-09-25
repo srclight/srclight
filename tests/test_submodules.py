@@ -64,3 +64,30 @@ def test_a_submodule_not_checked_out_is_skipped(with_submodule):
     paths = {r[0].replace("\\", "/") for r in db.conn.execute("SELECT path FROM files")}
     db.close()
     assert paths == {"app.py"}
+
+
+def test_git_history_of_a_submodule_file_is_read_in_the_submodule(with_submodule):
+    from srclight.git import blame_symbol, changes_to_file, detect_changes
+
+    main = with_submodule / "main"
+    assert len(changes_to_file(main, "vendor/parts/toolkit.py")) == 1
+    assert "error" not in blame_symbol(main, "vendor/parts/toolkit.py", 1, 2)
+
+    (main / "vendor/parts/toolkit.py").write_text(
+        "def blend_colors(a, b):\n    return b\n")
+    changed = {c["file"]: c["hunks"] for c in detect_changes(main)}
+    assert "vendor/parts" not in changed
+    assert changed["vendor/parts/toolkit.py"] == [
+        {"old_start": 2, "old_count": 1, "new_start": 2, "new_count": 1}]
+
+
+def test_paths_that_are_not_ascii_are_indexed(tmp_path):
+    _repo(tmp_path / "parts", {"outil.py": "def polir():\n    return 1\n"})
+    main = tmp_path / "main"
+    _repo(main, {"pièce.py": "def tailler():\n    return 1\n"})
+    _git(main, "submodule", "add", "-q", str(tmp_path / "parts"), "tiers/pièce")
+    _git(main, "commit", "-q", "-m", "add submodule")
+    db = _index(main)
+    paths = {r[0].replace("\\", "/") for r in db.conn.execute("SELECT path FROM files")}
+    db.close()
+    assert {"pièce.py", "tiers/pièce/outil.py"} <= paths

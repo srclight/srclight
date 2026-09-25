@@ -30,6 +30,21 @@ def _run_git(repo_root: Path, *args: str, timeout: int = 30) -> str:
         return ""
 
 
+def _owning_repo(repo_root: Path, file_path: str) -> tuple[Path, str]:
+    """The repository that holds a file, and the file's path in it.
+
+    A file inside a checked-out submodule belongs to the submodule: git run
+    from the parent sees the submodule's directory alone, and reads no
+    history or blame for the files in it. The deepest enclosing directory
+    with its own `.git` holds the file.
+    """
+    parts = Path(file_path.replace("\\", "/")).parts
+    for depth in range(len(parts) - 1, 0, -1):
+        if (repo_root.joinpath(*parts[:depth]) / ".git").exists():
+            return repo_root.joinpath(*parts[:depth]), "/".join(parts[depth:])
+    return repo_root, file_path
+
+
 def _run_git_lines(repo_root: Path, *args: str, timeout: int = 30) -> list[str]:
     """Run a git command and return non-empty stdout lines."""
     out = _run_git(repo_root, *args, timeout=timeout)
@@ -62,6 +77,7 @@ def blame_lines(repo_root: Path, file_path: str, start_line: int, end_line: int)
 
     Returns one BlameInfo per unique commit touching those lines.
     """
+    repo_root, file_path = _owning_repo(repo_root, file_path)
     lines = _run_git_lines(
         repo_root, "blame", "--porcelain",
         f"-L{start_line},{end_line}",
@@ -286,6 +302,7 @@ def changes_to_file(
         file_path: Relative file path
         n: Number of commits to return
     """
+    repo_root, file_path = _owning_repo(repo_root, file_path)
     args = [
         "log", f"-{n}", "--format=%H|%an|%aI|%s",
         "--", file_path,
@@ -325,10 +342,11 @@ def detect_changes(
     """
     import re
 
-    if ref:
-        diff_output = _run_git(repo_root, "diff", "-U0", ref)
-    else:
-        diff_output = _run_git(repo_root, "diff", "-U0", "HEAD")
+    # --submodule=diff: a checked-out submodule's changes come file by file,
+    # its path prefixed, rather than as its directory's commit id. Its
+    # context is read from the config, not from -U0.
+    diff_output = _run_git(repo_root, "-c", "diff.context=0", "diff",
+                           "--submodule=diff", "-U0", ref or "HEAD")
 
     if not diff_output:
         return []
