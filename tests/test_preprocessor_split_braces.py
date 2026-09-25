@@ -1026,7 +1026,8 @@ int body() {
     return 0;
 }
 """})
-    docs = dict(db.conn.execute("SELECT name, doc_comment FROM symbols"))
+    docs = {name: (doc or "").replace("\r\n", "\n")
+            for name, doc in db.conn.execute("SELECT name, doc_comment FROM symbols")}
     assert docs["holder"] == ("// The player who owns the current event. Player 0 until\n"
                               "// an order was seen.")
     assert docs["body"] == "/* A block. */\n// A line after it."
