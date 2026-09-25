@@ -724,13 +724,25 @@ def _ends_with_backslash(source: bytes, newline: int) -> bool:
 
 
 def _digit_separator(source: bytes, i: int) -> bool:
-    """Whether the quote at `i` follows a word or a number, as in `1'000`,
-    rather than opening a character literal — whose only word before it is
-    an encoding prefix, `L'x'`, `u8'x'`."""
+    """Whether the quote at `i` opens nothing because a word or a number is
+    glued to it: a digit separator, `1'000`, or the closing quote of a
+    multi-character constant too long to read as a literal, `'w_mcheck'`.
+    After a keyword or an encoding prefix it opens a character literal:
+    `case'{':`, `L'x'`, `u8'x'`."""
     j = i
     while j > 0 and (chr(source[j - 1]).isalnum() or source[j - 1] == 0x5F):
         j -= 1
-    return j < i and source[j:i] not in (b"L", b"u", b"U", b"u8")
+    word = source[j:i].decode("latin-1")
+    return bool(word) and word not in _BEFORE_A_CHARACTER
+
+
+# Words a character literal can be glued to: encoding prefixes, and the
+# keywords a value follows.
+_BEFORE_A_CHARACTER = frozenset({
+    "L", "u", "U", "u8", "case", "return", "else", "do", "throw", "sizeof",
+    "co_return", "co_yield", "and", "or", "not", "xor", "bitand", "bitor",
+    "compl", "not_eq", "and_eq", "or_eq", "xor_eq",
+})
 
 
 def _c_comment_bytes(source: bytes, literals: bool = False) -> bytearray:
