@@ -153,7 +153,11 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
         pct = (current / total * 100) if total > 0 else 0
         click.echo(f"\r  [{current}/{total}] {pct:5.1f}% {file[:60]:<60}", nl=False)
 
-    stats = indexer.index(root, on_progress=on_progress)
+    def on_phase(name: str):
+        click.echo()  # end the progress line
+        click.echo(f"  {name}...")
+
+    stats = indexer.index(root, on_progress=on_progress, on_phase=on_phase)
     click.echo()  # newline after progress
 
     click.echo()
@@ -602,7 +606,11 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
                 pct = (current / total * 100) if total > 0 else 0
                 click.echo(f"\r    [{current}/{total}] {pct:5.1f}% {file[:55]:<55}", nl=False)
 
-            stats = indexer.index(root, on_progress=on_progress)
+            def on_phase(name: str):
+                click.echo()  # end the progress line
+                click.echo(f"    {name}...")
+
+            stats = indexer.index(root, on_progress=on_progress, on_phase=on_phase)
             click.echo()  # newline after progress
 
             click.echo(f"    {stats.files_scanned} files, {stats.symbols_extracted} symbols, "

@@ -859,8 +859,14 @@ class Indexer:
         self,
         root: Path | None = None,
         on_progress: Callable[[str, int, int], None] | None = None,
+        on_phase: Callable[[str], None] | None = None,
     ) -> IndexStats:
-        """Index a codebase. Returns statistics."""
+        """Index a codebase. Returns statistics.
+
+        `on_progress(label, current, total)` follows the file scan, then the
+        call graph under the label "call graph". `on_phase(name)` announces
+        each step after the scan, which can take minutes on a large project.
+        """
         root = root or self.config.root
         root = root.resolve()
         stats = IndexStats()
@@ -990,8 +996,13 @@ class Indexer:
 
         # Build call graph and inheritance edges (second pass)
         if stats.files_indexed > 0:
-            stats.edges_created = self._build_edges()
+            if on_phase:
+                on_phase("Building the call graph")
+            phase_start = time.monotonic()
+            stats.edges_created = self._build_edges(on_progress=on_progress)
             stats.edges_created += self._build_inheritance_edges()
+            logger.info("Call graph: %d edges in %.0fs",
+                        stats.edges_created, time.monotonic() - phase_start)
 
         # Community detection and execution flow tracing (post-edge phase)
         # Run if new edges were created OR if communities table is empty (first run after v5 migration)
@@ -1008,6 +1019,8 @@ class Indexer:
         if needs_communities:
             try:
                 from .community import detect_communities, trace_execution_flows
+                if on_phase:
+                    on_phase("Finding communities and execution flows")
                 communities = detect_communities(self.db)
                 if communities:
                     sym_to_comm = {}
@@ -1341,7 +1354,7 @@ class Indexer:
 
         return count
 
-    def _build_edges(self) -> int:
+    def _build_edges(self, on_progress: Callable[[str, int, int], None] | None = None) -> int:
         """Build call graph edges by scanning symbol content for references.
 
         For each symbol, scan its body for references to other known symbol names.
@@ -1512,7 +1525,9 @@ class Indexer:
                 return sd, "same_dir"
             return targets, "name_only"
 
-        for row in content_rows:
+        for done, row in enumerate(content_rows, 1):
+            if on_progress and (done % 500 == 0 or done == len(content_rows)):
+                on_progress("call graph", done, len(content_rows))
             source_id = row["id"]
             source_name = row["name"]
             source_file = row["file_path"]
