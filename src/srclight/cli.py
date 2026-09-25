@@ -75,6 +75,48 @@ def main(verbose: bool):
     )
 
 
+class _ProgressLine:
+    """The `\\r` line that shows indexing progress, and the phases after it.
+
+    Anything else printed while the line is open — a phase, and also a log
+    record, which reaches the same terminal on stderr — would continue it
+    instead of starting a line of its own, so the line is ended first.
+    """
+
+    def __init__(self, indent: str, width: int):
+        self.indent, self.width = indent, width
+        self.open = False
+
+    def progress(self, file: str, current: int, total: int) -> None:
+        pct = (current / total * 100) if total > 0 else 0
+        click.echo(f"\r{self.indent}[{current}/{total}] {pct:5.1f}% "
+                   f"{file[:self.width]:<{self.width}}", nl=False)
+        self.open = True
+
+    def phase(self, name: str) -> None:
+        self.close()
+        click.echo(f"{self.indent}{name}...")
+
+    def close(self) -> None:
+        if self.open:
+            click.echo()
+            self.open = False
+
+    def _before_log(self, record: logging.LogRecord) -> bool:
+        self.close()
+        return True
+
+    def __enter__(self) -> _ProgressLine:
+        for handler in logging.getLogger().handlers:
+            handler.addFilter(self._before_log)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for handler in logging.getLogger().handlers:
+            handler.removeFilter(self._before_log)
+        self.close()
+
+
 def parse_extension_overrides(values: tuple[str, ...]) -> dict[str, str]:
     """Turn `--ext EXT=LANGUAGE` values into {extension: language}.
 
@@ -203,22 +245,8 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
 
     indexer = Indexer(db, config)
 
-    line_open = [False]  # a progress line waits for its newline
-
-    def on_progress(file: str, current: int, total: int):
-        pct = (current / total * 100) if total > 0 else 0
-        click.echo(f"\r  [{current}/{total}] {pct:5.1f}% {file[:60]:<60}", nl=False)
-        line_open[0] = True
-
-    def on_phase(name: str):
-        if line_open[0]:
-            click.echo()
-            line_open[0] = False
-        click.echo(f"  {name}...")
-
-    stats = indexer.index(root, on_progress=on_progress, on_phase=on_phase)
-    if line_open[0]:
-        click.echo()
+    with _ProgressLine("  ", 60) as line:
+        stats = indexer.index(root, on_progress=line.progress, on_phase=line.phase)
 
     click.echo()
     click.echo(f"  Files scanned:   {stats.files_scanned}")
@@ -662,22 +690,8 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
                 click.echo(f"    Embedding model: {resolved_model} ({origin})")
             indexer = Indexer(db, indexer_config)
 
-            line_open = [False]  # a progress line waits for its newline
-
-            def on_progress(file: str, current: int, total: int):
-                pct = (current / total * 100) if total > 0 else 0
-                click.echo(f"\r    [{current}/{total}] {pct:5.1f}% {file[:55]:<55}", nl=False)
-                line_open[0] = True
-
-            def on_phase(name: str):
-                if line_open[0]:
-                    click.echo()
-                    line_open[0] = False
-                click.echo(f"    {name}...")
-
-            stats = indexer.index(root, on_progress=on_progress, on_phase=on_phase)
-            if line_open[0]:
-                click.echo()
+            with _ProgressLine("    ", 55) as line:
+                stats = indexer.index(root, on_progress=line.progress, on_phase=line.phase)
 
             click.echo(f"    {stats.files_scanned} files, {stats.symbols_extracted} symbols, "
                         f"{stats.files_unchanged} unchanged, {stats.elapsed_seconds:.1f}s")
