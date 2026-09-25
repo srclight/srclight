@@ -787,13 +787,15 @@ class Database:
         return self._row_to_symbol(row)
 
     def symbols_in_file(self, path: str) -> list[SymbolRecord]:
+        """The symbols of a file, its path written with either separator:
+        paths are stored as the OS writes them, while git gives `a/b`."""
         assert self.conn is not None
         rows = self.conn.execute(
             """SELECT s.*, f.path as file_path FROM symbols s
                JOIN files f ON s.file_id = f.id
-               WHERE f.path = ?
+               WHERE f.path IN (?, ?, ?)
                ORDER BY s.start_line""",
-            (path,),
+            (path, path.replace("/", "\\"), path.replace("\\", "/")),
         ).fetchall()
         return [self._row_to_symbol(r) for r in rows]
 

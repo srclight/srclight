@@ -91,3 +91,10 @@ def test_paths_that_are_not_ascii_are_indexed(tmp_path):
     paths = {r[0].replace("\\", "/") for r in db.conn.execute("SELECT path FROM files")}
     db.close()
     assert {"naïve.py", "vendor/café/tool.py"} <= paths
+
+
+def test_a_file_in_a_folder_is_found_with_either_separator(with_submodule):
+    db = _index(with_submodule / "main")
+    for path in ("vendor/parts/toolkit.py", "vendor\\parts\\toolkit.py"):
+        assert [s.name for s in db.symbols_in_file(path)] == ["blend_colors"], path
+    db.close()
