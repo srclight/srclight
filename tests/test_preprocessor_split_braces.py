@@ -975,7 +975,7 @@ void manage() {
     finish();
 }
 """})
-    symbols = _symbols(db, "loop.cpp")
+    symbols = [s for s in _symbols(db, "loop.cpp") if s[0] != "PICK"]
     extents = {n: (s, e) for n, s, e in symbols}
     for name, (start, end) in extents.items():
         for other, (o_start, o_end) in extents.items():
