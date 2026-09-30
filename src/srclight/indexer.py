@@ -2189,15 +2189,18 @@ _PARALLEL_GRAPH_MIN_SYMBOLS = 20000
 # writing the edges stay in one process — while memory keeps growing: on
 # ~200k symbols, 8 processes took 19 s and 2.6 GB, 15 took 19 s and 4.3 GB.
 _GRAPH_WORKERS_MAX = 8
+# A process pool on Windows waits on at most 61 processes, and refuses more.
+_WINDOWS_POOL_MAX = 61
 
 
 def _graph_workers(symbols: int) -> int:
-    """How many processes scan the call graph. SRCLIGHT_GRAPH_WORKERS sets it;
-    1 scans in the indexing process."""
+    """How many processes scan the call graph. SRCLIGHT_GRAPH_WORKERS sets it,
+    within what the platform allows; 1 scans in the indexing process."""
     configured = os.environ.get("SRCLIGHT_GRAPH_WORKERS", "").strip()
     if configured:
         try:
-            return max(1, int(configured))
+            count = max(1, int(configured))
+            return min(count, _WINDOWS_POOL_MAX) if os.name == "nt" else count
         except ValueError:
             logger.warning("SRCLIGHT_GRAPH_WORKERS=%r is not a number; ignored", configured)
     if symbols < _PARALLEL_GRAPH_MIN_SYMBOLS:

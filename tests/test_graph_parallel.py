@@ -83,6 +83,13 @@ def test_a_large_index_uses_one_worker_per_physical_core_up_to_a_cap(monkeypatch
     assert _graph_workers(10**6) == expected
 
 
+@pytest.mark.parametrize("os_name,expected", [("nt", 61), ("posix", 100)])
+def test_a_configured_count_stays_within_what_the_platform_allows(monkeypatch, os_name, expected):
+    monkeypatch.setenv("SRCLIGHT_GRAPH_WORKERS", "100")
+    monkeypatch.setattr("os.name", os_name)
+    assert _graph_workers(10**6) == expected
+
+
 def test_the_cpus_the_process_may_use_count_where_known(monkeypatch):
     monkeypatch.delenv("SRCLIGHT_GRAPH_WORKERS", raising=False)
     monkeypatch.setattr("os.sched_getaffinity", lambda pid: set(range(6)), raising=False)
