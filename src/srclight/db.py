@@ -287,7 +287,8 @@ CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_stamp
     ON symbol_embeddings(embedded_at, model, dimensions);
 -- The hashes that say which symbols need embedding again, likewise readable
 -- without the blobs, and without the symbols' content stored before them.
-CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_hash ON symbol_embeddings(model, body_hash);
+CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_hash
+    ON symbol_embeddings(symbol_id, model, body_hash);
 CREATE INDEX IF NOT EXISTS idx_symbols_body_hash ON symbols(body_hash, file_id);
 CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
 CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);
@@ -1408,18 +1409,28 @@ class Database:
         index, to find nothing. Two covering indexes hold the hashes, so the
         comparison reads only them, and the details are fetched for the
         symbols it finds — the first `limit` of them by id, as the scan in
-        rowid order gave them. An embedding or a symbol without a hash never
-        counts as changed, as `!=` against NULL never did.
+        rowid order gave them. The comparison is the join's, `!=` included,
+        so a hash missing on either side never counts as a change.
+
+        SQLite looks the embedding up by its primary key, whose row holds the
+        blob, unless told to use the index: INDEXED BY is only named once
+        both indexes exist, and a database that has not been through
+        initialize() since they were added is answered by the plain join.
         """
         assert self.conn is not None
-        embedded = dict(self.conn.execute(
-            "SELECT symbol_id, body_hash FROM symbol_embeddings WHERE model = ?", (model,)))
-        needed = sorted(
-            sid for sid, body_hash in self.conn.execute(
-                "SELECT s.id, s.body_hash FROM symbols s JOIN files f ON s.file_id = f.id")
-            if sid not in embedded or (
-                body_hash is not None and embedded[sid] is not None
-                and embedded[sid] != body_hash))[:limit]
+        present = {row[0] for row in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN "
+            "('idx_symbols_body_hash', 'idx_symbol_embeddings_hash')")}
+        hinted = len(present) == 2
+        needed = sorted(row[0] for row in self.conn.execute(
+            f"""SELECT s.id
+                FROM symbols s {'INDEXED BY idx_symbols_body_hash' if hinted else ''}
+                JOIN files f ON s.file_id = f.id
+                LEFT JOIN symbol_embeddings e
+                    {'INDEXED BY idx_symbol_embeddings_hash' if hinted else ''}
+                    ON s.id = e.symbol_id AND e.model = ?
+                WHERE e.symbol_id IS NULL OR e.body_hash != s.body_hash""",
+            (model,)))[:limit]
         found: list[dict] = []
         for start in range(0, len(needed), 500):
             chunk = needed[start:start + 500]

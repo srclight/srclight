@@ -69,10 +69,20 @@ def test_another_model_needs_everything_it_has_not_embedded(db):
 def test_the_hashes_are_read_from_indexes_not_from_the_tables(db):
     """body_hash sits after the embedding blob and after the symbol's
     content: read from either table, it walks all of them on every run."""
-    def plan(sql, *args):
-        return " ".join(r[3] for r in db.conn.execute("EXPLAIN QUERY PLAN " + sql, args))
+    statements = []
+    db.conn.set_trace_callback(statements.append)
+    db.get_symbols_needing_embeddings(MODEL)
+    db.conn.set_trace_callback(None)
+    listing = next(s for s in statements if "LEFT JOIN symbol_embeddings" in s)
+    plan = " ".join(r[3] for r in db.conn.execute(
+        "EXPLAIN QUERY PLAN " + listing.replace(f"'{MODEL}'", "?"), (MODEL,)))
+    assert "COVERING INDEX idx_symbols_body_hash" in plan, plan
+    assert "COVERING INDEX idx_symbol_embeddings_hash" in plan, plan
 
-    assert "COVERING INDEX idx_symbol_embeddings_hash" in plan(
-        "SELECT symbol_id, body_hash FROM symbol_embeddings WHERE model = ?", MODEL)
-    assert "COVERING INDEX idx_symbols_body_hash" in plan(
-        "SELECT s.id, s.body_hash FROM symbols s JOIN files f ON s.file_id = f.id")
+
+def test_a_database_without_the_indexes_is_still_answered(db):
+    """The MCP server's reindex opens an existing database without running
+    initialize(): the indexes may not be there, and naming them would fail."""
+    expected = _reference(db, MODEL, 100000)
+    db.conn.execute("DROP INDEX idx_symbol_embeddings_hash")
+    assert db.get_symbols_needing_embeddings(MODEL) == expected
