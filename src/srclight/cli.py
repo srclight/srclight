@@ -92,7 +92,7 @@ class _ProgressLine:
     """
 
     # What runs before the first phase the indexer announces.
-    FIRST_PHASE = "Scanning files"
+    FIRST_PHASE = "Indexing files"
 
     def __init__(self, indent: str, width: int, clock=time.monotonic):
         self.indent, self.width = indent, width

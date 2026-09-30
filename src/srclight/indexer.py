@@ -3033,6 +3033,12 @@ class Indexer:
             if stats.symbols_embedded > 0:
                 logger.info("Embedded %d symbols with %s", stats.symbols_embedded, embed_model)
 
+        # A phase of its own: folding the WAL back into index.db can take long
+        # on a large first index, and would otherwise be timed as part of
+        # whatever phase came last.
+        if on_phase:
+            on_phase("Saving the index")
+
         # Symbols moved and nothing was embedded: the sidecar now describes a
         # database that has changed, and symbols.id is a rowid reused after
         # deletion, so leaving it valid serves one symbol's score under

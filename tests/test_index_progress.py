@@ -3,6 +3,8 @@
 Building the call graph and finding communities can take minutes on a large
 project; a run that printed nothing in between looked stuck.
 """
+import pytest
+
 from srclight.db import Database
 from srclight.indexer import IndexConfig, Indexer
 
@@ -125,13 +127,13 @@ def test_each_phase_is_timed_from_the_one_before(capsys):
         line.phase("Finding communities and execution flows")
         line.phase("Rebuilding the vector cache")
     assert line.durations() == [
-        ("Scanning files", 12.5),
+        ("Indexing files", 12.5),
         ("Building the call graph", 17.5),
         ("Finding communities and execution flows", 1.5),
         ("Rebuilding the vector cache", 8.5),
     ]
     summary = line.summary()
-    assert summary[0].split() == ["Scanning", "files", "12.5s"]
+    assert summary[0].split() == ["Indexing", "files", "12.5s"]
     assert len({len(s) for s in summary}) == 1, "durations line up on the right"
 
 
@@ -156,4 +158,35 @@ def test_the_cli_summary_lists_the_phases(tmp_path):
     result = CliRunner().invoke(main, ["index", str(tmp_path), "--no-embed"])
     assert result.exit_code == 0, result.output
     after_time = result.output.split("  Time:", 1)[1]
-    assert "Scanning files" in after_time and "Building the call graph" in after_time, result.output
+    assert "Indexing files" in after_time and "Building the call graph" in after_time, result.output
+
+
+@pytest.mark.parametrize("embed", [False, True])
+def test_the_work_after_the_last_phase_is_a_phase_of_its_own(tmp_path, monkeypatch, embed):
+    """Committing and folding the WAL back into index.db can take long on a
+    large first index: timed as part of the phase before, it made that one
+    look slow."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text("def alpha():\n    return beta()\n\n\ndef beta():\n    return 1\n")
+    if embed:
+        from srclight import embeddings as embeddings_mod
+        from srclight.embeddings import vector_to_bytes
+
+        class _Stub:
+            name = "stub:model"
+            dimensions = 3
+
+        monkeypatch.setattr(embeddings_mod, "get_provider", lambda spec, **kw: _Stub())
+        monkeypatch.setattr(embeddings_mod, "embed_symbols",
+                            lambda provider, symbols, on_progress=None: [
+                                (s["id"], vector_to_bytes([0.1, 0.2, 0.3])) for s in symbols])
+    db = Database(tmp_path / "index.db")
+    db.open()
+    db.initialize()
+    phases = []
+    config = IndexConfig(root=root, embed_model="stub:model" if embed else None,
+                         disable_embeddings=not embed)
+    Indexer(db, config).index(root, on_phase=phases.append)
+    db.close()
+    assert phases[-1] == "Saving the index", phases
