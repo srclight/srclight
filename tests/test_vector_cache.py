@@ -589,3 +589,24 @@ def test_a_build_leaves_the_callers_connection_alone(tmp_path, monkeypatch):
     left = db.conn.execute("SELECT count(*) FROM schema_info WHERE key = 'half_done'").fetchone()[0]
     assert left == 0
     db.close()
+
+
+def test_a_caller_with_uncommitted_writes_gets_a_sidecar_it_sees_as_current(tmp_path):
+    """The MCP server's reindex bumps the cache version in a transaction it
+    has not committed yet, on the connection the server checks the cache
+    against. A sidecar read from the committed database carried the older
+    version: stale again at once, rebuilt on every search until the commit."""
+    db, db_path = _setup_db(tmp_path, n_symbols=5)
+    VectorCache(db_path.parent).build_from_db(db.conn)
+    time.sleep(0.01)
+    sid = db.conn.execute("SELECT min(symbol_id) FROM symbol_embeddings").fetchone()[0]
+    db.upsert_embedding(sid, "mock:test", 8, vector_to_bytes(_make_vec(8, seed=5.0)), "x")
+    assert db.conn.in_transaction  # not committed
+
+    cache = VectorCache(db_path.parent)
+    cache.build_from_db(db.conn)
+    assert cache.is_valid(db.conn)
+    matrix, _, meta = _sidecar(cache)
+    assert np.allclose(matrix[meta["symbol_ids"].index(sid)], _make_vec(8, seed=5.0))
+    db.conn.rollback()
+    db.close()

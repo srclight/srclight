@@ -64,50 +64,26 @@ class VectorCache:
         written at the same moment (`embedded_at` changes on every write, and
         a symbol id reused after a deletion gets a row of its own). Only the
         others are read from SQLite. The result is the sidecar a full read
-        builds.
+        builds. A caller with uncommitted writes gets them in the sidecar, read
+        in full as before.
         """
         import numpy as np
 
-        # The embeddings are listed, then read, in several statements: one
-        # read transaction makes them one snapshot, so a reindex committing
-        # meanwhile cannot delete a vector between the two. It is taken on a
-        # connection of its own: the caller's may be shared — the MCP server
-        # hands every thread the same one, and its reindex writes through it
-        # — and a transaction opened there would swallow those writes and
-        # commit them half done.
-        own = self._snapshot_connection(conn)
-        if own is not None:
-            conn = own
-            conn.execute("BEGIN")
-        try:
-            # No ORDER BY: sorted by symbol_id, SQLite walks the table itself,
-            # whose rows hold the blobs; unsorted, it reads a covering index.
-            rows = sorted(conn.execute("""
-                SELECT e.symbol_id, e.model, e.dimensions, e.embedded_at,
-                       s.kind, f.path as file_path
-                FROM symbol_embeddings e
-                JOIN symbols s ON e.symbol_id = s.id
-                JOIN files f ON s.file_id = f.id
-            """).fetchall(), key=lambda row: row[0])
-
-            if not rows:
-                return
-
-            dims = rows[0][2]
-            n = len(rows)
-            ids = [row[0] for row in rows]
-            stamps = [row[3] for row in rows]
-
-            matrix = np.empty((n, dims), dtype=np.float32)
-            norms = np.empty(n, dtype=np.float32)
-            unread = self._reuse_previous(ids, stamps, rows[0][1], dims, matrix, norms)
-            self._read_vectors(conn, ids, unread, matrix, norms)
-            version = self._get_db_version(conn)
-        finally:
-            if own is not None:
-                own.close()  # nothing written: ends the snapshot
-        logger.debug("Sidecar vectors: %d reused, %d read from the database",
-                     n - len(unread), len(unread))
+        if conn.in_transaction:
+            # The caller has writes of its own in flight — the MCP server's
+            # reindex, on the connection all its threads share. The sidecar
+            # must describe what that connection sees, version included, or
+            # the server finds it stale on every search and rebuilds it again.
+            # One statement reads it all consistently, as builds always did.
+            built = self._read_in_one_statement(conn)
+        else:
+            built = self._read_reusing_previous(conn)
+        if built is None:
+            return
+        rows, matrix, norms, version = built
+        n, dims = matrix.shape
+        ids = [row[0] for row in rows]
+        stamps = [row[3] for row in rows]
 
         # Ensure directory exists
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -140,6 +116,74 @@ class VectorCache:
         # Load into memory / GPU
         self._load_matrix(matrix, norms, meta)
         logger.info("Built sidecar: %d vectors x %d dims (version %d)", n, dims, version)
+
+    def _read_reusing_previous(self, conn):
+        """(rows, matrix, norms, version) of the committed database, taking
+        from the sidecar on disk every vector it still holds; None when there
+        are no embeddings."""
+        import numpy as np
+
+        # The embeddings are listed, then read, in several statements: one
+        # read transaction makes them one snapshot, so a reindex committing
+        # meanwhile cannot delete a vector between the two. It is taken on a
+        # connection of its own: the caller's may be shared — the MCP server
+        # hands every thread the same one, and its reindex writes through it
+        # — and a transaction opened there would swallow those writes and
+        # commit them half done.
+        own = self._snapshot_connection(conn)
+        if own is not None:
+            conn = own
+            conn.execute("BEGIN")
+        try:
+            # No ORDER BY: sorted by symbol_id, SQLite walks the table itself,
+            # whose rows hold the blobs; unsorted, it reads a covering index.
+            rows = sorted(conn.execute("""
+                SELECT e.symbol_id, e.model, e.dimensions, e.embedded_at,
+                       s.kind, f.path as file_path
+                FROM symbol_embeddings e
+                JOIN symbols s ON e.symbol_id = s.id
+                JOIN files f ON s.file_id = f.id
+            """).fetchall(), key=lambda row: row[0])
+            if not rows:
+                return None
+            dims = rows[0][2]
+            n = len(rows)
+            ids = [row[0] for row in rows]
+            matrix = np.empty((n, dims), dtype=np.float32)
+            norms = np.empty(n, dtype=np.float32)
+            unread = self._reuse_previous(ids, [row[3] for row in rows], rows[0][1], dims,
+                                          matrix, norms)
+            self._read_vectors(conn, ids, unread, matrix, norms)
+            version = self._get_db_version(conn)
+        finally:
+            if own is not None:
+                own.close()  # nothing written: ends the snapshot
+        logger.debug("Sidecar vectors: %d reused, %d read from the database",
+                     n - len(unread), len(unread))
+        return rows, matrix, norms, version
+
+    def _read_in_one_statement(self, conn):
+        """(rows, matrix, norms, version) as `conn` sees them, uncommitted
+        writes included, every vector read; None when there are none."""
+        import numpy as np
+
+        rows, blobs = [], []
+        for row in conn.execute("""
+            SELECT e.symbol_id, e.model, e.dimensions, e.embedded_at,
+                   s.kind, f.path as file_path, e.embedding
+            FROM symbol_embeddings e
+            JOIN symbols s ON e.symbol_id = s.id
+            JOIN files f ON s.file_id = f.id
+            ORDER BY e.symbol_id
+        """):
+            rows.append(tuple(row)[:6])
+            blobs.append(row[6])
+        if not rows:
+            return None
+        matrix = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(
+            len(rows), rows[0][2]).copy()
+        norms = np.linalg.norm(matrix, axis=1).astype(np.float32)
+        return rows, matrix, norms, self._get_db_version(conn)
 
     @staticmethod
     def _snapshot_connection(conn):
