@@ -3068,9 +3068,10 @@ class Indexer:
         self.db.commit()
         stats.elapsed_seconds = time.monotonic() - start
 
-        # A caller following the phases prints its own summary of the run —
-        # the CLI does — so the same figures are only a debug line there. The
-        # MCP tool and the git hook have no other record of it.
+        # A caller following the phases prints its own summary of the run,
+        # with these figures — both CLI index commands do — so they are only
+        # a debug line there. The MCP tool and the git hook have no other
+        # record of the run.
         (logger.debug if on_phase else logger.info)(
             "Indexed %d files (%d symbols, %d edges) in %.2fs. %d unchanged, %d removed, %d errors.",
             stats.files_indexed, stats.symbols_extracted, stats.edges_created,

@@ -293,6 +293,8 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
                f"{stats.errors} errors")
     click.echo(f"  Symbols:     {stats.symbols_extracted} extracted, "
                f"{db_stats['symbols']} in the index")
+    click.echo(f"  Edges:       {stats.edges_created} built this run, "
+               f"{db_stats['edges']} in the index")
     click.echo(f"  Time:        {stats.elapsed_seconds:.2f}s")
     for step in line.summary():
         click.echo(step)
@@ -732,8 +734,12 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
             with _ProgressLine("    ", 55) as line:
                 stats = indexer.index(root, on_progress=line.progress, on_phase=line.phase)
 
-            click.echo(f"    {stats.files_scanned} files, {stats.symbols_extracted} symbols, "
-                        f"{stats.files_unchanged} unchanged, {stats.elapsed_seconds:.1f}s")
+            # Every figure of the indexer's closing log line, which is only a
+            # debug line for a caller that prints its own summary.
+            click.echo(f"    {stats.files_scanned} files: {stats.files_indexed} indexed, "
+                       f"{stats.files_unchanged} unchanged, {stats.files_removed} removed, "
+                       f"{stats.errors} errors; {stats.symbols_extracted} symbols, "
+                       f"{stats.edges_created} edges, {stats.elapsed_seconds:.1f}s")
 
             db_stats = db.stats()
             click.echo(f"    DB: {db_stats['db_size_mb']} MB")

@@ -8,6 +8,8 @@ import pytest
 from srclight.db import Database
 from srclight.indexer import IndexConfig, Indexer
 
+from .test_workspace import ws_dir  # noqa: F401  (fixture re-export)
+
 
 def test_the_phases_after_the_scan_are_reported(tmp_path):
     root = tmp_path / "repo"
@@ -268,3 +270,27 @@ def test_the_summary_counts_files_and_symbols_on_one_line_each(tmp_path):
     assert result.exit_code == 0, result.output
     assert "  Files:       1 scanned, 1 indexed, 0 unchanged, 0 removed, 0 errors" in result.output
     assert "  Symbols:     2 extracted, 2 in the index" in result.output
+    assert "  Edges:       1 built this run, 1 in the index" in result.output
+
+
+def test_the_workspace_summary_keeps_every_figure_of_the_run(tmp_path, ws_dir):  # noqa: F811
+    """The indexer's closing line is only a debug line for a caller that
+    follows the phases: the workspace summary must carry what it said —
+    files removed, errors and edges included."""
+    from click.testing import CliRunner
+
+    from srclight.cli import main
+    from srclight.workspace import WorkspaceConfig
+
+    project = _small_repo(tmp_path)
+    (project / "gone.py").write_text("def gone():\n    return 0\n")
+    config = WorkspaceConfig(name="summary-ws")
+    config.add_project("alpha", str(project))
+    config.save()
+    assert CliRunner().invoke(main, ["workspace", "index", "-w", "summary-ws", "--no-embed"]
+                              ).exit_code == 0
+    (project / "gone.py").unlink()
+    result = CliRunner().invoke(main, ["workspace", "index", "-w", "summary-ws", "--no-embed"])
+    assert result.exit_code == 0, result.output
+    assert "1 files: 0 indexed, 1 unchanged, 1 removed, 0 errors; 0 symbols, " in result.output
+    assert " edges, " in result.output
