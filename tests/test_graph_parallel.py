@@ -101,6 +101,24 @@ def test_the_cli_lets_the_cpus_choose(tmp_path, monkeypatch):
     assert seen == [0]
 
 
+def test_the_frozen_entry_point_lets_workers_start(monkeypatch):
+    """A frozen build starts graph workers as its own executable with
+    `--multiprocessing-fork`; without freeze_support() first, the CLI rejects
+    the flag and every pool breaks."""
+    import multiprocessing
+    import runpy
+    from pathlib import Path
+
+    from srclight import cli
+
+    calls = []
+    monkeypatch.setattr(multiprocessing, "freeze_support", lambda: calls.append("freeze_support"))
+    monkeypatch.setattr(cli, "main", lambda: calls.append("main"))
+    entry = Path(__file__).resolve().parent.parent / "packaging" / "pyinstaller" / "entry_point.py"
+    runpy.run_path(str(entry), run_name="__main__")
+    assert calls == ["freeze_support", "main"]
+
+
 @pytest.mark.parametrize("configured,symbols,expected", [
     ("1", 10**6, 1),
     ("3", 10, 3),
