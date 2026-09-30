@@ -2978,7 +2978,6 @@ class Indexer:
                 )
                 if on_phase:
                     on_phase("Finding communities and execution flows")
-                edges = call_graph_edges(self.db)
                 fingerprint = call_graph_fingerprint(self.db)
                 # The graph is rebuilt on every run that changes a file, often
                 # into the same graph: a file without calls, say. Louvain on
@@ -2989,7 +2988,7 @@ class Indexer:
                     logger.info("Communities unchanged: same call graph as last run")
                     communities = []
                 else:
-                    communities = detect_communities(self.db, edges)
+                    communities = detect_communities(self.db, call_graph_edges(self.db))
                 if communities:
                     sym_to_comm = {}
                     for c in communities:
