@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import time
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2181,6 +2182,416 @@ def _doc_languages() -> set[str]:
     return set(get_registry().keys()) | {"markdown"}
 
 
+# Symbols below this many are scanned in the indexing process: starting other
+# processes costs more than it saves on a small project.
+_PARALLEL_GRAPH_MIN_SYMBOLS = 20000
+# Past this many processes the scan stops shortening — reading the symbols and
+# writing the edges stay in one process — while memory keeps growing: on
+# ~200k symbols, 8 processes took 19 s and 2.6 GB, 15 took 19 s and 4.3 GB.
+_GRAPH_WORKERS_MAX = 8
+
+
+def _graph_workers(symbols: int) -> int:
+    """How many processes scan the call graph. SRCLIGHT_GRAPH_WORKERS sets it;
+    1 scans in the indexing process."""
+    configured = os.environ.get("SRCLIGHT_GRAPH_WORKERS", "").strip()
+    if configured:
+        try:
+            return max(1, int(configured))
+        except ValueError:
+            logger.warning("SRCLIGHT_GRAPH_WORKERS=%r is not a number; ignored", configured)
+    if symbols < _PARALLEL_GRAPH_MIN_SYMBOLS:
+        return 1
+    # One process per physical core: the CPUs this process may run on,
+    # halved for the second hardware thread of each core, which does not
+    # speed this scan up — while each process holds its own copy of the
+    # tables in memory.
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:  # not on Windows or macOS
+        cpus = os.cpu_count() or 1
+    return max(1, min(_GRAPH_WORKERS_MAX, cpus // 2))
+
+
+_edge_scanner: _EdgeScanner | None = None
+
+
+def _start_edge_worker(rows, spans, root) -> None:
+    global _edge_scanner
+    _edge_scanner = _EdgeScanner(rows, spans, root)
+
+
+def _scan_edge_chunk(chunk: list[dict]) -> list[tuple[int, int, float, str]]:
+    assert _edge_scanner is not None
+    edges: list[tuple[int, int, float, str]] = []
+    for row in chunk:
+        edges.extend(_edge_scanner.scan(row))
+    return edges
+
+
+def _dir_of(path: str) -> str:
+    """Get directory component of a path."""
+    idx = path.rfind("/")
+    return path[:idx] if idx >= 0 else ""
+
+
+class _EdgeScanner:
+    """The call edges of one symbol at a time, from tables built once.
+
+    `rows` are the symbols that can be targets, as _build_edges selects them;
+    `spans` the (file id, first line, last line) of every symbol scanned, which
+    tell a container's own lines from its members'; `root` where the files are,
+    for their imports. Everything here is plain data, so a process of its own
+    can build the same tables from the same arguments.
+    """
+
+    def __init__(self, rows, spans, root: str):
+        from .db import is_vendored_path
+
+        self.root = Path(root)
+        # Asked for both ends of every edge: once per file is enough.
+        self.is_vendored_path = functools.lru_cache(maxsize=None)(is_vendored_path)
+
+        name_to_symbols: dict[str, list[dict]] = {}
+        symbol_info: dict[int, dict] = {}
+        for (sym_id, name, qualified_name, kind, signature, metadata,
+             file_path, c_class, bodiless) in rows:
+            info = {"id": sym_id, "file": file_path.replace("\\", "/"),
+                    "kind": kind, "qualified": qualified_name,
+                    "signature": signature, "body": _shared_body(metadata),
+                    # `class Heap;`: a forward declaration, or a definition.
+                    "forward": bool(c_class and bodiless),
+                    "c_class_body": bool(c_class and not bodiless)}
+            symbol_info[sym_id] = info
+            if name not in name_to_symbols:
+                name_to_symbols[name] = []
+            name_to_symbols[name].append(info)
+
+        filtered_names = {
+            name: syms for name, syms in name_to_symbols.items()
+            if not graph_name_excluded(name)
+        }
+
+        # A prototype is no target, but its signature is the function's too:
+        # default arguments are often written there only.
+        prototype_signatures: dict[str, list[str]] = {}
+        for syms in name_to_symbols.values():
+            for sym in syms:
+                if sym["kind"] == "prototype" and sym.get("signature"):
+                    prototype_signatures.setdefault(
+                        sym.get("qualified") or "", []).append(sym["signature"])
+        for syms in name_to_symbols.values():
+            for sym in syms:
+                if sym["kind"] in ("function", "method") and sym.get("qualified") in prototype_signatures:
+                    sym["other_signatures"] = prototype_signatures[sym["qualified"]]
+        # A member written with its class, `Stack_c::get()`, names one
+        # member — even when the name alone is too common to follow. A member
+        # defined or declared in its class has no symbol named that way, so it
+        # is listed under it; otherwise the text would read as the class
+        # `Stack_c` and a separate `get`.
+        # A function-like macro written after a declarator, `f() MACRO(x) {`,
+        # can be read as the function's name: that "function" is the macro.
+        macro_names = {name for name, syms in name_to_symbols.items()
+                       if any(s["kind"] == "macro" for s in syms)}
+
+        def _macro_misread(t: dict) -> bool:
+            # A constructor opens with its class's name, `Box(int)`: a macro
+            # of that name makes it no misread. Every symbol is asked, so one
+            # stored without a qualified name must not stop the graph.
+            short = (t.get("qualified") or "").rsplit("::", 1)[-1]
+            return (t["kind"] in ("function", "method", "prototype")
+                    and not _is_constructor(t, short)
+                    and short in macro_names
+                    and (t.get("signature") or "").lstrip().startswith(short + "("))
+
+        # It depends on the target alone, and each is a candidate of many calls.
+        for info in symbol_info.values():
+            info["macro_misread"] = _macro_misread(info)
+
+        member_aliases: set[str] = set()
+        for name, syms in name_to_symbols.items():
+            for sym in syms:
+                if sym["kind"] not in _EDGE_TARGET_KINDS and not _is_constructor(sym, name):
+                    continue
+                parts = _without_template_args(sym.get("qualified") or "").split("::")
+                if len(parts) >= 2 and parts[-1] == name:
+                    aliases = ["::".join(parts[-2:])]
+                    # `ns::Tint(1, 2)` constructs: the constructor goes with
+                    # the class it is written as.
+                    if len(parts) >= 3 and _is_constructor(sym, name):
+                        aliases.append("::".join(parts[-3:-1]))
+                    for alias in aliases:
+                        member_aliases.add(alias)
+                        listed = filtered_names.setdefault(alias, [])
+                        if all(s["id"] != sym["id"] for s in listed):
+                            listed.append(sym)
+
+        self.filtered_names = filtered_names
+        self.member_aliases = member_aliases
+        self.match_names = build_name_matcher(set(filtered_names)) if filtered_names else None
+
+        # A container's body overlaps its members' bodies. Scanned whole, it
+        # re-reports every call they make and "calls" each method it declares:
+        # a class of a few thousand lines yields thousands of edges, nearly all
+        # noise. The members are scanned on their own, so anything that is not
+        # a callable keeps only the lines it owns — its bases, its fields'
+        # types. Spans are sorted by first line, so the ones a symbol may hold
+        # are found by bisection rather than by walking the whole file.
+        spans_by_file: dict[int, list[tuple[int, int]]] = {}
+        for file_id, start_line, end_line in spans:
+            spans_by_file.setdefault(file_id, []).append((start_line, end_line))
+        for file_spans in spans_by_file.values():
+            file_spans.sort()
+        self.spans_by_file = spans_by_file
+        self.span_starts = {fid: [s for s, _ in file_spans]
+                            for fid, file_spans in spans_by_file.items()}
+
+        # Per-file import evidence (a boost/filter for the import tier, never a
+        # resolver). Reads the file head from disk at index time; a file gone
+        # missing simply never hits the import tier.
+        self.file_imports: dict[str, set[str]] = {}
+
+    def _nested_spans(self, file_id: int, start_line: int, end_line: int) -> list[tuple[int, int]]:
+        spans = self.spans_by_file.get(file_id, [])
+        starts = self.span_starts.get(file_id, [])
+        return spans[bisect.bisect_left(starts, start_line):
+                     bisect.bisect_right(starts, end_line)]
+
+    def _imports_for(self, file_path: str, language: str | None) -> set[str]:
+        from .imports import extract_imports
+
+        if file_path not in self.file_imports:
+            names: set[str] = set()
+            try:
+                head = "\n".join(
+                    (self.root / file_path).read_text(errors="ignore")
+                    .splitlines()[:100]
+                )
+                for imp in extract_imports(head, language or ""):
+                    mod = imp.get("module") or ""
+                    if mod:
+                        stem = mod.rsplit(".", 1)[-1].rsplit("/", 1)[-1]
+                        names.add(stem.rsplit(".", 1)[0] or stem)
+                    for nm in imp.get("names") or []:
+                        names.add(nm)
+            except OSError:
+                pass
+            self.file_imports[file_path] = names
+        return self.file_imports[file_path]
+
+    @staticmethod
+    def _without_forward_declarations(targets: list[dict], source_file: str) -> list[dict]:
+        """A forward declaration, `class Heap;`, names a class defined
+        elsewhere: beside that definition among the candidates it is no
+        target of its own — a class declared ahead in many headers would
+        look ambiguous. Declared in the calling file, it tells which
+        class the file means: the candidates narrow to that class and
+        its members."""
+        defined = {t["qualified"] for t in targets if t["c_class_body"]}
+        meant = {t["qualified"] for t in targets
+                 if t["forward"] and t["qualified"] in defined and t["file"] == source_file}
+        kept = [t for t in targets if not (t["forward"] and t["qualified"] in defined)]
+        if len(meant) == 1:
+            (qualified,) = meant
+            kept = [t for t in kept if (t["c_class_body"] and t["qualified"] == qualified)
+                    or (t["qualified"] or "").startswith(qualified + "::")]
+        return kept
+
+    def _compute_confidence(self, source_file: str, target_file: str) -> float:
+        """Score edge confidence by proximity."""
+        if source_file == target_file:
+            return 1.0
+        s_vendored = self.is_vendored_path(source_file)
+        t_vendored = self.is_vendored_path(target_file)
+        # Cross vendored/project boundary = low confidence
+        if s_vendored != t_vendored:
+            return 0.2
+        # Both vendored = skip entirely
+        if s_vendored and t_vendored:
+            return 0.1
+        # Same directory
+        if _dir_of(source_file) == _dir_of(target_file):
+            return 0.9
+        # Same top-level module (e.g., both under src/libcapture/)
+        s_parts = source_file.split("/")[:3]
+        t_parts = target_file.split("/")[:3]
+        if s_parts == t_parts:
+            return 0.7
+        return 0.5
+
+    @staticmethod
+    def _select_targets(targets: list[dict], source_file: str,
+                        imported: set[str], ref_name: str) -> tuple[list[dict], str]:
+        """Ranked, field-standard selection: prefer evidence,
+        and when none discriminates, keep the ranked LIST as name_only —
+        a labeled candidate list beats a fabricated winner."""
+        same_file = [t for t in targets if t["file"] == source_file]
+        if same_file:
+            return same_file, "same_file"
+        files = {t["file"] for t in targets}
+        if len(files) == 1:
+            return targets, "unique_file"
+        if imported:
+            imp = [t for t in targets
+                   if t["file"].rsplit("/", 1)[-1].rsplit(".", 1)[0] in imported]
+            if imp and len({t["file"] for t in imp}) == 1:
+                return imp, "import"
+        sdir = _dir_of(source_file)
+        sd = [t for t in targets if _dir_of(t["file"]) == sdir]
+        if sd and len({t["file"] for t in sd}) == 1:
+            return sd, "same_dir"
+        return targets, "name_only"
+
+    def scan(self, row) -> list[tuple[int, int, float, str]]:
+        """The (source, target, confidence, resolution) edges of one symbol.
+
+        Every reference is kept: a per-symbol cap once dropped calls from
+        long functions, in whatever order the name set happened to iterate,
+        so two runs disagreed.
+        """
+        from .refmask import mask_noncode
+
+        if self.match_names is None:
+            return []
+        filtered_names = self.filtered_names
+        edges: list[tuple[int, int, float, str]] = []
+        source_id = row["id"]
+        source_name = row["name"]
+        source_file = row["file_path"].replace("\\", "/")
+        # Mask comments/strings BEFORE scanning: a name that appears only in
+        # prose is not a reference (12.8% of sampled edges were this class).
+        content = mask_noncode(row["content"], row["language"] or "")
+        if row["language"] in ("c", "cpp"):
+            # A literal is still an argument: `f("x")` passes one.
+            content = _literals_as_values(row["content"], content)
+        if row["kind"] not in _CALLABLE_KINDS:
+            content = _own_text(
+                content, row["start_line"], _text_end(row),
+                self._nested_spans(row["file_id"], row["start_line"], _text_end(row)),
+            )
+
+        referenced_names = self.match_names(content)
+        referenced_names.discard(source_name)
+        # `A::B::c()` read as the member `B::c` still names the class `B`.
+        for qualified_ref in [n for n in referenced_names if n in self.member_aliases]:
+            qualifier = qualified_ref.rsplit("::", 1)[0].rsplit("::", 1)[-1]
+            if qualifier in filtered_names and qualifier != source_name:
+                referenced_names.add(qualifier)
+
+        imported = self._imports_for(row["file_path"], row["language"])
+        # Names the #if/#else recovery put over one shared body each hold
+        # the other's name; the extractor marked them, and between them
+        # that is not a call.
+        body = _shared_body(row["metadata"])
+        # In C and C++ the way a name is written narrows what it reaches,
+        # and a name the symbol declares for itself is no reference.
+        c_family = row["language"] in ("c", "cpp")
+        arities_of: dict[str, set] = {}
+        source_scope = None
+        if c_family:
+            unqualified = _without_template_args(row["qualified_name"] or "")
+            # A class template's body is its own scope. A constructor
+            # defined in its class is stored as a function, `C::C`; its
+            # scope is still its class.
+            if row["kind"] == "template" and _declares_a_class(content):
+                source_scope = unqualified or None
+            elif row["kind"] in ("method", "template", "function") and "::" in unqualified:
+                source_scope = unqualified.rsplit("::", 1)[0]
+            # An out-of-line definition opens with its own name, `C::f`:
+            # that is no call to the declaration `f`.
+            # A definition opens with its own name — `C::f`, or `f` and
+            # `~C` inside a class — which is no call. It is overwritten
+            # with a character no name holds: blanked, the return type
+            # before it, `C C::f(`, would read as `C(`; as an identifier,
+            # as a variable `C x(` constructed.
+            own_blanked = content
+            short_own = source_name.rsplit("::", 1)[-1]
+            for own in dict.fromkeys((source_name, short_own)):
+                found = _standalone_at(own_blanked, own)
+                if found is not None:
+                    own_blanked = (own_blanked[:found] + "#" * len(own)
+                                   + own_blanked[found + len(own):])
+                    break
+            receivers_of: dict[str, set] = {}
+            forms_of = _reference_forms_all(
+                own_blanked, {n for n in referenced_names if "::" not in n},
+                arities_of, receivers_of)
+            # A name met only inside the definition's own name — the class
+            # in `~C()` — is no reference.
+            referenced_names -= {n for n in referenced_names
+                                 if n.isidentifier() and n not in forms_of}
+            var_types = _declared_types(content, source_name, row["kind"])
+            # A qualified name, `C::f(...)`, is one token to the matcher:
+            # its argument counts are read here.
+            wanted = {n for n in referenced_names if "::" in n}
+            if wanted:
+                for m in _QUALIFIED_CALL_RE.finditer(own_blanked):
+                    # The matcher may know the name by its last parts
+                    # only: `app::gfx::Tinter(1)` is a call to `gfx::Tinter`.
+                    parts = m.group(1).split("::")
+                    for k in range(len(parts) - 1):
+                        written = "::".join(parts[k:])
+                        if written in wanted:
+                            arities_of.setdefault(written, set()).add(
+                                _call_arity(own_blanked, m.start(2)) if m.group(2) else None)
+            # A parameter or local hides the name written bare only:
+            # `x.name()`, `::name()` and `C::name()` still call.
+            for declared in _declared_names(content, source_name, row["kind"]):
+                if declared not in referenced_names:
+                    continue
+                forms, qualifiers = forms_of.get(declared, (set(), set()))
+                if forms <= {"bare"}:
+                    referenced_names.discard(declared)
+                else:
+                    forms_of[declared] = (forms - {"bare"}, qualifiers)
+        for ref_name in referenced_names:
+            targets = [t for t in filtered_names.get(ref_name, [])
+                       if t["id"] != source_id and (
+                           # A constructor — defined in its class, or only
+                           # declared there (a prototype) — is a target
+                           # where the name is called, never where it only
+                           # names a type: `Angle* p`, `const Angle& a`, a
+                           # field. That is a dependency on the class.
+                           (any(a is not None for a in arities_of.get(ref_name, ()))
+                            and t["kind"] in ("method", "prototype", "function", "template"))
+                           if _is_constructor(t, ref_name)
+                           else t["kind"] in _EDGE_TARGET_KINDS)
+                       and not t["macro_misread"]
+                       and not (body is not None and t["body"] == body
+                                and t["file"] == source_file)]
+            targets = self._without_forward_declarations(targets, source_file)
+            decided = None
+            if c_family and targets:
+                forms, qualifiers = forms_of.get(ref_name, (set(), set()))
+                targets, decided = _narrow_by_syntax(
+                    targets, ref_name, forms, qualifiers, source_scope, row["kind"],
+                    source_in_c=source_file.endswith(".c"),
+                    arities=arities_of.get(ref_name),
+                    receiver_types={var_types.get(v) for v in receivers_of.get(ref_name, ())}
+                    or None)
+            elif row["language"] == "python" and targets:
+                targets, decided = _narrow_python_self_call(
+                    targets, ref_name, content, row["qualified_name"] or "", row["kind"])
+            if not targets:
+                continue
+            if decided:
+                chosen, resolution = targets, decided
+            else:
+                chosen, resolution = self._select_targets(
+                    targets, source_file, imported, ref_name)
+            # A name defined in many places, with nothing but the name to
+            # pick among them, would link each call to every one.
+            if resolution == "name_only" and len(chosen) > GRAPH_MAX_FANOUT:
+                continue
+            for target in chosen:
+                confidence = self._compute_confidence(source_file, target["file"])
+                # Skip very low confidence edges
+                if confidence < 0.2:
+                    continue
+                edges.append((source_id, target["id"], confidence, resolution))
+        return edges
+
+
 class Indexer:
     """Indexes a codebase into a Srclight database."""
 
@@ -3047,12 +3458,13 @@ class Indexer:
         For each symbol, scan its body for references to other known symbol names.
         Creates "calls" edges with confidence scoring based on proximity.
         Returns the number of edges created.
+
+        Each symbol is scanned on its own, against tables built once from the
+        whole index, so a large index is scanned by several processes. The
+        edges are still written here, in the order a single scan would write
+        them.
         """
         assert self.db.conn is not None
-        from .db import is_vendored_path
-
-        # Asked for both ends of every edge: once per file is enough.
-        is_vendored_path = functools.lru_cache(maxsize=None)(is_vendored_path)
 
         # Clear all existing edges (full rebuild)
         self.db.conn.execute("DELETE FROM symbol_edges")
@@ -3062,7 +3474,7 @@ class Indexer:
         # and scanning their prose would create noise with zero useful edges.
         excluded = _doc_languages()
         placeholders = ",".join("?" * len(excluded))
-        rows = self.db.conn.execute(
+        rows = [tuple(row) for row in self.db.conn.execute(
             f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.signature, s.metadata,
                       f.path as file_path,
                       (f.language IN ('c', 'cpp') AND s.kind IN ('class', 'struct', 'union'))
@@ -3071,360 +3483,77 @@ class Indexer:
                FROM symbols s JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
-        ).fetchall()
+        )]
 
-        name_to_symbols: dict[str, list[dict]] = {}
-        symbol_info: dict[int, dict] = {}
-        for row in rows:
-            name = row["name"]
-            info = {"id": row["id"], "file": row["file_path"].replace("\\", "/"),
-                    "kind": row["kind"], "qualified": row["qualified_name"],
-                    "signature": row["signature"], "body": _shared_body(row["metadata"]),
-                    # `class Heap;`: a forward declaration, or a definition.
-                    "forward": bool(row["c_class"] and row["bodiless"]),
-                    "c_class_body": bool(row["c_class"] and not row["bodiless"])}
-            symbol_info[row["id"]] = info
-            if name not in name_to_symbols:
-                name_to_symbols[name] = []
-            name_to_symbols[name].append(info)
-
-        filtered_names = {
-            name: syms for name, syms in name_to_symbols.items()
-            if not graph_name_excluded(name)
-        }
-
-        def _without_forward_declarations(targets: list[dict], source_file: str) -> list[dict]:
-            """A forward declaration, `class Heap;`, names a class defined
-            elsewhere: beside that definition among the candidates it is no
-            target of its own — a class declared ahead in many headers would
-            look ambiguous. Declared in the calling file, it tells which
-            class the file means: the candidates narrow to that class and
-            its members."""
-            defined = {t["qualified"] for t in targets if t["c_class_body"]}
-            meant = {t["qualified"] for t in targets
-                     if t["forward"] and t["qualified"] in defined and t["file"] == source_file}
-            kept = [t for t in targets if not (t["forward"] and t["qualified"] in defined)]
-            if len(meant) == 1:
-                (qualified,) = meant
-                kept = [t for t in kept if (t["c_class_body"] and t["qualified"] == qualified)
-                        or (t["qualified"] or "").startswith(qualified + "::")]
-            return kept
-        # A prototype is no target, but its signature is the function's too:
-        # default arguments are often written there only.
-        prototype_signatures: dict[str, list[str]] = {}
-        for syms in name_to_symbols.values():
-            for sym in syms:
-                if sym["kind"] == "prototype" and sym.get("signature"):
-                    prototype_signatures.setdefault(
-                        sym.get("qualified") or "", []).append(sym["signature"])
-        for syms in name_to_symbols.values():
-            for sym in syms:
-                if sym["kind"] in ("function", "method") and sym.get("qualified") in prototype_signatures:
-                    sym["other_signatures"] = prototype_signatures[sym["qualified"]]
-        # A member written with its class, `Stack_c::get()`, names one
-        # member — even when the name alone is too common to follow. A member
-        # defined or declared in its class has no symbol named that way, so it
-        # is listed under it; otherwise the text would read as the class
-        # `Stack_c` and a separate `get`.
-        # A function-like macro written after a declarator, `f() MACRO(x) {`,
-        # can be read as the function's name: that "function" is the macro.
-        macro_names = {name for name, syms in name_to_symbols.items()
-                       if any(s["kind"] == "macro" for s in syms)}
-
-        def _macro_misread(t: dict) -> bool:
-            # A constructor opens with its class's name, `Box(int)`: a macro
-            # of that name makes it no misread. Every symbol is asked, so one
-            # stored without a qualified name must not stop the graph.
-            short = (t.get("qualified") or "").rsplit("::", 1)[-1]
-            return (t["kind"] in ("function", "method", "prototype")
-                    and not _is_constructor(t, short)
-                    and short in macro_names
-                    and (t.get("signature") or "").lstrip().startswith(short + "("))
-
-        # It depends on the target alone, and each is a candidate of many calls.
-        for info in symbol_info.values():
-            info["macro_misread"] = _macro_misread(info)
-
-        member_aliases: set[str] = set()
-        for name, syms in name_to_symbols.items():
-            for sym in syms:
-                if sym["kind"] not in _EDGE_TARGET_KINDS and not _is_constructor(sym, name):
-                    continue
-                parts = _without_template_args(sym.get("qualified") or "").split("::")
-                if len(parts) >= 2 and parts[-1] == name:
-                    aliases = ["::".join(parts[-2:])]
-                    # `ns::Tint(1, 2)` constructs: the constructor goes with
-                    # the class it is written as.
-                    if len(parts) >= 3 and _is_constructor(sym, name):
-                        aliases.append("::".join(parts[-3:-1]))
-                    for alias in aliases:
-                        member_aliases.add(alias)
-                        listed = filtered_names.setdefault(alias, [])
-                        if all(s["id"] != sym["id"] for s in listed):
-                            listed.append(sym)
-
-        if not filtered_names:
-            return 0
-        match_names = build_name_matcher(set(filtered_names))
-
-        def _dir_of(path: str) -> str:
-            """Get directory component of a path."""
-            idx = path.rfind("/")
-            return path[:idx] if idx >= 0 else ""
-
-        def _compute_confidence(source_file: str, target_file: str) -> float:
-            """Score edge confidence by proximity."""
-            if source_file == target_file:
-                return 1.0
-            s_vendored = is_vendored_path(source_file)
-            t_vendored = is_vendored_path(target_file)
-            # Cross vendored/project boundary = low confidence
-            if s_vendored != t_vendored:
-                return 0.2
-            # Both vendored = skip entirely
-            if s_vendored and t_vendored:
-                return 0.1
-            # Same directory
-            if _dir_of(source_file) == _dir_of(target_file):
-                return 0.9
-            # Same top-level module (e.g., both under src/libcapture/)
-            s_parts = source_file.split("/")[:3]
-            t_parts = target_file.split("/")[:3]
-            if s_parts == t_parts:
-                return 0.7
-            return 0.5
-
-        # Scan each symbol's content for references. Every reference is kept:
-        # a per-symbol cap once dropped calls from long functions, in whatever
-        # order the name set happened to iterate, so two runs disagreed.
-        edge_count = 0
-
-        content_rows = self.db.conn.execute(
+        content_rows = [dict(row) for row in self.db.conn.execute(
             f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.content, s.metadata,
                       s.file_id, s.start_line, s.end_line, f.path as file_path, f.language
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
-        ).fetchall()
+        )]
+        spans = [(row["file_id"], row["start_line"], _text_end(row)) for row in content_rows]
+        tables = (rows, spans, str(self.config.root))
 
-        # A container's body overlaps its members' bodies. Scanned whole, it
-        # re-reports every call they make and "calls" each method it declares:
-        # a class of a few thousand lines yields thousands of edges, nearly all
-        # noise. The members are scanned on their own, so anything that is not
-        # a callable keeps only the lines it owns — its bases, its fields'
-        # types. Spans are sorted by first line, so the ones a symbol may hold
-        # are found by bisection rather than by walking the whole file.
-        spans_by_file: dict[int, list[tuple[int, int]]] = {}
-        for row in content_rows:
-            spans_by_file.setdefault(row["file_id"], []).append(
-                (row["start_line"], _text_end(row))
-            )
-        for spans in spans_by_file.values():
-            spans.sort()
-        span_starts = {fid: [s for s, _ in spans] for fid, spans in spans_by_file.items()}
+        edge_count = 0
+        done = 0
 
-        def _nested_spans(file_id: int, start_line: int, end_line: int) -> list[tuple[int, int]]:
-            spans = spans_by_file.get(file_id, [])
-            starts = span_starts.get(file_id, [])
-            return spans[bisect.bisect_left(starts, start_line):
-                         bisect.bisect_right(starts, end_line)]
-
-        from .imports import extract_imports
-        from .refmask import mask_noncode
-
-        # Per-file import evidence (a boost/filter for the import tier, never a
-        # resolver). Reads the file head from disk at index time; a file gone
-        # missing simply never hits the import tier.
-        file_imports: dict[str, set[str]] = {}
-
-        def _imports_for(file_path: str, language: str | None) -> set[str]:
-            if file_path not in file_imports:
-                names: set[str] = set()
-                try:
-                    head = "\n".join(
-                        (self.config.root / file_path).read_text(errors="ignore")
-                        .splitlines()[:100]
-                    )
-                    for imp in extract_imports(head, language or ""):
-                        mod = imp.get("module") or ""
-                        if mod:
-                            stem = mod.rsplit(".", 1)[-1].rsplit("/", 1)[-1]
-                            names.add(stem.rsplit(".", 1)[0] or stem)
-                        for nm in imp.get("names") or []:
-                            names.add(nm)
-                except OSError:
-                    pass
-                file_imports[file_path] = names
-            return file_imports[file_path]
-
-        def _select_targets(targets: list[dict], source_file: str,
-                            imported: set[str], ref_name: str) -> tuple[list[dict], str]:
-            """Ranked, field-standard selection: prefer evidence,
-            and when none discriminates, keep the ranked LIST as name_only —
-            a labeled candidate list beats a fabricated winner."""
-            same_file = [t for t in targets if t["file"] == source_file]
-            if same_file:
-                return same_file, "same_file"
-            files = {t["file"] for t in targets}
-            if len(files) == 1:
-                return targets, "unique_file"
-            if imported:
-                imp = [t for t in targets
-                       if t["file"].rsplit("/", 1)[-1].rsplit(".", 1)[0] in imported]
-                if imp and len({t["file"] for t in imp}) == 1:
-                    return imp, "import"
-            sdir = _dir_of(source_file)
-            sd = [t for t in targets if _dir_of(t["file"]) == sdir]
-            if sd and len({t["file"] for t in sd}) == 1:
-                return sd, "same_dir"
-            return targets, "name_only"
-
-        for done, row in enumerate(content_rows, 1):
-            if on_progress and (done % 500 == 0 or done == len(content_rows)):
+        def write(edges: list[tuple[int, int, float, str]], scanned: int) -> None:
+            nonlocal edge_count, done
+            for source_id, target_id, confidence, resolution in edges:
+                self.db.insert_edge(EdgeRecord(
+                    source_id=source_id,
+                    target_id=target_id,
+                    edge_type="calls",
+                    confidence=confidence,
+                    resolution=resolution,
+                ))
+            edge_count += len(edges)
+            before, done = done, done + scanned
+            if on_progress and (done // 500 > before // 500 or done == len(content_rows)):
                 on_progress("call graph", done, len(content_rows))
-            source_id = row["id"]
-            source_name = row["name"]
-            source_file = row["file_path"].replace("\\", "/")
-            # Mask comments/strings BEFORE scanning: a name that appears only in
-            # prose is not a reference (12.8% of sampled edges were this class).
-            content = mask_noncode(row["content"], row["language"] or "")
-            if row["language"] in ("c", "cpp"):
-                # A literal is still an argument: `f("x")` passes one.
-                content = _literals_as_values(row["content"], content)
-            if row["kind"] not in _CALLABLE_KINDS:
-                content = _own_text(
-                    content, row["start_line"], _text_end(row),
-                    _nested_spans(row["file_id"], row["start_line"], _text_end(row)),
-                )
 
-            referenced_names = match_names(content)
-            referenced_names.discard(source_name)
-            # `A::B::c()` read as the member `B::c` still names the class `B`.
-            for qualified_ref in [n for n in referenced_names if n in member_aliases]:
-                qualifier = qualified_ref.rsplit("::", 1)[0].rsplit("::", 1)[-1]
-                if qualifier in filtered_names and qualifier != source_name:
-                    referenced_names.add(qualifier)
+        workers = _graph_workers(len(content_rows))
+        if workers > 1:
+            try:
+                self._scan_in_processes(tables, content_rows, workers, write)
+                return edge_count
+            except (OSError, BrokenProcessPool):
+                # Nothing is written until a chunk comes back in order, so
+                # what was written is a prefix: take it back and scan here.
+                logger.warning("Could not scan the call graph in parallel; "
+                               "scanning in this process", exc_info=True)
+                self.db.conn.execute("DELETE FROM symbol_edges")
+                edge_count = done = 0
 
-            imported = _imports_for(row["file_path"], row["language"])
-            # Names the #if/#else recovery put over one shared body each hold
-            # the other's name; the extractor marked them, and between them
-            # that is not a call.
-            body = _shared_body(row["metadata"])
-            # In C and C++ the way a name is written narrows what it reaches,
-            # and a name the symbol declares for itself is no reference.
-            c_family = row["language"] in ("c", "cpp")
-            arities_of: dict[str, set] = {}
-            source_scope = None
-            if c_family:
-                unqualified = _without_template_args(row["qualified_name"] or "")
-                # A class template's body is its own scope. A constructor
-                # defined in its class is stored as a function, `C::C`; its
-                # scope is still its class.
-                if row["kind"] == "template" and _declares_a_class(content):
-                    source_scope = unqualified or None
-                elif row["kind"] in ("method", "template", "function") and "::" in unqualified:
-                    source_scope = unqualified.rsplit("::", 1)[0]
-                # An out-of-line definition opens with its own name, `C::f`:
-                # that is no call to the declaration `f`.
-                # A definition opens with its own name — `C::f`, or `f` and
-                # `~C` inside a class — which is no call. It is overwritten
-                # with a character no name holds: blanked, the return type
-                # before it, `C C::f(`, would read as `C(`; as an identifier,
-                # as a variable `C x(` constructed.
-                own_blanked = content
-                short_own = source_name.rsplit("::", 1)[-1]
-                for own in dict.fromkeys((source_name, short_own)):
-                    found = _standalone_at(own_blanked, own)
-                    if found is not None:
-                        own_blanked = (own_blanked[:found] + "#" * len(own)
-                                       + own_blanked[found + len(own):])
-                        break
-                receivers_of: dict[str, set] = {}
-                forms_of = _reference_forms_all(
-                    own_blanked, {n for n in referenced_names if "::" not in n},
-                    arities_of, receivers_of)
-                # A name met only inside the definition's own name — the class
-                # in `~C()` — is no reference.
-                referenced_names -= {n for n in referenced_names
-                                     if n.isidentifier() and n not in forms_of}
-                var_types = _declared_types(content, source_name, row["kind"])
-                # A qualified name, `C::f(...)`, is one token to the matcher:
-                # its argument counts are read here.
-                wanted = {n for n in referenced_names if "::" in n}
-                if wanted:
-                    for m in _QUALIFIED_CALL_RE.finditer(own_blanked):
-                        # The matcher may know the name by its last parts
-                        # only: `app::gfx::Tinter(1)` is a call to `gfx::Tinter`.
-                        parts = m.group(1).split("::")
-                        for k in range(len(parts) - 1):
-                            written = "::".join(parts[k:])
-                            if written in wanted:
-                                arities_of.setdefault(written, set()).add(
-                                    _call_arity(own_blanked, m.start(2)) if m.group(2) else None)
-                # A parameter or local hides the name written bare only:
-                # `x.name()`, `::name()` and `C::name()` still call.
-                for declared in _declared_names(content, source_name, row["kind"]):
-                    if declared not in referenced_names:
-                        continue
-                    forms, qualifiers = forms_of.get(declared, (set(), set()))
-                    if forms <= {"bare"}:
-                        referenced_names.discard(declared)
-                    else:
-                        forms_of[declared] = (forms - {"bare"}, qualifiers)
-            for ref_name in referenced_names:
-                targets = [t for t in filtered_names.get(ref_name, [])
-                           if t["id"] != source_id and (
-                               # A constructor — defined in its class, or only
-                               # declared there (a prototype) — is a target
-                               # where the name is called, never where it only
-                               # names a type: `Angle* p`, `const Angle& a`, a
-                               # field. That is a dependency on the class.
-                               (any(a is not None for a in arities_of.get(ref_name, ()))
-                                and t["kind"] in ("method", "prototype", "function", "template"))
-                               if _is_constructor(t, ref_name)
-                               else t["kind"] in _EDGE_TARGET_KINDS)
-                           and not t["macro_misread"]
-                           and not (body is not None and t["body"] == body
-                                    and t["file"] == source_file)]
-                targets = _without_forward_declarations(targets, source_file)
-                decided = None
-                if c_family and targets:
-                    forms, qualifiers = forms_of.get(ref_name, (set(), set()))
-                    targets, decided = _narrow_by_syntax(
-                        targets, ref_name, forms, qualifiers, source_scope, row["kind"],
-                        source_in_c=source_file.endswith(".c"),
-                        arities=arities_of.get(ref_name),
-                        receiver_types={var_types.get(v) for v in receivers_of.get(ref_name, ())}
-                        or None)
-                elif row["language"] == "python" and targets:
-                    targets, decided = _narrow_python_self_call(
-                        targets, ref_name, content, row["qualified_name"] or "", row["kind"])
-                if not targets:
-                    continue
-                if decided:
-                    chosen, resolution = targets, decided
-                else:
-                    chosen, resolution = _select_targets(targets, source_file, imported, ref_name)
-                # A name defined in many places, with nothing but the name to
-                # pick among them, would link each call to every one.
-                if resolution == "name_only" and len(chosen) > GRAPH_MAX_FANOUT:
-                    continue
-                for target in chosen:
-                    confidence = _compute_confidence(source_file, target["file"])
-                    # Skip very low confidence edges
-                    if confidence < 0.2:
-                        continue
-                    self.db.insert_edge(EdgeRecord(
-                        source_id=source_id,
-                        target_id=target["id"],
-                        edge_type="calls",
-                        confidence=confidence,
-                        resolution=resolution,
-                    ))
-                    edge_count += 1
-
+        scanner = _EdgeScanner(*tables)
+        for row in content_rows:
+            write(scanner.scan(row), 1)
         return edge_count
+
+    @staticmethod
+    def _scan_in_processes(tables, content_rows: list[dict], workers: int, write) -> None:
+        """Scan the symbols in chunks over `workers` processes, handing each
+        chunk's edges to `write` in the order of the chunks."""
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+
+        # Small enough to show progress and balance the work, large enough
+        # that sending a chunk costs little beside scanning it. Neighbouring
+        # symbols share their file, whose imports each process reads once.
+        size = max(200, min(2000, len(content_rows) // (workers * 8) or 1))
+        chunks = [content_rows[i:i + size] for i in range(0, len(content_rows), size)]
+        logger.debug("Scanning the call graph over %d processes, %d chunks",
+                     workers, len(chunks))
+        # `spawn` everywhere: a forked copy of a process that holds an open
+        # SQLite connection and threads is not safe, and Windows has nothing
+        # else. Each process builds the tables once, from `tables`.
+        with ProcessPoolExecutor(
+                max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                initializer=_start_edge_worker, initargs=tables) as pool:
+            for chunk, edges in zip(chunks, pool.map(_scan_edge_chunk, chunks)):
+                write(edges, len(chunk))
 
     def _build_inheritance_edges(self) -> int:
         """Build 'inherits' edges by parsing base class specifiers.
