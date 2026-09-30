@@ -206,3 +206,30 @@ def test_flows_that_failed_to_store_are_found_again(project, tmp_path, caplog, m
     assert "Communities unchanged" not in caplog.text
     assert db.conn.execute("SELECT COUNT(*) FROM execution_flows").fetchone()[0] > 0
     db.close()
+
+
+def test_the_same_graph_gives_the_same_execution_flows_whatever_the_edge_order(tmp_path):
+    """Flows follow only the first few callees of each symbol, in the order
+    they are listed: listed in edge row order, the same graph gave other
+    flows from one run to the next."""
+    from srclight.community import trace_execution_flows
+
+    def flows(db):
+        found = trace_execution_flows(db, {}, max_branching=2)
+        return [[s["symbol_id"] for s in f["steps"]] for f in found]
+
+    runs = []
+    for seed in (1, 2, 3, 4):
+        db = _db_with_graph(tmp_path / f"{seed}.db", order_seed=seed)
+        runs.append(flows(db))
+        db.close()
+    assert runs[0]
+    assert all(run == runs[0] for run in runs)
+
+
+def test_a_record_that_is_not_a_dict_is_not_trusted(tmp_path):
+    db = _db_with_graph(tmp_path / "a.db", order_seed=1)
+    db.conn.execute("INSERT OR REPLACE INTO schema_info (key, value) "
+                    "VALUES ('communities_state', '[1, 2]')")
+    assert db.communities_still_hold(call_graph_fingerprint(db)) is False
+    db.close()

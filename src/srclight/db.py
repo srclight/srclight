@@ -1837,7 +1837,7 @@ class Database:
         """Whether the stored communities and flows were found from this very
         graph and are still all there."""
         record = self.get_communities_record()
-        return (record is not None and record.get("graph") == fingerprint
+        return (isinstance(record, dict) and record.get("graph") == fingerprint
                 and all(record.get(k) == v for k, v in self.community_row_counts().items()))
 
     def store_communities(self, communities: list[dict]) -> None:

@@ -290,9 +290,15 @@ def trace_execution_flows(
     in_degree: dict[int, int] = {}
     out_degree: dict[int, int] = {}
 
-    rows = db.conn.execute(
-        "SELECT source_id, target_id FROM symbol_edges WHERE edge_type = 'calls'"
-    ).fetchall()
+    # In a fixed order: each symbol's callees are followed in the order they
+    # are listed, and only the first few, so the order the edge rows came
+    # back in — which changes from one index run to the next — chose which.
+    rows = sorted(
+        db.conn.execute(
+            "SELECT source_id, target_id FROM symbol_edges WHERE edge_type = 'calls'"
+        ).fetchall(),
+        key=lambda row: (row[0], row[1]),
+    )
 
     # Load symbol info (kind, name, file_id) for all nodes in edges
     edge_node_ids: set[int] = set()
@@ -365,7 +371,8 @@ def trace_execution_flows(
 
         entry_scores.append((node_id, score))
 
-    entry_scores.sort(key=lambda x: x[1], reverse=True)
+    # Ties go to the lower symbol id, not to the order the nodes were met in.
+    entry_scores.sort(key=lambda x: (-x[1], x[0]))
     entry_points = [ep[0] for ep in entry_scores[:max_entry_points]]
 
     # BFS from each entry point (with global iteration cap)
