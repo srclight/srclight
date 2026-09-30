@@ -168,19 +168,23 @@ def test_symbols_re_parsed_under_the_same_ids_get_their_communities_back(project
     run left them in no community at all."""
     caplog.set_level(logging.INFO, logger="srclight.indexer")
     db_path = tmp_path / "index.db"
+
+    def flow_ids(db):
+        return [r[0] for r in db.conn.execute(
+            "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id "
+            "WHERE f.path = 'flow.py' ORDER BY s.id")]
+
     db = _index(project, db_path)
-    ids_before = [r[0] for r in db.conn.execute(
-        "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.path = 'flow.py' ORDER BY s.id")]
+    ids_before = flow_ids(db)
     assert _members_missing(db) == 0
     db.close()
 
     # A body changed, no call: the last file indexed, so its ids come back.
-    (project / "flow.py").write_text((project / "flow.py").read_text().replace("return 1", "return 2"))
+    flow = project / "flow.py"
+    flow.write_text(flow.read_text().replace("return 1", "return 2"))
     caplog.clear()
     db = _index(project, db_path)
-    ids_after = [r[0] for r in db.conn.execute(
-        "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.path = 'flow.py' ORDER BY s.id")]
-    assert ids_after == ids_before, "the test needs SQLite to reuse the ids"
+    assert flow_ids(db) == ids_before, "the test needs SQLite to reuse the ids"
     assert "Communities unchanged" not in caplog.text
     assert _members_missing(db) == 0
     db.close()
