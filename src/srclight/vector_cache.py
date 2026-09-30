@@ -202,14 +202,20 @@ class VectorCache:
         own.row_factory = sqlite3.Row
         return own
 
+    @staticmethod
+    def _identity(st) -> list[int]:
+        """What tells one written file from another: its size, its mtime and
+        its inode. The mtime alone is not enough — on a filesystem with a
+        coarse clock (ext4 under WSL2, network mounts, FAT) two builds a few
+        milliseconds apart get the same one — but os.replace() always puts a
+        file with another inode in place, and a rename keeps a file's inode."""
+        return [st.st_size, st.st_mtime_ns, st.st_ino]
+
     def _fingerprint(self) -> dict:
-        """Size and modification time of the matrix and norms files: each
+        """The identity of the matrix and norms files at their paths: each
         build writes them anew, so a pair left by another build differs."""
-        fingerprint = {}
-        for path in (self.npy_path, self.norms_path):
-            st = path.stat()
-            fingerprint[path.name] = [st.st_size, st.st_mtime_ns]
-        return fingerprint
+        return {path.name: self._identity(path.stat())
+                for path in (self.npy_path, self.norms_path)}
 
     def _reuse_previous(self, ids: list[int], stamps: list, model: str, dims: int,
                         matrix, norms) -> list[int]:
@@ -242,8 +248,8 @@ class VectorCache:
                     old_norms = None
             # Still the same files once mapped: another build replacing them
             # between the check and the load would pair its matrix with this
-            # meta. Size and mtime_ns unchanged across both loads mean what
-            # was mapped is what the meta names.
+            # meta. The same identities across both loads mean what was
+            # mapped is what the meta names.
             if meta["files"] != self._fingerprint():
                 return everything
             where = {key: row for row, key in enumerate(zip(old_ids, old_stamps))
@@ -305,9 +311,9 @@ class VectorCache:
     @staticmethod
     def _atomic_write(path: Path, write) -> list[int]:
         """Write through a temp file + os.replace(); return the written file's
-        [size, mtime_ns], taken from the file itself before it is renamed —
-        the rename keeps both — so it is this build's file whatever another
-        build puts at `path` afterwards.
+        identity (see _identity), taken from the file itself before it is
+        renamed — the rename keeps it — so it is this build's file whatever
+        another build puts at `path` afterwards.
 
         A running server holds every sidecar mmap'd for its whole life, and
         np.save() opens its target "wb" — O_TRUNC on the same inode. Rebuilding
@@ -324,7 +330,7 @@ class VectorCache:
                 os.fsync(fh.fileno())
                 st = os.fstat(fh.fileno())
             os.replace(tmp, path)
-            return [st.st_size, st.st_mtime_ns]
+            return VectorCache._identity(st)
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise

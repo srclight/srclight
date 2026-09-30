@@ -617,7 +617,11 @@ def test_the_meta_names_the_files_this_build_wrote(tmp_path, monkeypatch):
     """Two builds at once (a git hook's index and the server's rebuild)
     replace the same paths. Fingerprinted by path after the fact, this
     build's meta could name the other build's files and pass the check on a
-    mismatched set; taken from the written file itself, it cannot."""
+    mismatched set; taken from the written file itself, it cannot.
+
+    The other build's matrix has the same size and, as on a filesystem with
+    a coarse clock (ext4 under WSL2), the same mtime: only its inode tells
+    it apart."""
     db, db_path = _setup_db(tmp_path, n_symbols=5)
     real = VectorCache._atomic_write
     other = tmp_path / "other.npy"
@@ -626,7 +630,9 @@ def test_the_meta_names_the_files_this_build_wrote(tmp_path, monkeypatch):
     def another_build_lands_in_between(path, write):
         written = real(path, write)
         if path.name == "embeddings_norms.npy":
-            time.sleep(0.01)
+            mine = (db_path.parent / "embeddings.npy").stat()
+            assert other.stat().st_size == mine.st_size
+            os.utime(other, ns=(mine.st_atime_ns, mine.st_mtime_ns))
             os.replace(other, db_path.parent / "embeddings.npy")
         return written
 
