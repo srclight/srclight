@@ -1424,17 +1424,27 @@ class Database:
         hinted = len(present) == 2
         # SQLite keeps only the first `limit` ids as it scans: a first run,
         # or a new model, needs nearly every symbol of the index.
+        # The embedding is looked up in correlated subqueries, not joined:
+        # with planner statistics (ANALYZE) SQLite builds a Bloom filter for
+        # a join by scanning the joined table itself, blobs and all. There is
+        # at most one embedding per symbol (symbol_id is the primary key), so
+        # "none of this model, or one whose hash differs" is the LEFT JOIN's
+        # `e.symbol_id IS NULL OR e.body_hash != s.body_hash`, NULLs included.
+        # CROSS JOIN keeps the symbols' index the outer loop whatever the
+        # planner statistics say: SQLite never reorders it.
+        hint = "INDEXED BY idx_symbol_embeddings_hash" if hinted else ""
         needed = [row[0] for row in self.conn.execute(
             f"""SELECT s.id
                 FROM symbols s {'INDEXED BY idx_symbols_body_hash' if hinted else ''}
-                JOIN files f ON s.file_id = f.id
-                LEFT JOIN symbol_embeddings e
-                    {'INDEXED BY idx_symbol_embeddings_hash' if hinted else ''}
-                    ON s.id = e.symbol_id AND e.model = ?
-                WHERE e.symbol_id IS NULL OR e.body_hash != s.body_hash
+                CROSS JOIN files f ON s.file_id = f.id
+                WHERE NOT EXISTS (SELECT 1 FROM symbol_embeddings e {hint}
+                                  WHERE e.symbol_id = s.id AND e.model = ?)
+                   OR EXISTS (SELECT 1 FROM symbol_embeddings e {hint}
+                              WHERE e.symbol_id = s.id AND e.model = ?
+                                AND e.body_hash != s.body_hash)
                 ORDER BY s.id
                 LIMIT ?""",
-            (model, limit))]
+            (model, model, limit))]
         found: list[dict] = []
         for start in range(0, len(needed), 500):
             chunk = needed[start:start + 500]

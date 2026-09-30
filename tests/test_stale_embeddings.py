@@ -66,18 +66,45 @@ def test_another_model_needs_everything_it_has_not_embedded(db):
     assert db.get_symbols_needing_embeddings("mock:other") == _reference(db, "mock:other", 100000)
 
 
-def test_the_hashes_are_read_from_indexes_not_from_the_tables(db):
+def _large_index_statistics(db):
+    """Planner statistics of an index of ~200k symbols, all embedded."""
+    db.conn.execute("ANALYZE")
+    db.conn.execute(
+        "DELETE FROM sqlite_stat1 WHERE tbl IN ('symbols', 'symbol_embeddings', 'files')")
+    db.conn.executemany("INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES (?, ?, ?)", [
+        ("files", None, "20000"),
+        ("files", "idx_files_language", "20000 2000"),
+        ("files", "idx_files_hash", "20000 1"),
+        ("symbols", None, "200000"),
+        ("symbols", "idx_symbols_body_hash", "200000 1 1"),
+        ("symbol_embeddings", None, "200000"),
+        ("symbol_embeddings", "idx_symbol_embeddings_hash", "200000 1 1 1"),
+        ("symbol_embeddings", "idx_symbol_embeddings_stamp", "200000 1 1 1"),
+    ])
+    db.commit()
+    db.conn.execute("ANALYZE sqlite_schema")  # reload them
+
+
+@pytest.mark.parametrize("statistics", [False, True])
+def test_the_hashes_are_read_from_indexes_not_from_the_tables(db, statistics):
     """body_hash sits after the embedding blob and after the symbol's
-    content: read from either table, it walks all of them on every run."""
+    content: read from either table, it walks all of them on every run.
+    Whatever the planner knows about the tables, the symbols' index is the
+    one loop, and each embedding is one lookup in its own index."""
+    if statistics:
+        _large_index_statistics(db)
     statements = []
     db.conn.set_trace_callback(statements.append)
     db.get_symbols_needing_embeddings(MODEL)
     db.conn.set_trace_callback(None)
-    listing = next(s for s in statements if "LEFT JOIN symbol_embeddings" in s)
-    plan = " ".join(r[3] for r in db.conn.execute(
-        "EXPLAIN QUERY PLAN " + listing.replace(f"'{MODEL}'", "?"), (MODEL,)))
-    assert "COVERING INDEX idx_symbols_body_hash" in plan, plan
-    assert "COVERING INDEX idx_symbol_embeddings_hash" in plan, plan
+    listing = next(s for s in statements if "FROM symbol_embeddings e" in s)
+    plan = [r[3] for r in db.conn.execute(
+        "EXPLAIN QUERY PLAN " + listing.replace(f"'{MODEL}'", "?"), (MODEL, MODEL))]
+    scans = [p for p in plan if p.startswith("SCAN")]
+    assert scans == ["SCAN s USING COVERING INDEX idx_symbols_body_hash"], plan
+    lookups = [p for p in plan if "symbol_embeddings" in p or p.startswith("SEARCH e")]
+    assert lookups and all("COVERING INDEX idx_symbol_embeddings_hash" in p for p in lookups), plan
+    assert not any("BLOOM" in p for p in plan), plan
 
 
 def test_a_database_without_the_indexes_is_still_answered(db):
