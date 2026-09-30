@@ -311,6 +311,39 @@ def test_the_call_graph_log_gives_the_edges_the_index_holds(tmp_path, caplog):
     db.close()
     [logged] = re.findall(r"Call graph: (\d+) edges", caplog.text)
     assert int(logged) == held
+    # The closing line, all the MCP tool and the git hook get, too.
+    [closing] = re.findall(r"Indexed \d+ files \(\d+ symbols, (\d+) edges\)", caplog.text)
+    assert int(closing) == held
+
+
+def test_a_graph_rebuilt_empty_is_still_said_rebuilt(tmp_path):
+    """Any file indexed clears the graph and rebuilds it; without the note, an
+    empty result read as the old graph kept."""
+    from click.testing import CliRunner
+
+    from srclight.cli import main
+
+    (tmp_path / "a.py").write_text("def alpha():\n    return 1\n")
+    result = CliRunner().invoke(main, ["index", str(tmp_path), "--no-embed"])
+    assert result.exit_code == 0, result.output
+    assert "  Edges:       0 in the index, call graph rebuilt this run" in result.output
+
+
+def test_the_workspace_time_is_the_phases_added_up(tmp_path, ws_dir, monkeypatch):  # noqa: F811
+    """The indexer's elapsed time stops before its closing checkpoint, which
+    the "Saving the index" phase the workspace run prints includes."""
+    from click.testing import CliRunner
+
+    from srclight import cli
+    from srclight.workspace import WorkspaceConfig
+
+    monkeypatch.setattr(cli._ProgressLine, "total", lambda self: 123.4)
+    config = WorkspaceConfig(name="time-ws")
+    config.add_project("alpha", str(_small_repo(tmp_path)))
+    config.save()
+    result = CliRunner().invoke(cli.main, ["workspace", "index", "-w", "time-ws", "--no-embed"])
+    assert result.exit_code == 0, result.output
+    assert " edges in the index, 123.4s" in result.output
 
 
 def test_the_file_scan_is_announced_like_the_phases_after_it(capsys):

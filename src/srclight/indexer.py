@@ -2961,13 +2961,14 @@ class Indexer:
             if on_phase:
                 on_phase("Building the call graph")
             phase_start = time.monotonic()
-            stats.edges_created = self._build_edges(on_progress=on_progress)
-            stats.edges_created += self._build_inheritance_edges()
-            # edges_created also counts the duplicates INSERT OR IGNORE drops;
-            # the graph is rebuilt whole, so the table holds exactly this run's.
-            edges = self.db.conn.execute("SELECT COUNT(*) FROM symbol_edges").fetchone()[0]
+            self._build_edges(on_progress=on_progress)
+            self._build_inheritance_edges()
+            # Their counts include the duplicates INSERT OR IGNORE drops; the
+            # graph is rebuilt whole, so the table holds exactly this run's.
+            stats.edges_created = self.db.conn.execute(
+                "SELECT COUNT(*) FROM symbol_edges").fetchone()[0]
             logger.info("Call graph: %d edges in %.0fs",
-                        edges, time.monotonic() - phase_start)
+                        stats.edges_created, time.monotonic() - phase_start)
 
         # Community detection and execution flow tracing (post-edge phase)
         # Run if new edges were created OR if communities table is empty (first run after v5 migration)

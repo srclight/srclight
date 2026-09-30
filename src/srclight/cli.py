@@ -299,9 +299,8 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
                f"{stats.errors} errors")
     click.echo(f"  Symbols:     {stats.symbols_extracted} extracted, "
                f"{db_stats['symbols']} in the index")
-    # The index's own count: edges_created counts inserts tried, duplicates
-    # the database ignores included, and read as more edges than it holds.
-    rebuilt = ", call graph rebuilt this run" if stats.edges_created else ""
+    # Any file indexed rebuilds the whole graph, even when it ends up empty.
+    rebuilt = ", call graph rebuilt this run" if stats.files_indexed else ""
     click.echo(f"  Edges:       {db_stats['edges']} in the index{rebuilt}")
     # Measured here, from the first phase to the end of the last: the
     # indexer's own elapsed_seconds stops before its closing checkpoint,
@@ -752,7 +751,7 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
                        f"{stats.files_unchanged} unchanged, {stats.files_removed} removed, "
                        f"{stats.errors} errors; {stats.symbols_extracted} symbols, "
                        f"{db_stats['edges']} edges in the index, "
-                       f"{stats.elapsed_seconds:.1f}s")
+                       f"{line.total():.1f}s")
             click.echo(f"    DB: {db_stats['db_size_mb']} MB")
         except Exception as e:
             click.echo(f"\n    ERROR: {e}", err=True)
