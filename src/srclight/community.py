@@ -66,18 +66,29 @@ def call_graph_edges(db: Database) -> list[tuple[int, int, int]]:
     return sorted((low, high, w) for (low, high), w in weights.items())
 
 
-def call_graph_fingerprint(edges: list[tuple[int, int, int]]) -> str:
-    """A digest of `edges` and of the method that finds communities in them.
+def call_graph_fingerprint(db: Database, edges: list[tuple[int, int, int]]) -> str:
+    """A digest of everything communities and execution flows are found
+    from: `edges`, what the symbols in them are called, what they are and
+    where, and the method.
 
-    Communities and execution flows only name symbols that have call edges.
-    With the same edges — the same symbol ids — they are the same symbols,
-    never re-parsed since, so what was found last time still holds.
+    A symbol id is no identity on its own: a file re-parsed gets its
+    symbols re-inserted, and SQLite can hand the same ids back to symbols
+    that are renamed or moved. So each one's name, qualified name, kind and
+    file path are part of it.
     """
     import hashlib
 
+    assert db.conn is not None
+    nodes = sorted({n for low, high, _ in edges for n in (low, high)})
+    symbols = sorted(tuple(row) for row in _chunked_in_select(
+        db.conn, "id, name, qualified_name, kind, file_id", "symbols", nodes))
+    paths = dict(tuple(row) for row in _chunked_in_select(
+        db.conn, "id, path", "files", {row[4] for row in symbols}))
     digest = hashlib.blake2b(_COMMUNITY_METHOD.encode(), digest_size=16)
     for low, high, w in edges:
         digest.update(b"%d,%d,%d;" % (low, high, w))
+    for sid, name, qualified, kind, file_id in symbols:
+        digest.update(repr((sid, name, qualified, kind, paths.get(file_id))).encode())
     return digest.hexdigest()
 
 

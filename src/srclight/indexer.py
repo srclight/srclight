@@ -2979,13 +2979,13 @@ class Indexer:
                 if on_phase:
                     on_phase("Finding communities and execution flows")
                 edges = call_graph_edges(self.db)
-                fingerprint = call_graph_fingerprint(edges)
-                # The graph is rebuilt on every run that changes a file, most
-                # often into the same graph: a file without calls, or whose
-                # symbols kept their ids. Louvain on it again finds the same.
-                if (fingerprint == self.db.get_communities_fingerprint()
-                        and self.db.conn.execute(
-                            "SELECT 1 FROM communities LIMIT 1").fetchone()):
+                fingerprint = call_graph_fingerprint(self.db, edges)
+                # The graph is rebuilt on every run that changes a file, often
+                # into the same graph: a file without calls, say. Louvain on
+                # it again finds the same — but only what is stored is kept,
+                # and a re-parsed file's symbols take their community and flow
+                # rows with them even when they come back under the same ids.
+                if self.db.communities_still_hold(fingerprint):
                     logger.info("Communities unchanged: same call graph as last run")
                     communities = []
                 else:
@@ -2996,9 +2996,9 @@ class Indexer:
                         for m in c["members"]:
                             sym_to_comm[m["id"]] = c["id"]
                     flows = trace_execution_flows(self.db, sym_to_comm)
-                    self.db.set_communities_fingerprint(fingerprint)
                     self.db.store_communities(communities)
                     self.db.store_execution_flows(flows)
+                    self.db.set_communities_record(fingerprint)
                     logger.info(
                         "Detected %d communities, %d execution flows",
                         len(communities), len(flows),

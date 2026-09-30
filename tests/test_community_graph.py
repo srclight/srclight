@@ -67,14 +67,18 @@ def test_edges_are_undirected_and_weighted_by_their_count(tmp_path):
     db.close()
 
 
-def test_the_fingerprint_follows_the_edges_only(tmp_path):
+def test_the_fingerprint_follows_the_graph_and_its_symbols(tmp_path):
     a = _db_with_graph(tmp_path / "a.db", order_seed=4)
     b = _db_with_graph(tmp_path / "b.db", order_seed=5)
     edges = call_graph_edges(a)
-    assert call_graph_fingerprint(edges) == call_graph_fingerprint(call_graph_edges(b))
+    same = call_graph_fingerprint(a, edges)
+    assert same == call_graph_fingerprint(b, call_graph_edges(b))
     low, high, w = edges[0]
-    assert call_graph_fingerprint(edges) != call_graph_fingerprint([(low, high, w + 1)] + edges[1:])
-    assert call_graph_fingerprint(edges) != call_graph_fingerprint(edges[1:])
+    assert same != call_graph_fingerprint(a, [(low, high, w + 1)] + edges[1:])
+    assert same != call_graph_fingerprint(a, edges[1:])
+    # The same id, another symbol: renamed where it stands.
+    a.conn.execute("UPDATE symbols SET name = 'renamed' WHERE id = ?", (low,))
+    assert same != call_graph_fingerprint(a, edges)
     a.close()
     b.close()
 
@@ -125,4 +129,59 @@ def test_an_unchanged_call_graph_is_not_searched_again(project, tmp_path, caplog
     db = _index(project, db_path)
     assert "Communities unchanged" not in caplog.text
     assert "Detected" in caplog.text
+    db.close()
+
+
+def _members_missing(db):
+    """Symbols with call edges but no community."""
+    return db.conn.execute(
+        """SELECT COUNT(*) FROM (SELECT source_id AS id FROM symbol_edges WHERE edge_type = 'calls'
+                                 UNION SELECT target_id FROM symbol_edges WHERE edge_type = 'calls')
+           WHERE id NOT IN (SELECT symbol_id FROM symbol_communities)""").fetchone()[0]
+
+
+def test_symbols_re_parsed_under_the_same_ids_get_their_communities_back(project, tmp_path, caplog):
+    """Re-parsing a file deletes its symbols, and their community and flow
+    rows with them (ON DELETE CASCADE). SQLite can hand the same ids back to
+    the re-inserted symbols, and the graph then looks the same: skipped, the
+    run left them in no community at all."""
+    caplog.set_level(logging.INFO, logger="srclight.indexer")
+    db_path = tmp_path / "index.db"
+    db = _index(project, db_path)
+    ids_before = [r[0] for r in db.conn.execute(
+        "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.path = 'flow.py' ORDER BY s.id")]
+    assert _members_missing(db) == 0
+    db.close()
+
+    # A body changed, no call: the last file indexed, so its ids come back.
+    (project / "flow.py").write_text((project / "flow.py").read_text().replace("return 1", "return 2"))
+    caplog.clear()
+    db = _index(project, db_path)
+    ids_after = [r[0] for r in db.conn.execute(
+        "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.path = 'flow.py' ORDER BY s.id")]
+    assert ids_after == ids_before, "the test needs SQLite to reuse the ids"
+    assert "Communities unchanged" not in caplog.text
+    assert _members_missing(db) == 0
+    db.close()
+
+
+def test_flows_that_failed_to_store_are_found_again(project, tmp_path, caplog, monkeypatch):
+    """What the communities were found from is recorded once they and the
+    flows are stored: a failure in between leaves nothing to skip on."""
+    caplog.set_level(logging.INFO, logger="srclight.indexer")
+    db_path = tmp_path / "index.db"
+
+    def locked(self, flows):
+        raise RuntimeError("database is locked")
+
+    with monkeypatch.context() as m:
+        m.setattr(Database, "store_execution_flows", locked)
+        _index(project, db_path).close()
+    assert "Community detection failed" in caplog.text
+
+    (project / "alone.py").write_text("def unrelated_helper():\n    return 4\n")
+    caplog.clear()
+    db = _index(project, db_path)
+    assert "Communities unchanged" not in caplog.text
+    assert db.conn.execute("SELECT COUNT(*) FROM execution_flows").fetchone()[0] > 0
     db.close()
