@@ -2939,6 +2939,13 @@ class Indexer:
                 stats.errors += 1
                 failed_files += 1
 
+        # The progress line otherwise stays on the last file it showed, which
+        # says nothing about the pass: it ends on what the pass found.
+        if on_progress and files_to_index:
+            on_progress(f"done: {stats.files_indexed} indexed, "
+                        f"{stats.files_unchanged} unchanged",
+                        len(files_to_index), len(files_to_index))
+
         # Remove files that no longer exist
         for old_path in existing_paths - indexed_paths:
             file_rec = self.db.get_file(old_path)
@@ -3061,7 +3068,10 @@ class Indexer:
         self.db.commit()
         stats.elapsed_seconds = time.monotonic() - start
 
-        logger.info(
+        # A caller following the phases prints its own summary of the run —
+        # the CLI does — so the same figures are only a debug line there. The
+        # MCP tool and the git hook have no other record of it.
+        (logger.debug if on_phase else logger.info)(
             "Indexed %d files (%d symbols, %d edges) in %.2fs. %d unchanged, %d removed, %d errors.",
             stats.files_indexed, stats.symbols_extracted, stats.edges_created,
             stats.elapsed_seconds, stats.files_unchanged, stats.files_removed, stats.errors,
@@ -3719,7 +3729,7 @@ class Indexer:
         # Get symbols needing embeddings
         symbols = self.db.get_symbols_needing_embeddings(provider.name)
         if not symbols:
-            logger.debug("All symbols already embedded with %s", provider.name)
+            logger.info("No symbols to embed: all are embedded with %s", provider.name)
             return 0
 
         logger.info("Embedding %d symbols with %s...", len(symbols), provider.name)

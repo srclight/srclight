@@ -190,3 +190,81 @@ def test_the_work_after_the_last_phase_is_a_phase_of_its_own(tmp_path, monkeypat
     Indexer(db, config).index(root, on_phase=phases.append)
     db.close()
     assert phases[-1] == "Saving the index", phases
+
+
+def _small_repo(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text("def alpha():\n    return beta()\n\n\ndef beta():\n    return 1\n")
+    return root
+
+
+def test_the_file_pass_ends_on_what_it_found(tmp_path):
+    """Left on the last file it showed, the progress line said nothing
+    about the pass."""
+    root = _small_repo(tmp_path)
+    db = Database(tmp_path / "index.db")
+    db.open()
+    db.initialize()
+    progress = []
+    Indexer(db, IndexConfig(root=root, disable_embeddings=True)).index(
+        root, on_progress=lambda label, cur, tot: progress.append((label, cur, tot)))
+    db.close()
+    files = [p for p in progress if p[0] != "call graph"]
+    assert files[-1] == ("done: 1 indexed, 0 unchanged", 1, 1), files
+
+
+@pytest.mark.parametrize("follows_phases", [False, True])
+def test_the_run_summary_is_logged_where_nothing_else_prints_it(tmp_path, caplog, follows_phases):
+    """The CLI prints its own summary; the MCP tool and the git hook have
+    only the log."""
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="srclight.indexer")
+    root = _small_repo(tmp_path)
+    db = Database(tmp_path / "index.db")
+    db.open()
+    db.initialize()
+    Indexer(db, IndexConfig(root=root, disable_embeddings=True)).index(
+        root, on_phase=(lambda name: None) if follows_phases else None)
+    db.close()
+    [record] = [r for r in caplog.records if r.getMessage().startswith("Indexed ")]
+    assert record.levelno == (logging.DEBUG if follows_phases else logging.INFO)
+
+
+def test_nothing_to_embed_is_said(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from srclight import embeddings as embeddings_mod
+    from srclight.embeddings import vector_to_bytes
+
+    class _Stub:
+        name = "stub:model"
+        dimensions = 3
+
+    monkeypatch.setattr(embeddings_mod, "get_provider", lambda spec, **kw: _Stub())
+    monkeypatch.setattr(embeddings_mod, "embed_symbols",
+                        lambda provider, symbols, on_progress=None: [
+                            (s["id"], vector_to_bytes([0.1, 0.2, 0.3])) for s in symbols])
+    root = _small_repo(tmp_path)
+    db = Database(tmp_path / "index.db")
+    db.open()
+    db.initialize()
+    Indexer(db, IndexConfig(root=root, embed_model="stub:model")).index(root)
+    caplog.set_level(logging.INFO, logger="srclight.indexer")
+    caplog.clear()
+    Indexer(db, IndexConfig(root=root, embed_model="stub:model")).index(root)
+    db.close()
+    assert "No symbols to embed" in caplog.text
+
+
+def test_the_summary_counts_files_and_symbols_on_one_line_each(tmp_path):
+    from click.testing import CliRunner
+
+    from srclight.cli import main
+
+    root = _small_repo(tmp_path)
+    result = CliRunner().invoke(main, ["index", str(root), "--no-embed"])
+    assert result.exit_code == 0, result.output
+    assert "  Files:       1 scanned, 1 indexed, 0 unchanged, 0 removed, 0 errors" in result.output
+    assert "  Symbols:     2 extracted, 2 in the index" in result.output

@@ -285,24 +285,24 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
         stats = indexer.index(root, on_progress=line.progress, on_phase=line.phase)
 
     click.echo()
-    click.echo(f"  Files scanned:   {stats.files_scanned}")
-    click.echo(f"  Files indexed:   {stats.files_indexed}")
-    click.echo(f"  Files unchanged: {stats.files_unchanged}")
-    click.echo(f"  Files removed:   {stats.files_removed}")
-    click.echo(f"  Symbols found:   {stats.symbols_extracted}")
-    click.echo(f"  Errors:          {stats.errors}")
-    click.echo(f"  Time:            {stats.elapsed_seconds:.2f}s")
+    db_stats = db.stats()
+    # "Symbols extracted" counts the files indexed this run only; the index
+    # total is what the run left behind.
+    click.echo(f"  Files:       {stats.files_scanned} scanned, {stats.files_indexed} indexed, "
+               f"{stats.files_unchanged} unchanged, {stats.files_removed} removed, "
+               f"{stats.errors} errors")
+    click.echo(f"  Symbols:     {stats.symbols_extracted} extracted, "
+               f"{db_stats['symbols']} in the index")
+    click.echo(f"  Time:        {stats.elapsed_seconds:.2f}s")
     for step in line.summary():
         click.echo(step)
-
-    db_stats = db.stats()
-    click.echo(f"  Database size:   {db_stats['db_size_mb']} MB")
+    click.echo(f"  Database:    {db_stats['db_size_mb']} MB")
 
     if resolved_model:
         emb_stats = db.embedding_stats()
-        click.echo(f"  Embedded now:    {stats.symbols_embedded}")
-        click.echo(f"  Embeddings:      {emb_stats['embedded_symbols']}/{emb_stats['total_symbols']}"
-                    f" ({emb_stats['coverage_pct']}%)")
+        click.echo(f"  Embeddings:  {stats.symbols_embedded} embedded now, "
+                   f"{emb_stats['embedded_symbols']}/{emb_stats['total_symbols']} "
+                   f"({emb_stats['coverage_pct']}%)")
 
     db.close()
 
