@@ -66,7 +66,7 @@ def _get_db_path(root: Path) -> Path:
 
 # Each line carries the time it was logged: an index run's phases take from
 # seconds to minutes, and the gap between two lines says which one was slow.
-LOG_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 LOG_DATEFMT = "%H:%M:%S"
 
 
@@ -113,8 +113,7 @@ class _ProgressLine:
         self._next_phase(name)
         # The time as log lines carry it (LOG_FORMAT), in the same column: the
         # gap between two lines says how long a step took.
-        now = datetime.now()
-        click.echo(f"{now:%H:%M:%S}.{now.microsecond // 1000:03d} {name}...")
+        click.echo(f"{datetime.now():%H:%M:%S} {name}...")
 
     def _next_phase(self, name: str | None) -> None:
         now = self._clock()
@@ -122,6 +121,10 @@ class _ProgressLine:
             self.phases[-1][2] = now
         if name is not None:
             self.phases.append([name, now, None])
+
+    def total(self) -> float:
+        """How long all the phases took together."""
+        return sum(seconds for _, seconds in self.durations())
 
     def durations(self) -> list[tuple[str, float]]:
         """How long each phase took, in order, the file scan first."""
@@ -300,7 +303,10 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
     # the database ignores included, and read as more edges than it holds.
     rebuilt = ", call graph rebuilt this run" if stats.edges_created else ""
     click.echo(f"  Edges:       {db_stats['edges']} in the index{rebuilt}")
-    click.echo(f"  Time:        {stats.elapsed_seconds:.2f}s")
+    # Measured here, from the first phase to the end of the last: the
+    # indexer's own elapsed_seconds stops before its closing checkpoint,
+    # which the "Saving the index" phase below does include.
+    click.echo(f"  Time:        {line.total():.2f}s")
     for step in line.summary():
         click.echo(step)
     click.echo(f"  Database:    {db_stats['db_size_mb']} MB")

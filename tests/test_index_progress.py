@@ -113,7 +113,7 @@ def test_log_lines_carry_the_time():
     record = logging.LogRecord("srclight.indexer", logging.INFO, __file__, 1,
                                "Call graph: %d edges in %.0fs", (12, 3.0), None)
     line = logging.Formatter(LOG_FORMAT, LOG_DATEFMT).format(record)
-    assert re.fullmatch(r"\d\d:\d\d:\d\d\.\d{3} INFO srclight\.indexer: Call graph: 12 edges in 3s",
+    assert re.fullmatch(r"\d\d:\d\d:\d\d INFO srclight\.indexer: Call graph: 12 edges in 3s",
                         line), line
 
 
@@ -148,7 +148,7 @@ def test_phase_lines_carry_the_time(capsys):
         line.phase("Building the call graph")
     out = capsys.readouterr().out
     # Formatted and placed like the time on a log line, so the two align.
-    assert re.search(r"^\d\d:\d\d:\d\d\.\d{3} Building the call graph\.\.\.$", out, re.M), out
+    assert re.search(r"^\d\d:\d\d:\d\d Building the call graph\.\.\.$", out, re.M), out
 
 
 def test_the_cli_summary_lists_the_phases(tmp_path):
@@ -319,3 +319,16 @@ def test_the_file_pass_counts_the_files_that_failed(tmp_path, monkeypatch):
     db.close()
     files = [p for p in progress if p[0] != "call graph"]
     assert files[-1] == ("done: 1 indexed, 0 unchanged, 1 failed", 2, 2), files
+
+
+def test_the_total_is_the_phases_added_up():
+    """The indexer's elapsed time stops before its closing checkpoint, which
+    the last phase includes: printed as the total, the phases could add up
+    to more than it."""
+    from srclight.cli import _ProgressLine
+
+    ticks = iter([0.0, 12.0, 30.0, 95.0])
+    with _ProgressLine("  ", 10, clock=lambda: next(ticks)) as line:
+        line.phase("Building the call graph")
+        line.phase("Saving the index")
+    assert line.total() == 95.0 == sum(s for _, s in line.durations())
