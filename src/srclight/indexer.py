@@ -2771,7 +2771,8 @@ class Indexer:
         stats = IndexStats()
         start = time.monotonic()
 
-        logger.info("Indexing %s", root)
+        # The CLI, which follows the phases, has already printed the root.
+        (logger.debug if on_phase else logger.info)("Indexing %s", root)
 
         self._ext_overrides = self._resolve_extension_overrides()
         ignore_patterns = self._effective_ignore_patterns()
@@ -2962,8 +2963,11 @@ class Indexer:
             phase_start = time.monotonic()
             stats.edges_created = self._build_edges(on_progress=on_progress)
             stats.edges_created += self._build_inheritance_edges()
+            # edges_created also counts the duplicates INSERT OR IGNORE drops;
+            # the graph is rebuilt whole, so the table holds exactly this run's.
+            edges = self.db.conn.execute("SELECT COUNT(*) FROM symbol_edges").fetchone()[0]
             logger.info("Call graph: %d edges in %.0fs",
-                        stats.edges_created, time.monotonic() - phase_start)
+                        edges, time.monotonic() - phase_start)
 
         # Community detection and execution flow tracing (post-edge phase)
         # Run if new edges were created OR if communities table is empty (first run after v5 migration)
@@ -3040,7 +3044,9 @@ class Indexer:
                 on_phase("Embedding new and changed symbols")
             stats.symbols_embedded = self._build_embeddings(embed_model)
             if stats.symbols_embedded > 0:
-                logger.info("Embedded %d symbols with %s", stats.symbols_embedded, embed_model)
+                # The CLI's summary says it too.
+                (logger.debug if on_phase else logger.info)(
+                    "Embedded %d symbols with %s", stats.symbols_embedded, embed_model)
 
         # A phase of its own: folding the WAL back into index.db can take long
         # on a large first index, and would otherwise be timed as part of
@@ -3740,6 +3746,8 @@ class Indexer:
         embed_start = time.monotonic()
 
         def _on_progress(batch_num: int, total: int) -> None:
+            if total < 2:
+                return  # a single batch has no progress to report
             elapsed = time.monotonic() - embed_start
             rate = batch_num / elapsed if elapsed > 0 else 0
             remaining = (total - batch_num) / rate if rate > 0 else 0

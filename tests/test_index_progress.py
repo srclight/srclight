@@ -231,8 +231,97 @@ def test_the_run_summary_is_logged_where_nothing_else_prints_it(tmp_path, caplog
     Indexer(db, IndexConfig(root=root, disable_embeddings=True)).index(
         root, on_phase=(lambda name: None) if follows_phases else None)
     db.close()
-    [record] = [r for r in caplog.records if r.getMessage().startswith("Indexed ")]
+    for opening in ("Indexed ", "Indexing "):
+        [record] = [r for r in caplog.records if r.getMessage().startswith(opening)]
+        assert record.levelno == (logging.DEBUG if follows_phases else logging.INFO), opening
+
+
+def _stub_embeddings(monkeypatch, batches=1):
+    from srclight import embeddings as embeddings_mod
+    from srclight.embeddings import vector_to_bytes
+
+    class _Stub:
+        name = "stub:model"
+        dimensions = 3
+
+    def embed(provider, symbols, on_progress=None):
+        for n in range(1, batches + 1):
+            if on_progress:
+                on_progress(n, batches)
+        return [(s["id"], vector_to_bytes([0.1, 0.2, 0.3])) for s in symbols]
+
+    monkeypatch.setattr(embeddings_mod, "get_provider", lambda spec, **kw: _Stub())
+    monkeypatch.setattr(embeddings_mod, "embed_symbols", embed)
+
+
+@pytest.mark.parametrize("follows_phases", [False, True])
+def test_the_embedded_count_is_logged_where_nothing_else_prints_it(
+        tmp_path, monkeypatch, caplog, follows_phases):
+    """The CLI's summary gives it already ("N embedded now")."""
+    import logging
+
+    _stub_embeddings(monkeypatch)
+    caplog.set_level(logging.DEBUG, logger="srclight.indexer")
+    root = _small_repo(tmp_path)
+    db = Database(tmp_path / "index.db")
+    db.open()
+    db.initialize()
+    Indexer(db, IndexConfig(root=root, embed_model="stub:model")).index(
+        root, on_phase=(lambda name: None) if follows_phases else None)
+    db.close()
+    [record] = [r for r in caplog.records if r.getMessage().startswith("Embedded ")]
     assert record.levelno == (logging.DEBUG if follows_phases else logging.INFO)
+
+
+@pytest.mark.parametrize("batches", [1, 2])
+def test_batch_progress_is_logged_only_for_several_batches(tmp_path, monkeypatch, caplog, batches):
+    """"batch 1/1 (0s elapsed, ~0s remaining)" said nothing the next line did not."""
+    import logging
+
+    _stub_embeddings(monkeypatch, batches)
+    caplog.set_level(logging.INFO, logger="srclight.indexer")
+    root = _small_repo(tmp_path)
+    db = Database(tmp_path / "index.db")
+    db.open()
+    db.initialize()
+    Indexer(db, IndexConfig(root=root, embed_model="stub:model")).index(root)
+    db.close()
+    logged = [r.getMessage() for r in caplog.records if "Embedding batch" in r.getMessage()]
+    assert len(logged) == (0 if batches == 1 else 2), logged
+
+
+def test_the_call_graph_log_gives_the_edges_the_index_holds(tmp_path, caplog):
+    """The insert count also held the duplicates the table ignores, so the
+    log and the summary gave two different figures for one graph."""
+    import logging
+    import re
+
+    caplog.set_level(logging.INFO, logger="srclight.indexer")
+    root = tmp_path / "repo"
+    root.mkdir()
+    # Both bases resolve to the one class named Base: two inserts, one edge.
+    (root / "a.py").write_text(
+        "class Base:\n    pass\n\n\nclass Child(one.Base, two.Base):\n    pass\n")
+    db = Database(tmp_path / "index.db")
+    db.open()
+    db.initialize()
+    indexer = Indexer(db, IndexConfig(root=root, disable_embeddings=True))
+    indexer.index(root)
+    held = db.stats()["edges"]
+    db.close()
+    [logged] = re.findall(r"Call graph: (\d+) edges", caplog.text)
+    assert int(logged) == held
+
+
+def test_the_file_scan_is_announced_like_the_phases_after_it(capsys):
+    import re
+
+    from srclight.cli import _ProgressLine
+
+    with _ProgressLine("  ", 10):
+        pass
+    out = capsys.readouterr().out
+    assert re.fullmatch(r"\d\d:\d\d:\d\d Indexing files\.\.\.\n", out), out
 
 
 def test_nothing_to_embed_is_said(tmp_path, monkeypatch, caplog):

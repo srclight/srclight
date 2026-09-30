@@ -142,7 +142,7 @@ class _ProgressLine:
     def __enter__(self) -> _ProgressLine:
         for handler in logging.getLogger().handlers:
             handler.addFilter(self._before_log)
-        self._next_phase(self.FIRST_PHASE)
+        self.phase(self.FIRST_PHASE)
         return self
 
     def __exit__(self, *exc) -> None:
