@@ -357,11 +357,18 @@ def _sidecar(cache):
 def _build_traced(db, directory):
     """Build a sidecar in `directory`; return the ids whose blobs were read."""
     statements = []
-    db.conn.set_trace_callback(statements.append)
+    real = VectorCache.__dict__["_snapshot_connection"]
+
+    def traced(conn):
+        own = real.__func__(conn)
+        own.set_trace_callback(statements.append)
+        return own
+
+    VectorCache._snapshot_connection = staticmethod(traced)
     try:
         VectorCache(directory).build_from_db(db.conn)
     finally:
-        db.conn.set_trace_callback(None)
+        VectorCache._snapshot_connection = real
     blob_reads = [s for s in statements if "SELECT symbol_id, embedding" in s]
     read = set()
     for s in blob_reads:
@@ -559,4 +566,26 @@ def test_a_replace_that_fails_leaves_the_sidecar_reusable(tmp_path, monkeypatch)
     assert VectorCache(db_path.parent).sidecar_exists()
     _, read = _build_traced(db, db_path.parent)
     assert read == changed
+    db.close()
+
+
+def test_a_build_leaves_the_callers_connection_alone(tmp_path, monkeypatch):
+    """The MCP server shares one connection between its threads, and its
+    reindex writes through it. A transaction the build opened there took in
+    those writes and committed them half done; the reindex could no longer
+    roll them back."""
+    db, db_path = _setup_db(tmp_path, n_symbols=5)
+    assert not db.conn.in_transaction
+    real = VectorCache._reuse_previous
+
+    def a_reindex_writes_meanwhile(self, *args, **kwargs):
+        db.conn.execute("INSERT INTO schema_info (key, value) VALUES ('half_done', '1')")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(VectorCache, "_reuse_previous", a_reindex_writes_meanwhile)
+    VectorCache(db_path.parent).build_from_db(db.conn)
+    assert db.conn.in_transaction, "the write's own transaction was ended by the build"
+    db.conn.rollback()
+    left = db.conn.execute("SELECT count(*) FROM schema_info WHERE key = 'half_done'").fetchone()[0]
+    assert left == 0
     db.close()

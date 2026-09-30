@@ -70,10 +70,14 @@ class VectorCache:
 
         # The embeddings are listed, then read, in several statements: one
         # read transaction makes them one snapshot, so a reindex committing
-        # in another process cannot delete a vector between the two. Inside
-        # the caller's own transaction they already are.
-        began = not conn.in_transaction
-        if began:
+        # meanwhile cannot delete a vector between the two. It is taken on a
+        # connection of its own: the caller's may be shared — the MCP server
+        # hands every thread the same one, and its reindex writes through it
+        # — and a transaction opened there would swallow those writes and
+        # commit them half done.
+        own = self._snapshot_connection(conn)
+        if own is not None:
+            conn = own
             conn.execute("BEGIN")
         try:
             # No ORDER BY: sorted by symbol_id, SQLite walks the table itself,
@@ -100,8 +104,8 @@ class VectorCache:
             self._read_vectors(conn, ids, unread, matrix, norms)
             version = self._get_db_version(conn)
         finally:
-            if began:
-                conn.execute("COMMIT")  # nothing written: ends the snapshot
+            if own is not None:
+                own.close()  # nothing written: ends the snapshot
         logger.debug("Sidecar vectors: %d reused, %d read from the database",
                      n - len(unread), len(unread))
 
@@ -136,6 +140,21 @@ class VectorCache:
         # Load into memory / GPU
         self._load_matrix(matrix, norms, meta)
         logger.info("Built sidecar: %d vectors x %d dims (version %d)", n, dims, version)
+
+    @staticmethod
+    def _snapshot_connection(conn):
+        """A new connection to the database `conn` is open on, or None when
+        it has no file to open again (an in-memory database), in which case
+        the build reads through `conn` itself, statement by statement."""
+        import sqlite3
+
+        path = next((row[2] for row in conn.execute("PRAGMA database_list")
+                     if row[1] == "main"), "")
+        if not path:
+            return None
+        own = sqlite3.connect(path, timeout=30)
+        own.row_factory = sqlite3.Row
+        return own
 
     def _fingerprint(self) -> dict:
         """Size and modification time of the matrix and norms files: each
