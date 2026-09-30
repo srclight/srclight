@@ -67,18 +67,39 @@ def test_edges_are_undirected_and_weighted_by_their_count(tmp_path):
     db.close()
 
 
-def test_the_fingerprint_follows_the_graph_and_its_symbols(tmp_path):
+def test_the_fingerprint_follows_the_calls_and_their_symbols(tmp_path):
     a = _db_with_graph(tmp_path / "a.db", order_seed=4)
     b = _db_with_graph(tmp_path / "b.db", order_seed=5)
-    edges = call_graph_edges(a)
-    same = call_graph_fingerprint(a, edges)
-    assert same == call_graph_fingerprint(b, call_graph_edges(b))
-    low, high, w = edges[0]
-    assert same != call_graph_fingerprint(a, [(low, high, w + 1)] + edges[1:])
-    assert same != call_graph_fingerprint(a, edges[1:])
+    same = call_graph_fingerprint(a)
+    assert same == call_graph_fingerprint(b), "the order the edges were written in"
+
+    src, tgt = a.conn.execute(
+        "SELECT source_id, target_id FROM symbol_edges WHERE edge_type = 'calls' "
+        "ORDER BY rowid LIMIT 1").fetchone()
+    # One more call, between two symbols not linked yet.
+    linked = {tuple(r) for r in a.conn.execute("SELECT source_id, target_id FROM symbol_edges")}
+    ids = [r[0] for r in a.conn.execute("SELECT id FROM symbols ORDER BY id")]
+    extra = next((x, y) for x in ids for y in ids
+                 if x != y and (x, y) not in linked and (y, x) not in linked)
+    a.insert_edge(EdgeRecord(source_id=extra[0], target_id=extra[1], edge_type="calls"))
+    assert call_graph_fingerprint(a) != same
+    a.conn.execute("DELETE FROM symbol_edges WHERE source_id = ? AND target_id = ?", extra)
+    assert call_graph_fingerprint(a) == same
+
+    # The same call the other way round: the same undirected graph, so the
+    # same communities, but not the same execution flows.
+    undirected = call_graph_edges(a)
+    a.conn.execute("UPDATE symbol_edges SET source_id = ?, target_id = ? "
+                   "WHERE source_id = ? AND target_id = ?", (tgt, src, src, tgt))
+    assert call_graph_edges(a) == undirected
+    assert call_graph_fingerprint(a) != same
+    a.conn.execute("UPDATE symbol_edges SET source_id = ?, target_id = ? "
+                   "WHERE source_id = ? AND target_id = ?", (src, tgt, tgt, src))
+    assert call_graph_fingerprint(a) == same
+
     # The same id, another symbol: renamed where it stands.
-    a.conn.execute("UPDATE symbols SET name = 'renamed' WHERE id = ?", (low,))
-    assert same != call_graph_fingerprint(a, edges)
+    a.conn.execute("UPDATE symbols SET name = 'renamed' WHERE id = ?", (src,))
+    assert call_graph_fingerprint(a) != same
     a.close()
     b.close()
 

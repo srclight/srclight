@@ -44,8 +44,9 @@ def _chunked_in_select(conn, columns: str, table: str, ids, *, chunk: int = _IN_
 
 
 # Part of the call graph fingerprint: a change to how communities are found
-# must not be skipped as "graph unchanged" on an index that has not changed.
-_COMMUNITY_METHOD = "louvain-1.0-seed42-sorted"
+# or how execution flows are traced must not be skipped as "graph unchanged"
+# on an index that has not changed. Bump it with any change to either.
+_GRAPH_ANALYSIS_METHOD = "louvain-1.0-seed42-sorted/flows-20-8-3-50"
 
 
 def call_graph_edges(db: Database) -> list[tuple[int, int, int]]:
@@ -66,27 +67,31 @@ def call_graph_edges(db: Database) -> list[tuple[int, int, int]]:
     return sorted((low, high, w) for (low, high), w in weights.items())
 
 
-def call_graph_fingerprint(db: Database, edges: list[tuple[int, int, int]]) -> str:
+def call_graph_fingerprint(db: Database) -> str:
     """A digest of everything communities and execution flows are found
-    from: `edges`, what the symbols in them are called, what they are and
-    where, and the method.
+    from: the calls, what the symbols making them are called, what they are
+    and where, and the methods.
 
-    A symbol id is no identity on its own: a file re-parsed gets its
-    symbols re-inserted, and SQLite can hand the same ids back to symbols
-    that are renamed or moved. So each one's name, qualified name, kind and
-    file path are part of it.
+    The calls are counted with their direction: communities only need the
+    undirected graph, but execution flows follow calls from caller to
+    callee. And a symbol id is no identity on its own: a file re-parsed gets
+    its symbols re-inserted, and SQLite can hand the same ids back to
+    symbols that are renamed or moved. So each one's name, qualified name,
+    kind and file path are part of it.
     """
     import hashlib
 
     assert db.conn is not None
-    nodes = sorted({n for low, high, _ in edges for n in (low, high)})
+    calls = sorted(Counter(tuple(row) for row in db.conn.execute(
+        "SELECT source_id, target_id FROM symbol_edges WHERE edge_type = 'calls'")).items())
+    nodes = sorted({n for (src, tgt), _ in calls for n in (src, tgt)})
     symbols = sorted(tuple(row) for row in _chunked_in_select(
         db.conn, "id, name, qualified_name, kind, file_id", "symbols", nodes))
     paths = dict(tuple(row) for row in _chunked_in_select(
         db.conn, "id, path", "files", {row[4] for row in symbols}))
-    digest = hashlib.blake2b(_COMMUNITY_METHOD.encode(), digest_size=16)
-    for low, high, w in edges:
-        digest.update(b"%d,%d,%d;" % (low, high, w))
+    digest = hashlib.blake2b(_GRAPH_ANALYSIS_METHOD.encode(), digest_size=16)
+    for (src, tgt), count in calls:
+        digest.update(b"%d>%d*%d;" % (src, tgt, count))
     for sid, name, qualified, kind, file_id in symbols:
         digest.update(repr((sid, name, qualified, kind, paths.get(file_id))).encode())
     return digest.hexdigest()

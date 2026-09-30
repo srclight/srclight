@@ -2979,7 +2979,7 @@ class Indexer:
                 if on_phase:
                     on_phase("Finding communities and execution flows")
                 edges = call_graph_edges(self.db)
-                fingerprint = call_graph_fingerprint(self.db, edges)
+                fingerprint = call_graph_fingerprint(self.db)
                 # The graph is rebuilt on every run that changes a file, often
                 # into the same graph: a file without calls, say. Louvain on
                 # it again finds the same — but only what is stored is kept,
