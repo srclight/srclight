@@ -285,6 +285,10 @@ CREATE TABLE IF NOT EXISTS symbol_embeddings (
 -- reuse the vectors it already holds.
 CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_stamp
     ON symbol_embeddings(embedded_at, model, dimensions);
+-- The hashes that say which symbols need embedding again, likewise readable
+-- without the blobs, and without the symbols' content stored before them.
+CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_hash ON symbol_embeddings(model, body_hash);
+CREATE INDEX IF NOT EXISTS idx_symbols_body_hash ON symbols(body_hash, file_id);
 CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
 CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
@@ -1395,19 +1399,41 @@ class Database:
         )
 
     def get_symbols_needing_embeddings(self, model: str, limit: int = 100000) -> list[dict]:
-        """Get symbols that need embeddings (no embedding or body_hash changed)."""
+        """Get symbols that need embeddings (no embedding or body_hash changed).
+
+        Asked on every index run, and usually the answer is none. One query
+        joining symbols to their embeddings read `body_hash` from both
+        tables, where it is stored after the symbol's content and after the
+        embedding blob: every run walked all of both, gigabytes on a large
+        index, to find nothing. Two covering indexes hold the hashes, so the
+        comparison reads only them, and the details are fetched for the
+        symbols it finds — the first `limit` of them by id, as the scan in
+        rowid order gave them. An embedding or a symbol without a hash never
+        counts as changed, as `!=` against NULL never did.
+        """
         assert self.conn is not None
-        rows = self.conn.execute(
-            """SELECT s.id, s.name, s.qualified_name, s.signature, s.doc_comment,
-                      s.content, s.body_hash, s.kind, f.path as file_path
-               FROM symbols s
-               JOIN files f ON s.file_id = f.id
-               LEFT JOIN symbol_embeddings e ON s.id = e.symbol_id AND e.model = ?
-               WHERE e.symbol_id IS NULL OR e.body_hash != s.body_hash
-               LIMIT ?""",
-            (model, limit),
-        ).fetchall()
-        return [{k: row[k] for k in row.keys()} for row in rows]
+        embedded = dict(self.conn.execute(
+            "SELECT symbol_id, body_hash FROM symbol_embeddings WHERE model = ?", (model,)))
+        needed = sorted(
+            sid for sid, body_hash in self.conn.execute(
+                "SELECT s.id, s.body_hash FROM symbols s JOIN files f ON s.file_id = f.id")
+            if sid not in embedded or (
+                body_hash is not None and embedded[sid] is not None
+                and embedded[sid] != body_hash))[:limit]
+        found: list[dict] = []
+        for start in range(0, len(needed), 500):
+            chunk = needed[start:start + 500]
+            rows = self.conn.execute(
+                f"""SELECT s.id, s.name, s.qualified_name, s.signature, s.doc_comment,
+                          s.content, s.body_hash, s.kind, f.path as file_path
+                   FROM symbols s
+                   JOIN files f ON s.file_id = f.id
+                   WHERE s.id IN ({','.join('?' * len(chunk))})
+                   ORDER BY s.id""",
+                chunk,
+            ).fetchall()
+            found.extend({k: row[k] for k in row.keys()} for row in rows)
+        return found
 
     def vector_search(self, query_embedding: bytes, dimensions: int,
                       limit: int = 10, kind: str | None = None,
