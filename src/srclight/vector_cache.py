@@ -68,39 +68,56 @@ class VectorCache:
         """
         import numpy as np
 
-        # No ORDER BY: sorted by symbol_id, SQLite walks the table itself,
-        # whose rows hold the blobs; unsorted, it reads a covering index.
-        rows = sorted(conn.execute("""
-            SELECT e.symbol_id, e.model, e.dimensions, e.embedded_at,
-                   s.kind, f.path as file_path
-            FROM symbol_embeddings e
-            JOIN symbols s ON e.symbol_id = s.id
-            JOIN files f ON s.file_id = f.id
-        """).fetchall(), key=lambda row: row[0])
+        # The embeddings are listed, then read, in several statements: one
+        # read transaction makes them one snapshot, so a reindex committing
+        # in another process cannot delete a vector between the two. Inside
+        # the caller's own transaction they already are.
+        began = not conn.in_transaction
+        if began:
+            conn.execute("BEGIN")
+        try:
+            # No ORDER BY: sorted by symbol_id, SQLite walks the table itself,
+            # whose rows hold the blobs; unsorted, it reads a covering index.
+            rows = sorted(conn.execute("""
+                SELECT e.symbol_id, e.model, e.dimensions, e.embedded_at,
+                       s.kind, f.path as file_path
+                FROM symbol_embeddings e
+                JOIN symbols s ON e.symbol_id = s.id
+                JOIN files f ON s.file_id = f.id
+            """).fetchall(), key=lambda row: row[0])
 
-        if not rows:
-            return
+            if not rows:
+                return
 
-        dims = rows[0][2]
-        n = len(rows)
-        ids = [row[0] for row in rows]
-        stamps = [row[3] for row in rows]
+            dims = rows[0][2]
+            n = len(rows)
+            ids = [row[0] for row in rows]
+            stamps = [row[3] for row in rows]
 
-        matrix = np.empty((n, dims), dtype=np.float32)
-        norms = np.empty(n, dtype=np.float32)
-        unread = self._reuse_previous(ids, stamps, rows[0][1], dims, matrix, norms)
-        self._read_vectors(conn, ids, unread, matrix, norms)
+            matrix = np.empty((n, dims), dtype=np.float32)
+            norms = np.empty(n, dtype=np.float32)
+            unread = self._reuse_previous(ids, stamps, rows[0][1], dims, matrix, norms)
+            self._read_vectors(conn, ids, unread, matrix, norms)
+            version = self._get_db_version(conn)
+        finally:
+            if began:
+                conn.execute("COMMIT")  # nothing written: ends the snapshot
         logger.debug("Sidecar vectors: %d reused, %d read from the database",
                      n - len(unread), len(unread))
 
         # Ensure directory exists
         self._dir.mkdir(parents=True, exist_ok=True)
 
-        # Write sidecar files
+        # The three files are replaced one at a time, and without its meta
+        # neither a reader nor the next build uses a sidecar. So the meta goes
+        # first and comes back last: a build killed half way leaves no
+        # sidecar, never a matrix paired with another build's meta — which
+        # the next build would reuse row by row, handing symbols each other's
+        # vectors for good.
+        self.meta_path.unlink(missing_ok=True)
         self._atomic_write(self.npy_path, lambda fh: np.save(fh, matrix))
         self._atomic_write(self.norms_path, lambda fh: np.save(fh, norms))
 
-        version = self._get_db_version(conn)
         meta = {
             "version": version,
             "model": rows[0][1],

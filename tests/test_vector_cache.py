@@ -474,3 +474,58 @@ def test_the_stamps_are_read_without_the_blobs(tmp_path):
         JOIN files f ON s.file_id = f.id"""))
     assert "COVERING INDEX idx_symbol_embeddings_stamp" in plan
     db.close()
+
+
+def test_a_build_killed_half_way_leaves_no_sidecar_to_reuse(tmp_path, monkeypatch):
+    """The files are replaced one at a time. A new matrix beside the previous
+    build's meta — same row count, rows moved — would hand symbols each
+    other's vectors on every later build. Without its meta, nothing uses it."""
+    db, db_path = _setup_db(tmp_path, n_symbols=5)
+    cache = VectorCache(db_path.parent)
+    cache.build_from_db(db.conn)
+    _change_some(db)
+
+    real = VectorCache._atomic_write
+
+    def killed_after_the_matrix(path, write):
+        if path.name == "embeddings_norms.npy":
+            raise KeyboardInterrupt("killed")
+        real(path, write)
+
+    monkeypatch.setattr(VectorCache, "_atomic_write", staticmethod(killed_after_the_matrix))
+    with pytest.raises(KeyboardInterrupt):
+        VectorCache(db_path.parent).build_from_db(db.conn)
+    monkeypatch.setattr(VectorCache, "_atomic_write", staticmethod(real))
+
+    assert not VectorCache(db_path.parent).sidecar_exists()
+    _, read = _build_traced(db, db_path.parent)
+    assert read == "all"
+    fresh = tmp_path / "fresh"
+    VectorCache(fresh).build_from_db(db.conn)
+    rebuilt, full = _sidecar(VectorCache(db_path.parent)), _sidecar(VectorCache(fresh))
+    assert np.array_equal(rebuilt[0], full[0]) and rebuilt[2] == full[2]
+    db.close()
+
+
+def test_a_deletion_committed_during_a_build_does_not_break_it(tmp_path, monkeypatch):
+    """The vectors are listed, then read, in separate statements. A reindex
+    in another process deleting symbols between the two made the build fail;
+    one read transaction reads both from the same snapshot."""
+    import sqlite3
+
+    db, db_path = _setup_db(tmp_path, n_symbols=5)
+    ids = [r[0] for r in db.conn.execute("SELECT symbol_id FROM symbol_embeddings")]
+    real = VectorCache._reuse_previous
+
+    def meanwhile_elsewhere(self, *args, **kwargs):
+        other = sqlite3.connect(db_path)
+        other.execute("DELETE FROM symbol_embeddings WHERE symbol_id = ?", (ids[0],))
+        other.commit()
+        other.close()
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(VectorCache, "_reuse_previous", meanwhile_elsewhere)
+    cache = VectorCache(db_path.parent)
+    cache.build_from_db(db.conn)
+    assert json.loads(cache.meta_path.read_text())["symbol_ids"] == sorted(ids)
+    db.close()
