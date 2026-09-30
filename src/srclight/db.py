@@ -1422,15 +1422,19 @@ class Database:
             "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN "
             "('idx_symbols_body_hash', 'idx_symbol_embeddings_hash')")}
         hinted = len(present) == 2
-        needed = sorted(row[0] for row in self.conn.execute(
+        # SQLite keeps only the first `limit` ids as it scans: a first run,
+        # or a new model, needs nearly every symbol of the index.
+        needed = [row[0] for row in self.conn.execute(
             f"""SELECT s.id
                 FROM symbols s {'INDEXED BY idx_symbols_body_hash' if hinted else ''}
                 JOIN files f ON s.file_id = f.id
                 LEFT JOIN symbol_embeddings e
                     {'INDEXED BY idx_symbol_embeddings_hash' if hinted else ''}
                     ON s.id = e.symbol_id AND e.model = ?
-                WHERE e.symbol_id IS NULL OR e.body_hash != s.body_hash""",
-            (model,)))[:limit]
+                WHERE e.symbol_id IS NULL OR e.body_hash != s.body_hash
+                ORDER BY s.id
+                LIMIT ?""",
+            (model, limit))]
         found: list[dict] = []
         for start in range(0, len(needed), 500):
             chunk = needed[start:start + 500]
