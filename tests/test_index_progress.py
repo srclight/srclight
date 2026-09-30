@@ -97,3 +97,17 @@ def test_the_cli_prints_no_blank_line_between_steps(tmp_path, monkeypatch):
     assert steps, result.output
     for i in steps:
         assert lines[i - 1].strip(), result.output
+
+
+def test_log_lines_carry_the_time():
+    """The gap between two lines of an index run says which phase was slow."""
+    import logging
+    import re
+
+    from srclight.cli import LOG_DATEFMT, LOG_FORMAT
+
+    record = logging.LogRecord("srclight.indexer", logging.INFO, __file__, 1,
+                               "Call graph: %d edges in %.0fs", (12, 3.0), None)
+    line = logging.Formatter(LOG_FORMAT, LOG_DATEFMT).format(record)
+    assert re.fullmatch(r"\d\d:\d\d:\d\d\.\d{3} INFO srclight\.indexer: Call graph: 12 edges in 3s",
+                        line), line

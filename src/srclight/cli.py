@@ -62,6 +62,12 @@ def _get_db_path(root: Path) -> Path:
     return new_path
 
 
+# Each line carries the time it was logged: an index run's phases take from
+# seconds to minutes, and the gap between two lines says which one was slow.
+LOG_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s"
+LOG_DATEFMT = "%H:%M:%S"
+
+
 @click.group()
 @click.version_option(version=__version__)
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
@@ -70,7 +76,8 @@ def main(verbose: bool):
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT,
+        datefmt=LOG_DATEFMT,
         stream=sys.stderr,
     )
 
