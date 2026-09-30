@@ -271,7 +271,7 @@ def test_the_summary_counts_files_and_symbols_on_one_line_each(tmp_path):
     assert result.exit_code == 0, result.output
     assert "  Files:       1 scanned, 1 indexed, 0 unchanged, 0 removed, 0 errors" in result.output
     assert "  Symbols:     2 extracted, 2 in the index" in result.output
-    assert "  Edges:       1 built this run, 1 in the index" in result.output
+    assert "  Edges:       1 in the index, call graph rebuilt this run" in result.output
 
 
 def test_the_workspace_summary_keeps_every_figure_of_the_run(tmp_path, ws_dir):  # noqa: F811
@@ -294,7 +294,7 @@ def test_the_workspace_summary_keeps_every_figure_of_the_run(tmp_path, ws_dir): 
     result = CliRunner().invoke(main, ["workspace", "index", "-w", "summary-ws", "--no-embed"])
     assert result.exit_code == 0, result.output
     assert "1 files: 0 indexed, 1 unchanged, 1 removed, 0 errors; 0 symbols, " in result.output
-    assert " edges, " in result.output
+    assert " edges in the index, " in result.output
 
 
 def test_the_file_pass_counts_the_files_that_failed(tmp_path, monkeypatch):

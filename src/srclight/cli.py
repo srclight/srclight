@@ -296,8 +296,10 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
                f"{stats.errors} errors")
     click.echo(f"  Symbols:     {stats.symbols_extracted} extracted, "
                f"{db_stats['symbols']} in the index")
-    click.echo(f"  Edges:       {stats.edges_created} built this run, "
-               f"{db_stats['edges']} in the index")
+    # The index's own count: edges_created counts inserts tried, duplicates
+    # the database ignores included, and read as more edges than it holds.
+    rebuilt = ", call graph rebuilt this run" if stats.edges_created else ""
+    click.echo(f"  Edges:       {db_stats['edges']} in the index{rebuilt}")
     click.echo(f"  Time:        {stats.elapsed_seconds:.2f}s")
     for step in line.summary():
         click.echo(step)
@@ -739,12 +741,12 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
 
             # Every figure of the indexer's closing log line, which is only a
             # debug line for a caller that prints its own summary.
+            db_stats = db.stats()
             click.echo(f"    {stats.files_scanned} files: {stats.files_indexed} indexed, "
                        f"{stats.files_unchanged} unchanged, {stats.files_removed} removed, "
                        f"{stats.errors} errors; {stats.symbols_extracted} symbols, "
-                       f"{stats.edges_created} edges, {stats.elapsed_seconds:.1f}s")
-
-            db_stats = db.stats()
+                       f"{db_stats['edges']} edges in the index, "
+                       f"{stats.elapsed_seconds:.1f}s")
             click.echo(f"    DB: {db_stats['db_size_mb']} MB")
         except Exception as e:
             click.echo(f"\n    ERROR: {e}", err=True)
