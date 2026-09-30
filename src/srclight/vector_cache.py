@@ -88,8 +88,10 @@ class VectorCache:
         # Ensure directory exists
         self._dir.mkdir(parents=True, exist_ok=True)
 
-        self._atomic_write(self.npy_path, lambda fh: np.save(fh, matrix))
-        self._atomic_write(self.norms_path, lambda fh: np.save(fh, norms))
+        files = {
+            self.npy_path.name: self._atomic_write(self.npy_path, lambda fh: np.save(fh, matrix)),
+            self.norms_path.name: self._atomic_write(self.norms_path, lambda fh: np.save(fh, norms)),
+        }
 
         meta = {
             "version": version,
@@ -107,7 +109,7 @@ class VectorCache:
             # by row — with the same row count, handing symbols each other's
             # vectors from then on. A replace that fails (a reader holding
             # the file mapped on Windows) leaves all three as they were.
-            "files": self._fingerprint(),
+            "files": files,
         }
         self._atomic_write(
             self.meta_path, lambda fh: fh.write(json.dumps(meta).encode())
@@ -238,6 +240,12 @@ class VectorCache:
                 old_norms = np.load(self.norms_path, mmap_mode="r")
                 if old_norms.shape != (len(old_ids),):
                     old_norms = None
+            # Still the same files once mapped: another build replacing them
+            # between the check and the load would pair its matrix with this
+            # meta. Size and mtime_ns unchanged across both loads mean what
+            # was mapped is what the meta names.
+            if meta["files"] != self._fingerprint():
+                return everything
             where = {key: row for row, key in enumerate(zip(old_ids, old_stamps))
                      if key[1] is not None}
             kept_at, kept_from, unread = [], [], []
@@ -295,8 +303,11 @@ class VectorCache:
         norms[positions] = np.linalg.norm(matrix[positions], axis=1)
 
     @staticmethod
-    def _atomic_write(path: Path, write) -> None:
-        """Write through a temp file + os.replace().
+    def _atomic_write(path: Path, write) -> list[int]:
+        """Write through a temp file + os.replace(); return the written file's
+        [size, mtime_ns], taken from the file itself before it is renamed —
+        the rename keeps both — so it is this build's file whatever another
+        build puts at `path` afterwards.
 
         A running server holds every sidecar mmap'd for its whole life, and
         np.save() opens its target "wb" — O_TRUNC on the same inode. Rebuilding
@@ -311,7 +322,9 @@ class VectorCache:
                 write(fh)
                 fh.flush()
                 os.fsync(fh.fileno())
+                st = os.fstat(fh.fileno())
             os.replace(tmp, path)
+            return [st.st_size, st.st_mtime_ns]
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise

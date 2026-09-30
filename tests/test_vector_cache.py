@@ -1,6 +1,7 @@
 """Tests for VectorCache — GPU/CPU-resident embedding matrix with .npy sidecar."""
 
 import json
+import os
 import struct
 import time
 
@@ -503,7 +504,7 @@ def test_a_build_killed_half_way_is_not_reused(tmp_path, monkeypatch):
     def killed_after_the_matrix(path, write):
         if path.name == "embeddings_norms.npy":
             raise KeyboardInterrupt("killed")
-        real(path, write)
+        return real(path, write)
 
     monkeypatch.setattr(VectorCache, "_atomic_write", staticmethod(killed_after_the_matrix))
     with pytest.raises(KeyboardInterrupt):
@@ -556,7 +557,7 @@ def test_a_replace_that_fails_leaves_the_sidecar_reusable(tmp_path, monkeypatch)
     def mapped_elsewhere(path, write):
         if path.name == "embeddings.npy":
             raise PermissionError("the file is mapped by another process")
-        real(path, write)
+        return real(path, write)
 
     monkeypatch.setattr(VectorCache, "_atomic_write", staticmethod(mapped_elsewhere))
     with pytest.raises(PermissionError):
@@ -609,4 +610,31 @@ def test_a_caller_with_uncommitted_writes_gets_a_sidecar_it_sees_as_current(tmp_
     matrix, _, meta = _sidecar(cache)
     assert np.allclose(matrix[meta["symbol_ids"].index(sid)], _make_vec(8, seed=5.0))
     db.conn.rollback()
+    db.close()
+
+
+def test_the_meta_names_the_files_this_build_wrote(tmp_path, monkeypatch):
+    """Two builds at once (a git hook's index and the server's rebuild)
+    replace the same paths. Fingerprinted by path after the fact, this
+    build's meta could name the other build's files and pass the check on a
+    mismatched set; taken from the written file itself, it cannot."""
+    db, db_path = _setup_db(tmp_path, n_symbols=5)
+    real = VectorCache._atomic_write
+    other = tmp_path / "other.npy"
+    np.save(other, np.ones((5, 8), dtype=np.float32))
+
+    def another_build_lands_in_between(path, write):
+        written = real(path, write)
+        if path.name == "embeddings_norms.npy":
+            time.sleep(0.01)
+            os.replace(other, db_path.parent / "embeddings.npy")
+        return written
+
+    monkeypatch.setattr(VectorCache, "_atomic_write", staticmethod(another_build_lands_in_between))
+    VectorCache(db_path.parent).build_from_db(db.conn)
+    monkeypatch.setattr(VectorCache, "_atomic_write", staticmethod(real))
+
+    _change_some(db)
+    _, read = _build_traced(db, db_path.parent)
+    assert read == "all"
     db.close()
