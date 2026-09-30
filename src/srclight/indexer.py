@@ -2970,16 +2970,33 @@ class Indexer:
                 pass
         if needs_communities:
             try:
-                from .community import detect_communities, trace_execution_flows
+                from .community import (
+                    call_graph_edges,
+                    call_graph_fingerprint,
+                    detect_communities,
+                    trace_execution_flows,
+                )
                 if on_phase:
                     on_phase("Finding communities and execution flows")
-                communities = detect_communities(self.db)
+                edges = call_graph_edges(self.db)
+                fingerprint = call_graph_fingerprint(edges)
+                # The graph is rebuilt on every run that changes a file, most
+                # often into the same graph: a file without calls, or whose
+                # symbols kept their ids. Louvain on it again finds the same.
+                if (fingerprint == self.db.get_communities_fingerprint()
+                        and self.db.conn.execute(
+                            "SELECT 1 FROM communities LIMIT 1").fetchone()):
+                    logger.info("Communities unchanged: same call graph as last run")
+                    communities = []
+                else:
+                    communities = detect_communities(self.db, edges)
                 if communities:
                     sym_to_comm = {}
                     for c in communities:
                         for m in c["members"]:
                             sym_to_comm[m["id"]] = c["id"]
                     flows = trace_execution_flows(self.db, sym_to_comm)
+                    self.db.set_communities_fingerprint(fingerprint)
                     self.db.store_communities(communities)
                     self.db.store_execution_flows(flows)
                     logger.info(

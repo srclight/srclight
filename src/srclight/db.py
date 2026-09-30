@@ -1803,6 +1803,22 @@ class Database:
 
     # --- Communities ---
 
+    def get_communities_fingerprint(self) -> str | None:
+        """The call graph fingerprint the stored communities were found in."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'communities_graph'"
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_communities_fingerprint(self, fingerprint: str) -> None:
+        """Record the call graph the communities about to be stored came from."""
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('communities_graph', ?)",
+            (fingerprint,),
+        )
+
     def store_communities(self, communities: list[dict]) -> None:
         """Store detected communities and their symbol memberships."""
         assert self.conn is not None
