@@ -147,7 +147,8 @@ def test_phase_lines_carry_the_time(capsys):
     with _ProgressLine("  ", 10) as line:
         line.phase("Building the call graph")
     out = capsys.readouterr().out
-    assert re.search(r"^  \d\d:\d\d:\d\d Building the call graph\.\.\.$", out, re.M), out
+    # Formatted and placed like the time on a log line, so the two align.
+    assert re.search(r"^\d\d:\d\d:\d\d\.\d{3} Building the call graph\.\.\.$", out, re.M), out
 
 
 def test_the_cli_summary_lists_the_phases(tmp_path):

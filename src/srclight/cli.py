@@ -14,6 +14,7 @@ import json
 import logging
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -110,8 +111,10 @@ class _ProgressLine:
     def phase(self, name: str) -> None:
         self.close()
         self._next_phase(name)
-        # The time, as log lines carry it: the gap between two says how long.
-        click.echo(f"{self.indent}{time.strftime('%H:%M:%S')} {name}...")
+        # The time as log lines carry it (LOG_FORMAT), in the same column: the
+        # gap between two lines says how long a step took.
+        now = datetime.now()
+        click.echo(f"{now:%H:%M:%S}.{now.microsecond // 1000:03d} {name}...")
 
     def _next_phase(self, name: str | None) -> None:
         now = self._clock()
