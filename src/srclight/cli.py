@@ -219,6 +219,7 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
         root=root, embed_model=embed_model,
         disable_embeddings=no_embed or forget_embed_model,
         extension_overrides=declared,
+        graph_workers=0,  # the entry point guards __main__
     )
     if declared:
         click.echo("Extra extensions: "
@@ -680,6 +681,7 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
             indexer_config = IndexConfig(
                 root=root, embed_model=embed_model,
                 disable_embeddings=no_embed or forget_embed_model,
+                graph_workers=0,  # the entry point guards __main__
             )
             resolved_model = resolve_embed_model(db, indexer_config)
             indexer_config.embed_model = resolved_model  # pin it, see index()

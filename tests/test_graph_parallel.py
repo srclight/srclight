@@ -30,11 +30,11 @@ def _project(root):
 def _edges(tmp_path, monkeypatch, workers):
     root = tmp_path / f"repo{workers}"
     _project(root)
-    monkeypatch.setenv("SRCLIGHT_GRAPH_WORKERS", str(workers))
     db = Database(tmp_path / f"index{workers}.db")
     db.open()
     db.initialize()
-    Indexer(db, IndexConfig(root=root, disable_embeddings=True)).index(root)
+    Indexer(db, IndexConfig(root=root, disable_embeddings=True,
+                            graph_workers=workers)).index(root)
     rows = db.conn.execute(
         """SELECT s.qualified_name AS source, t.qualified_name AS target,
                   e.confidence, e.resolution
@@ -62,6 +62,43 @@ def test_a_failed_pool_falls_back_to_a_single_scan(tmp_path, monkeypatch, caplog
     monkeypatch.setattr(Indexer, "_scan_in_processes", staticmethod(broken))
     assert _edges(tmp_path, monkeypatch, 2) == single
     assert "in parallel" in caplog.text
+
+
+def test_a_library_caller_scans_in_its_own_process_by_default(tmp_path, monkeypatch):
+    """Worker processes re-import the caller's `__main__`: a script without
+    the guard would run again in each. Only callers that ask get them — not
+    even the environment variable turns them on behind a script's back."""
+    def must_not_start(*args, **kwargs):
+        raise AssertionError("worker processes started for a library caller")
+
+    monkeypatch.setenv("SRCLIGHT_GRAPH_WORKERS", "4")
+    monkeypatch.setattr(Indexer, "_scan_in_processes", staticmethod(must_not_start))
+    root = tmp_path / "repo"
+    _project(root)
+    db = Database(tmp_path / "index.db")
+    db.open()
+    db.initialize()
+    Indexer(db, IndexConfig(root=root, disable_embeddings=True)).index(root)
+    db.close()
+
+
+def test_the_cli_lets_the_cpus_choose(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from srclight import cli
+
+    seen = []
+
+    class _Recording(Indexer):
+        def __init__(self, db, config):
+            seen.append(config.graph_workers)
+            super().__init__(db, config)
+
+    monkeypatch.setattr("srclight.indexer.Indexer", _Recording)
+    (tmp_path / "a.py").write_text("def alpha():\n    return 1\n")
+    result = CliRunner().invoke(cli.main, ["index", str(tmp_path), "--no-embed"])
+    assert result.exit_code == 0, result.output
+    assert seen == [0]
 
 
 @pytest.mark.parametrize("configured,symbols,expected", [

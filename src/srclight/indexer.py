@@ -161,6 +161,13 @@ class IndexConfig:
     extension_overrides: dict[str, str] | None = None
     embed_model: str | None = None  # e.g. "qwen3-embedding", "voyage-code-3"
     disable_embeddings: bool = False  # --no-embed: index without touching embeddings
+    # Processes that scan the call graph. 1 keeps it in the calling process;
+    # 0 chooses from the CPUs, SRCLIGHT_GRAPH_WORKERS overriding. More than 1
+    # starts processes with `spawn`, which re-imports the calling program's
+    # `__main__`: only a program that guards it with
+    # `if __name__ == "__main__":` may ask for them, as the CLI and the MCP
+    # server do.
+    graph_workers: int = 1
 
 
 def resolve_embed_model(db: Database, config: IndexConfig) -> str | None:
@@ -2193,14 +2200,22 @@ _GRAPH_WORKERS_MAX = 8
 _WINDOWS_POOL_MAX = 61
 
 
-def _graph_workers(symbols: int) -> int:
-    """How many processes scan the call graph. SRCLIGHT_GRAPH_WORKERS sets it,
-    within what the platform allows; 1 scans in the indexing process."""
+def _within_platform(count: int) -> int:
+    count = max(1, count)
+    return min(count, _WINDOWS_POOL_MAX) if os.name == "nt" else count
+
+
+def _graph_workers(symbols: int, requested: int = 0) -> int:
+    """How many processes scan the call graph: `requested` when it names a
+    count (IndexConfig.graph_workers), otherwise SRCLIGHT_GRAPH_WORKERS or
+    the CPUs — always within what the platform allows. 1 scans in the
+    indexing process."""
+    if requested:
+        return _within_platform(requested)
     configured = os.environ.get("SRCLIGHT_GRAPH_WORKERS", "").strip()
     if configured:
         try:
-            count = max(1, int(configured))
-            return min(count, _WINDOWS_POOL_MAX) if os.name == "nt" else count
+            return _within_platform(int(configured))
         except ValueError:
             logger.warning("SRCLIGHT_GRAPH_WORKERS=%r is not a number; ignored", configured)
     if symbols < _PARALLEL_GRAPH_MIN_SYMBOLS:
@@ -3517,7 +3532,7 @@ class Indexer:
             if on_progress and (done // 500 > before // 500 or done == len(content_rows)):
                 on_progress("call graph", done, len(content_rows))
 
-        workers = _graph_workers(len(content_rows))
+        workers = _graph_workers(len(content_rows), self.config.graph_workers)
         if workers > 1:
             try:
                 self._scan_in_processes(tables, content_rows, workers, write)

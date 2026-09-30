@@ -1709,7 +1709,8 @@ async def reindex(path: str | None = None, embed: bool = True) -> str:
     # semantic_search then falls back to a full SQLite scan.
     _vector_cache = None
 
-    config = IndexConfig(root=root, disable_embeddings=not embed)
+    # The server runs from the CLI's entry point, which guards __main__.
+    config = IndexConfig(root=root, disable_embeddings=not embed, graph_workers=0)
     # Resolve once and pin, as the CLI does: resolving again after the file
     # pass can disagree with what we report back to the caller.
     config.embed_model = resolve_embed_model(db, config)
