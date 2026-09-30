@@ -295,3 +295,27 @@ def test_the_workspace_summary_keeps_every_figure_of_the_run(tmp_path, ws_dir): 
     assert result.exit_code == 0, result.output
     assert "1 files: 0 indexed, 1 unchanged, 1 removed, 0 errors; 0 symbols, " in result.output
     assert " edges, " in result.output
+
+
+def test_the_file_pass_counts_the_files_that_failed(tmp_path, monkeypatch):
+    """Indexed, unchanged and failed add up to the files the pass went
+    through; without the failures, the line did not."""
+    root = _small_repo(tmp_path)
+    (root / "b.py").write_text("def other():\n    return 2\n")
+    db = Database(tmp_path / "index.db")
+    db.open()
+    db.initialize()
+    indexer = Indexer(db, IndexConfig(root=root, disable_embeddings=True))
+    real = indexer._extract_symbols
+
+    def fails_on_b(file_id, rel_path, source, lang):
+        if rel_path.endswith("b.py"):
+            raise RuntimeError("unreadable")
+        return real(file_id, rel_path, source, lang)
+
+    monkeypatch.setattr(indexer, "_extract_symbols", fails_on_b)
+    progress = []
+    indexer.index(root, on_progress=lambda label, cur, tot: progress.append((label, cur, tot)))
+    db.close()
+    files = [p for p in progress if p[0] != "call graph"]
+    assert files[-1] == ("done: 1 indexed, 0 unchanged, 1 failed", 2, 2), files

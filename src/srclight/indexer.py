@@ -2942,8 +2942,10 @@ class Indexer:
         # The progress line otherwise stays on the last file it showed, which
         # says nothing about the pass: it ends on what the pass found.
         if on_progress and files_to_index:
+            # The three add up to the files the pass went through.
+            failed = f", {stats.errors} failed" if stats.errors else ""
             on_progress(f"done: {stats.files_indexed} indexed, "
-                        f"{stats.files_unchanged} unchanged",
+                        f"{stats.files_unchanged} unchanged{failed}",
                         len(files_to_index), len(files_to_index))
 
         # Remove files that no longer exist
