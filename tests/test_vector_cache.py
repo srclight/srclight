@@ -350,6 +350,7 @@ def test_load_refuses_a_sidecar_whose_meta_disagrees_with_the_matrix(tmp_path):
 def _sidecar(cache):
     meta = json.loads(cache.meta_path.read_text())
     meta.pop("version")
+    meta.pop("files", None)  # differs between any two builds, by design
     return np.load(cache.npy_path), np.load(cache.norms_path), meta
 
 
@@ -436,7 +437,8 @@ def test_a_symbol_id_reused_after_a_deletion_is_read_again(tmp_path):
     db.close()
 
 
-@pytest.mark.parametrize("spoil", ["no_stamps", "other_model", "torn_matrix", "garbage_meta"])
+@pytest.mark.parametrize("spoil", ["no_stamps", "other_model", "torn_matrix", "garbage_meta",
+                                   "matrix_replaced"])
 def test_a_sidecar_that_cannot_be_trusted_is_not_reused(tmp_path, spoil):
     db, db_path = _setup_db(tmp_path, n_symbols=5)
     cache = VectorCache(db_path.parent)
@@ -450,6 +452,9 @@ def test_a_sidecar_that_cannot_be_trusted_is_not_reused(tmp_path, spoil):
         cache.meta_path.write_text(json.dumps(meta))
     elif spoil == "torn_matrix":
         np.save(cache.npy_path, np.zeros((3, 8), dtype=np.float32))
+    elif spoil == "matrix_replaced":  # same shape, another build's rows
+        time.sleep(0.01)
+        np.save(cache.npy_path, np.load(cache.npy_path)[::-1].copy())
     else:
         cache.meta_path.write_text("{not json")
     _change_some(db)
@@ -476,10 +481,11 @@ def test_the_stamps_are_read_without_the_blobs(tmp_path):
     db.close()
 
 
-def test_a_build_killed_half_way_leaves_no_sidecar_to_reuse(tmp_path, monkeypatch):
+def test_a_build_killed_half_way_is_not_reused(tmp_path, monkeypatch):
     """The files are replaced one at a time. A new matrix beside the previous
     build's meta — same row count, rows moved — would hand symbols each
-    other's vectors on every later build. Without its meta, nothing uses it."""
+    other's vectors on every later build. The meta names the exact files it
+    describes, and this matrix is not one of them."""
     db, db_path = _setup_db(tmp_path, n_symbols=5)
     cache = VectorCache(db_path.parent)
     cache.build_from_db(db.conn)
@@ -497,7 +503,6 @@ def test_a_build_killed_half_way_leaves_no_sidecar_to_reuse(tmp_path, monkeypatc
         VectorCache(db_path.parent).build_from_db(db.conn)
     monkeypatch.setattr(VectorCache, "_atomic_write", staticmethod(real))
 
-    assert not VectorCache(db_path.parent).sidecar_exists()
     _, read = _build_traced(db, db_path.parent)
     assert read == "all"
     fresh = tmp_path / "fresh"
@@ -528,4 +533,30 @@ def test_a_deletion_committed_during_a_build_does_not_break_it(tmp_path, monkeyp
     cache = VectorCache(db_path.parent)
     cache.build_from_db(db.conn)
     assert json.loads(cache.meta_path.read_text())["symbol_ids"] == sorted(ids)
+    db.close()
+
+
+def test_a_replace_that_fails_leaves_the_sidecar_reusable(tmp_path, monkeypatch):
+    """On Windows a reader holding the matrix mapped makes os.replace fail.
+    The build stops there, the three files are still the previous build's,
+    and the next build reuses them."""
+    db, db_path = _setup_db(tmp_path, n_symbols=5)
+    VectorCache(db_path.parent).build_from_db(db.conn)
+    changed = _change_some(db)
+
+    real = VectorCache._atomic_write
+
+    def mapped_elsewhere(path, write):
+        if path.name == "embeddings.npy":
+            raise PermissionError("the file is mapped by another process")
+        real(path, write)
+
+    monkeypatch.setattr(VectorCache, "_atomic_write", staticmethod(mapped_elsewhere))
+    with pytest.raises(PermissionError):
+        VectorCache(db_path.parent).build_from_db(db.conn)
+    monkeypatch.setattr(VectorCache, "_atomic_write", staticmethod(real))
+
+    assert VectorCache(db_path.parent).sidecar_exists()
+    _, read = _build_traced(db, db_path.parent)
+    assert read == changed
     db.close()

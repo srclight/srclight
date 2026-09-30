@@ -108,13 +108,6 @@ class VectorCache:
         # Ensure directory exists
         self._dir.mkdir(parents=True, exist_ok=True)
 
-        # The three files are replaced one at a time, and without its meta
-        # neither a reader nor the next build uses a sidecar. So the meta goes
-        # first and comes back last: a build killed half way leaves no
-        # sidecar, never a matrix paired with another build's meta — which
-        # the next build would reuse row by row, handing symbols each other's
-        # vectors for good.
-        self.meta_path.unlink(missing_ok=True)
         self._atomic_write(self.npy_path, lambda fh: np.save(fh, matrix))
         self._atomic_write(self.norms_path, lambda fh: np.save(fh, norms))
 
@@ -128,6 +121,13 @@ class VectorCache:
             "file_paths": [row[5] for row in rows],
             # What the next build compares to reuse these vectors.
             "embedded_at": stamps,
+            # The exact files this meta describes. They are replaced one at a
+            # time: a build killed after the matrix leaves it beside the
+            # previous meta, which the next build would otherwise reuse row
+            # by row — with the same row count, handing symbols each other's
+            # vectors from then on. A replace that fails (a reader holding
+            # the file mapped on Windows) leaves all three as they were.
+            "files": self._fingerprint(),
         }
         self._atomic_write(
             self.meta_path, lambda fh: fh.write(json.dumps(meta).encode())
@@ -136,6 +136,15 @@ class VectorCache:
         # Load into memory / GPU
         self._load_matrix(matrix, norms, meta)
         logger.info("Built sidecar: %d vectors x %d dims (version %d)", n, dims, version)
+
+    def _fingerprint(self) -> dict:
+        """Size and modification time of the matrix and norms files: each
+        build writes them anew, so a pair left by another build differs."""
+        fingerprint = {}
+        for path in (self.npy_path, self.norms_path):
+            st = path.stat()
+            fingerprint[path.name] = [st.st_size, st.st_mtime_ns]
+        return fingerprint
 
     def _reuse_previous(self, ids: list[int], stamps: list, model: str, dims: int,
                         matrix, norms) -> list[int]:
@@ -156,7 +165,8 @@ class VectorCache:
             meta = json.loads(self.meta_path.read_text())
             old_ids, old_stamps = meta.get("symbol_ids"), meta.get("embedded_at")
             if (old_stamps is None or old_ids is None or len(old_stamps) != len(old_ids)
-                    or meta.get("model") != model or meta.get("dimensions") != dims):
+                    or meta.get("model") != model or meta.get("dimensions") != dims
+                    or meta.get("files") != self._fingerprint()):
                 return everything
             old_matrix = np.load(self.npy_path, mmap_mode="r")
             if old_matrix.shape != (len(old_ids), dims) or old_matrix.dtype != np.float32:
