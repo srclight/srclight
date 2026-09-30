@@ -279,6 +279,12 @@ CREATE TABLE IF NOT EXISTS symbol_embeddings (
 );
 
 -- Regular indexes
+-- Which embeddings exist and when each was written, readable without the
+-- blobs: embedded_at is stored after the embedding, so reading it from the
+-- table walks every blob's pages. The vector cache compares these stamps to
+-- reuse the vectors it already holds.
+CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_stamp
+    ON symbol_embeddings(embedded_at, model, dimensions);
 CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
 CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);

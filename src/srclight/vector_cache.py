@@ -55,28 +55,43 @@ class VectorCache:
     # --- Build sidecar from SQLite ---
 
     def build_from_db(self, conn) -> None:
-        """Read all embeddings from SQLite, write .npy + meta, load to GPU."""
+        """Read all embeddings from SQLite, write .npy + meta, load to GPU.
+
+        Reading every blob is most of the cost on a large index — gigabytes,
+        cold on disk right after the indexing pass — and nearly all of them
+        are already in the sidecar being replaced. A vector is taken from
+        there when the database still holds the same one: same symbol,
+        written at the same moment (`embedded_at` changes on every write, and
+        a symbol id reused after a deletion gets a row of its own). Only the
+        others are read from SQLite. The result is the sidecar a full read
+        builds.
+        """
         import numpy as np
 
-        rows = conn.execute("""
-            SELECT e.symbol_id, e.embedding, e.model, e.dimensions,
+        # No ORDER BY: sorted by symbol_id, SQLite walks the table itself,
+        # whose rows hold the blobs; unsorted, it reads a covering index.
+        rows = sorted(conn.execute("""
+            SELECT e.symbol_id, e.model, e.dimensions, e.embedded_at,
                    s.kind, f.path as file_path
             FROM symbol_embeddings e
             JOIN symbols s ON e.symbol_id = s.id
             JOIN files f ON s.file_id = f.id
-            ORDER BY e.symbol_id
-        """).fetchall()
+        """).fetchall(), key=lambda row: row[0])
 
         if not rows:
             return
 
-        dims = rows[0]["dimensions"]
+        dims = rows[0][2]
         n = len(rows)
+        ids = [row[0] for row in rows]
+        stamps = [row[3] for row in rows]
 
-        # Decode to contiguous matrix
-        buf = b"".join(row["embedding"] for row in rows)
-        matrix = np.frombuffer(buf, dtype=np.float32).reshape(n, dims).copy()
-        norms = np.linalg.norm(matrix, axis=1).astype(np.float32)
+        matrix = np.empty((n, dims), dtype=np.float32)
+        norms = np.empty(n, dtype=np.float32)
+        unread = self._reuse_previous(ids, stamps, rows[0][1], dims, matrix, norms)
+        self._read_vectors(conn, ids, unread, matrix, norms)
+        logger.debug("Sidecar vectors: %d reused, %d read from the database",
+                     n - len(unread), len(unread))
 
         # Ensure directory exists
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -88,12 +103,14 @@ class VectorCache:
         version = self._get_db_version(conn)
         meta = {
             "version": version,
-            "model": rows[0]["model"],
+            "model": rows[0][1],
             "dimensions": dims,
             "row_count": n,
-            "symbol_ids": [row["symbol_id"] for row in rows],
-            "symbol_kinds": [row["kind"] for row in rows],
-            "file_paths": [row["file_path"] for row in rows],
+            "symbol_ids": ids,
+            "symbol_kinds": [row[4] for row in rows],
+            "file_paths": [row[5] for row in rows],
+            # What the next build compares to reuse these vectors.
+            "embedded_at": stamps,
         }
         self._atomic_write(
             self.meta_path, lambda fh: fh.write(json.dumps(meta).encode())
@@ -102,6 +119,90 @@ class VectorCache:
         # Load into memory / GPU
         self._load_matrix(matrix, norms, meta)
         logger.info("Built sidecar: %d vectors x %d dims (version %d)", n, dims, version)
+
+    def _reuse_previous(self, ids: list[int], stamps: list, model: str, dims: int,
+                        matrix, norms) -> list[int]:
+        """Fill `matrix` and `norms` from the sidecar on disk where it holds
+        the same vector; return the positions it could not fill.
+
+        Anything that does not add up — no sidecar, one from before the
+        stamps were recorded, another model, a torn one — reuses nothing,
+        and the build reads everything as it always did.
+        """
+        import numpy as np
+
+        everything = list(range(len(ids)))
+        if not self.sidecar_exists():
+            return everything
+        old_matrix = old_norms = None
+        try:
+            meta = json.loads(self.meta_path.read_text())
+            old_ids, old_stamps = meta.get("symbol_ids"), meta.get("embedded_at")
+            if (old_stamps is None or old_ids is None or len(old_stamps) != len(old_ids)
+                    or meta.get("model") != model or meta.get("dimensions") != dims):
+                return everything
+            old_matrix = np.load(self.npy_path, mmap_mode="r")
+            if old_matrix.shape != (len(old_ids), dims) or old_matrix.dtype != np.float32:
+                return everything
+            if self.norms_path.exists():
+                old_norms = np.load(self.norms_path, mmap_mode="r")
+                if old_norms.shape != (len(old_ids),):
+                    old_norms = None
+            where = {key: row for row, key in enumerate(zip(old_ids, old_stamps))
+                     if key[1] is not None}
+            kept_at, kept_from, unread = [], [], []
+            for position, key in enumerate(zip(ids, stamps)):
+                row = where.get(key)
+                if row is None:
+                    unread.append(position)
+                else:
+                    kept_at.append(position)
+                    kept_from.append(row)
+            if kept_at:
+                # Copies, not views: nothing may keep the old files mapped,
+                # or replacing them fails on Windows.
+                matrix[kept_at] = old_matrix[kept_from]
+                norms[kept_at] = (old_norms[kept_from] if old_norms is not None
+                                  else np.linalg.norm(matrix[kept_at], axis=1))
+            return unread
+        except (OSError, ValueError, KeyError, TypeError):
+            logger.debug("Could not reuse the sidecar at %s; reading every vector",
+                         self.npy_path, exc_info=True)
+            return everything
+        finally:
+            del old_matrix, old_norms
+
+    @staticmethod
+    def _read_vectors(conn, ids: list[int], positions: list[int], matrix, norms) -> None:
+        """Read the vectors at `positions` from SQLite into `matrix`, one blob
+        at a time — never all of them in one list and then one joined buffer,
+        which held the matrix three times over — and compute their norms."""
+        import numpy as np
+
+        if not positions:
+            return
+        position_of = {ids[p]: p for p in positions}
+        if len(positions) * 2 > len(ids):
+            # Most of the table: one pass in rowid order reads it sequentially.
+            cursor = conn.execute("SELECT symbol_id, embedding FROM symbol_embeddings")
+            pairs = ((sid, blob) for sid, blob in cursor if sid in position_of)
+        else:
+            def chunked():
+                wanted = [ids[p] for p in positions]
+                for start in range(0, len(wanted), 500):
+                    chunk = wanted[start:start + 500]
+                    yield from conn.execute(
+                        "SELECT symbol_id, embedding FROM symbol_embeddings "
+                        f"WHERE symbol_id IN ({','.join('?' * len(chunk))})", chunk)
+            pairs = chunked()
+        read = 0
+        for sid, blob in pairs:
+            matrix[position_of[sid]] = np.frombuffer(blob, dtype=np.float32)
+            read += 1
+        if read != len(positions):
+            # The matrix is np.empty: a row never read holds garbage.
+            raise ValueError(f"read {read} of the {len(positions)} embeddings listed")
+        norms[positions] = np.linalg.norm(matrix[positions], axis=1)
 
     @staticmethod
     def _atomic_write(path: Path, write) -> None:
