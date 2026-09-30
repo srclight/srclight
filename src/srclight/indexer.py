@@ -3778,8 +3778,9 @@ class Indexer:
                     on_phase("Rebuilding the vector cache")
                 srclight_dir = self.config.root / ".srclight"
                 cache = VectorCache(srclight_dir)
+                # It logs what it built: every vector, not only the ones just
+                # embedded, and how many it reused.
                 cache.build_from_db(self.db.conn)
-                logger.info("Embedding sidecar built: %d vectors", len(results))
             except Exception as e:
                 logger.warning("Failed to build embedding sidecar: %s", e)
 

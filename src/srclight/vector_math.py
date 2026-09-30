@@ -15,16 +15,16 @@ try:
     # Test that GPU is actually available
     _np.zeros(1)
     _backend = "cupy"
-    logger.info("vector_math: using cupy (GPU)")
+    logger.debug("vector_math: using cupy (GPU)")
 except Exception:
     try:
         import numpy as _np
 
         _backend = "numpy"
-        logger.info("vector_math: using numpy (CPU)")
+        logger.debug("vector_math: using numpy (CPU)")
     except ImportError:
         _np = None
-        logger.info("vector_math: using pure Python fallback")
+        logger.debug("vector_math: using pure Python fallback")
 
 
 def get_backend() -> str:

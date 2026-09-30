@@ -111,3 +111,49 @@ def test_log_lines_carry_the_time():
     line = logging.Formatter(LOG_FORMAT, LOG_DATEFMT).format(record)
     assert re.fullmatch(r"\d\d:\d\d:\d\d\.\d{3} INFO srclight\.indexer: Call graph: 12 edges in 3s",
                         line), line
+
+
+def test_each_phase_is_timed_from_the_one_before(capsys):
+    """Only the call graph logged its duration: the others had to be read
+    off the gap between two timestamps."""
+    from srclight.cli import _ProgressLine
+
+    ticks = iter([0.0, 12.5, 30.0, 31.5, 40.0])
+    with _ProgressLine("  ", 10, clock=lambda: next(ticks)) as line:
+        line.progress("a.c", 1, 2)
+        line.phase("Building the call graph")
+        line.phase("Finding communities and execution flows")
+        line.phase("Rebuilding the vector cache")
+    assert line.durations() == [
+        ("Scanning files", 12.5),
+        ("Building the call graph", 17.5),
+        ("Finding communities and execution flows", 1.5),
+        ("Rebuilding the vector cache", 8.5),
+    ]
+    summary = line.summary()
+    assert summary[0].split() == ["Scanning", "files", "12.5s"]
+    assert len({len(s) for s in summary}) == 1, "durations line up on the right"
+
+
+def test_phase_lines_carry_the_time(capsys):
+    import re
+
+    from srclight.cli import _ProgressLine
+
+    with _ProgressLine("  ", 10) as line:
+        line.phase("Building the call graph")
+    out = capsys.readouterr().out
+    assert re.search(r"^  \d\d:\d\d:\d\d Building the call graph\.\.\.$", out, re.M), out
+
+
+def test_the_cli_summary_lists_the_phases(tmp_path):
+    from click.testing import CliRunner
+
+    from srclight.cli import main
+
+    (tmp_path / "a.py").write_text(
+        "def alpha():\n    return beta()\n\n\ndef beta():\n    return 1\n")
+    result = CliRunner().invoke(main, ["index", str(tmp_path), "--no-embed"])
+    assert result.exit_code == 0, result.output
+    after_time = result.output.split("  Time:", 1)[1]
+    assert "Scanning files" in after_time and "Building the call graph" in after_time, result.output

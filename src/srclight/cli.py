@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -90,9 +91,15 @@ class _ProgressLine:
     instead of starting a line of its own, so the line is ended first.
     """
 
-    def __init__(self, indent: str, width: int):
+    # What runs before the first phase the indexer announces.
+    FIRST_PHASE = "Scanning files"
+
+    def __init__(self, indent: str, width: int, clock=time.monotonic):
         self.indent, self.width = indent, width
         self.open = False
+        self._clock = clock
+        # (name, start, end) of each phase; the current one has no end yet.
+        self.phases: list[list] = []
 
     def progress(self, file: str, current: int, total: int) -> None:
         pct = (current / total * 100) if total > 0 else 0
@@ -102,7 +109,20 @@ class _ProgressLine:
 
     def phase(self, name: str) -> None:
         self.close()
-        click.echo(f"{self.indent}{name}...")
+        self._next_phase(name)
+        # The time, as log lines carry it: the gap between two says how long.
+        click.echo(f"{self.indent}{time.strftime('%H:%M:%S')} {name}...")
+
+    def _next_phase(self, name: str | None) -> None:
+        now = self._clock()
+        if self.phases and self.phases[-1][2] is None:
+            self.phases[-1][2] = now
+        if name is not None:
+            self.phases.append([name, now, None])
+
+    def durations(self) -> list[tuple[str, float]]:
+        """How long each phase took, in order, the file scan first."""
+        return [(name, end - start) for name, start, end in self.phases if end is not None]
 
     def close(self) -> None:
         if self.open:
@@ -116,12 +136,20 @@ class _ProgressLine:
     def __enter__(self) -> _ProgressLine:
         for handler in logging.getLogger().handlers:
             handler.addFilter(self._before_log)
+        self._next_phase(self.FIRST_PHASE)
         return self
 
     def __exit__(self, *exc) -> None:
         for handler in logging.getLogger().handlers:
             handler.removeFilter(self._before_log)
+        self._next_phase(None)
         self.close()
+
+    def summary(self) -> list[str]:
+        """One line per phase for the run's summary: name and duration."""
+        steps = self.durations()
+        width = max((len(name) for name, _ in steps), default=0)
+        return [f"{self.indent}  {name:<{width}}  {seconds:6.1f}s" for name, seconds in steps]
 
 
 def parse_extension_overrides(values: tuple[str, ...]) -> dict[str, str]:
@@ -264,6 +292,8 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
     click.echo(f"  Symbols found:   {stats.symbols_extracted}")
     click.echo(f"  Errors:          {stats.errors}")
     click.echo(f"  Time:            {stats.elapsed_seconds:.2f}s")
+    for step in line.summary():
+        click.echo(step)
 
     db_stats = db.stats()
     click.echo(f"  Database size:   {db_stats['db_size_mb']} MB")

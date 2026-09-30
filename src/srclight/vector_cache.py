@@ -160,7 +160,7 @@ class VectorCache:
         finally:
             if own is not None:
                 own.close()  # nothing written: ends the snapshot
-        logger.debug("Sidecar vectors: %d reused, %d read from the database",
+        logger.info("Vector cache: %d vectors reused, %d read from the database",
                      n - len(unread), len(unread))
         return rows, matrix, norms, version
 
