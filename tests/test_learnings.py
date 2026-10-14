@@ -196,6 +196,50 @@ def test_expire_stale(ldb):
     assert ldb.get_learning(lid) is None
 
 
+def _expire(ldb, lid):
+    ldb.conn.execute(
+        "UPDATE learnings SET expires_at = '2020-01-01T00:00:00.000000Z' WHERE id = ?",
+        (lid,),
+    )
+    ldb.conn.commit()
+
+
+def test_search_skips_expired_learnings(ldb):
+    """A learning past its ttl_days is not returned by any search."""
+    expiring = ldb.record_learning(
+        LearningRecord(kind="blocker", content="zebra migration freeze", ttl_days=1)
+    )
+    permanent = ldb.record_learning(
+        LearningRecord(kind="decision", content="zebra tables stay in Postgres")
+    )
+    for lid in (expiring, permanent):
+        ldb.upsert_embedding(lid, "test-model", 2, [1.0, 0.0], "h")
+
+    # Not yet expired: both are found.
+    assert {r["learning_id"] for r in ldb.search_fts("zebra")} == {expiring, permanent}
+
+    _expire(ldb, expiring)
+
+    assert [r["learning_id"] for r in ldb.search_fts("zebra")] == [permanent]
+    assert [r["learning_id"] for r in ldb._search_like("zebra", None, None, 20, False)] == [
+        permanent
+    ]
+    assert [r["learning_id"] for r in ldb.search_embeddings([1.0, 0.0])] == [permanent]
+
+
+async def test_learnings_tools_explain_workspace_mode(monkeypatch):
+    """In single-repo mode the client sees why the learnings tools fail."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    import srclight.server as server_mod
+
+    monkeypatch.setattr(server_mod, "_workspace_name", None)
+    monkeypatch.setattr(server_mod, "_learnings_db", None)
+
+    with pytest.raises(ToolError, match="workspace mode"):
+        await server_mod.mcp.call_tool("learning_stats", {})
+
+
 def test_stats(ldb):
     """Stats by kind and project."""
     ldb.record_learning(LearningRecord(kind="decision", content="A", project="ice"))

@@ -411,6 +411,8 @@ class LearningsDB:
             params.append(project)
         if not include_superseded:
             sql += " AND l.superseded_by IS NULL"
+        sql += " AND (l.expires_at IS NULL OR l.expires_at > ?)"
+        params.append(_now_iso())
 
         sql += " ORDER BY fts_rank LIMIT ?"
         params.append(limit)
@@ -457,6 +459,8 @@ class LearningsDB:
             params.append(project)
         if not include_superseded:
             conditions.append("superseded_by IS NULL")
+        conditions.append("(expires_at IS NULL OR expires_at > ?)")
+        params.append(_now_iso())
 
         sql = f"SELECT * FROM learnings WHERE {' AND '.join(conditions)} ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
@@ -499,6 +503,8 @@ class LearningsDB:
             params.append(project)
         if not include_superseded:
             conditions.append("l.superseded_by IS NULL")
+        conditions.append("(l.expires_at IS NULL OR l.expires_at > ?)")
+        params.append(_now_iso())
 
         sql = f"""
             SELECT le.learning_id, le.embedding, le.dimensions,

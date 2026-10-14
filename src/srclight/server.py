@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 
 from .db import Database
@@ -313,7 +314,12 @@ def _get_learnings_db():
     from .learnings import LearningsDB
 
     if _workspace_name is None:
-        raise RuntimeError("Learnings require workspace mode")
+        # ToolError, not RuntimeError: MCPServer forwards only a ToolError's text,
+        # so any other exception reaches the client as a bare "Error executing tool".
+        raise ToolError(
+            "Learnings require workspace mode: start the server with "
+            "'srclight serve --workspace NAME'"
+        )
 
     config = WorkspaceConfig.load(_workspace_name)
     _learnings_db = LearningsDB(config.learnings_db_path)
