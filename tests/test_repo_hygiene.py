@@ -6,6 +6,7 @@ import asyncio
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -135,11 +136,28 @@ _PRIVATE_NAME_DIGESTS = frozenset({
 _WORD = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 
+def _word_candidates(word: str):
+    """The word, and every run of its `-`/`_`-separated parts.
+
+    `-` and `_` are word characters here, so a guarded name glued to a suffix
+    (`name-mcp`, `name_db`, `two-part-name-x`) is a different word and would
+    hash differently. Each contiguous run is tried with either separator.
+    """
+    yield word
+    parts = [p for p in re.split(r"[-_]", word) if p]
+    for i in range(len(parts)):
+        for j in range(i + 1, len(parts) + 1):
+            run = parts[i:j]
+            yield "-".join(run)
+            yield "_".join(run)
+
+
 def _names_private_project(line: str) -> bool:
     import hashlib
     return any(
-        hashlib.sha256(word.encode()).hexdigest() in _PRIVATE_NAME_DIGESTS
+        hashlib.sha256(candidate.encode()).hexdigest() in _PRIVATE_NAME_DIGESTS
         for word in _WORD.findall(line.lower())
+        for candidate in _word_candidates(word)
     )
 
 
@@ -180,3 +198,17 @@ def test_no_private_workstation_references_in_tracked_text():
             if any(p.search(line) for p in patterns) or _names_private_project(line):
                 offenders.append(f"  {rel}:{n}: {line.strip()[:120]}")
     assert not offenders, "Private references in tracked public files:\n" + "\n".join(offenders)
+
+
+def test_private_name_matcher_sees_names_glued_to_suffixes(monkeypatch):
+    """`-` and `_` are word characters, so a glued suffix changed the hash."""
+    import hashlib
+
+    digests = {hashlib.sha256(n.encode()).hexdigest() for n in ("lumen", "dim-star")}
+    monkeypatch.setattr(sys.modules[__name__], "_PRIVATE_NAME_DIGESTS", frozenset(digests))
+
+    for line in ("see lumen here", "lumen-mcp server", "the lumen_db file",
+                 "a dim-star-pack", "x_dim_star_y", "Dim-Star"):
+        assert _names_private_project(line), line
+    for line in ("illumination", "dimstar", "dim star", "lumens"):
+        assert not _names_private_project(line), line

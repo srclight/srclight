@@ -1029,3 +1029,32 @@ def test_a_current_sidecar_is_not_rebuilt(repo, stub_provider, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert builds == [], "an unchanged run rebuilt a sidecar that was already current"
+
+
+def test_a_reparse_with_nothing_to_embed_leaves_the_sidecar_current(repo, stub_provider):
+    """The rebuild ran before the step that invalidates the sidecar.
+
+    A file reparsed with its symbols' text unchanged keeps its vectors, so
+    nothing is embedded; the sidecar was rebuilt and then marked stale at
+    once by the invalidation that follows a pass that embedded nothing —
+    a full rebuild thrown away, and a stale sidecar until the next run.
+    """
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"]).exit_code == 0
+    (repo / "main.py").write_text("\ndef hello():\n    return 1\n")
+
+    result = CliRunner().invoke(main, ["index", str(repo)])
+
+    assert result.exit_code == 0, result.output
+    assert _sidecar_is_current(repo), "the sidecar built this run was invalidated by it"
+
+
+def test_the_sidecar_meta_version_is_read_from_its_head(tmp_path):
+    import json
+
+    from srclight.indexer import _sidecar_meta_version
+
+    meta = tmp_path / "embeddings_meta.json"
+    meta.write_text(json.dumps({"version": 41, "symbol_ids": list(range(5000))}))
+    assert _sidecar_meta_version(meta) == 41
+    meta.write_text(json.dumps({"model": "m", "version": 7}))  # not first: full parse
+    assert _sidecar_meta_version(meta) == 7
