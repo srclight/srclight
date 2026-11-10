@@ -2881,10 +2881,11 @@ async def show_status(message: str = "") -> str:
     if _last_query_client is not None:
         stats["last_query_client"] = _last_query_client
     try:
-        map_result = await codebase_map()
-        stats["codebase"] = json.loads(map_result)
+        # codebase_map is synchronous. Awaiting it raised a TypeError that the
+        # except below swallowed, so no status ever carried the codebase.
+        stats["codebase"] = json.loads(codebase_map())
     except Exception:
-        pass
+        logger.debug("show_status: codebase_map unavailable", exc_info=True)
     return json.dumps(stats, indent=2)
 
 
