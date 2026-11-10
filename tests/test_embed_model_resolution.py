@@ -956,3 +956,76 @@ def test_workspace_index_honours_no_embed(workspace, embed_calls, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert embed_calls == []
+
+
+# --- a stale sidecar heals on the next run, even when nothing changed ---
+
+
+def _sidecar_is_current(repo) -> bool:
+    from srclight.vector_cache import VectorCache
+
+    srclight_dir = repo / ".srclight"
+    cache = VectorCache(srclight_dir)
+    if not cache.sidecar_exists():
+        return False
+    cache.load_sidecar()
+    db = Database(srclight_dir / "index.db")
+    db.open()
+    try:
+        return cache.is_valid(db.conn)
+    finally:
+        db.close()
+
+
+def test_a_run_with_nothing_to_embed_rebuilds_a_stale_sidecar(repo, stub_provider):
+    """The sidecar was rebuilt only after embedding something new.
+
+    A sidecar left behind by an earlier run (killed mid-build, or written
+    before an interrupted re-embed) then outlived every later run of a repo
+    that stopped changing: each one found nothing to embed and returned
+    early, and semantic search saw part of the index for good while every
+    run reported success. The vectors are all in the database; the sidecar
+    is only a copy of them, so rebuilding it needs no provider.
+    """
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"]).exit_code == 0
+    assert _sidecar_is_current(repo)
+
+    # The database moves on without the sidecar following it.
+    db = Database(repo / ".srclight" / "index.db")
+    db.open()
+    db.conn.execute(
+        "UPDATE schema_info SET value = CAST(value AS INTEGER) + 1"
+        " WHERE key = 'embedding_cache_version'"
+    )
+    db.conn.commit()
+    db.close()
+    assert not _sidecar_is_current(repo)
+
+    result = CliRunner().invoke(main, ["index", str(repo)])
+
+    assert result.exit_code == 0, result.output
+    assert _sidecar_is_current(repo), "a run with nothing to embed left the sidecar stale"
+
+
+def test_a_run_with_nothing_to_embed_restores_a_missing_sidecar(repo, stub_provider):
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"]).exit_code == 0
+    for name in ("embeddings.npy", "embeddings_norms.npy", "embeddings_meta.json"):
+        (repo / ".srclight" / name).unlink()
+
+    result = CliRunner().invoke(main, ["index", str(repo)])
+
+    assert result.exit_code == 0, result.output
+    assert _sidecar_is_current(repo)
+
+
+def test_a_current_sidecar_is_not_rebuilt(repo, stub_provider, monkeypatch):
+    from srclight.vector_cache import VectorCache
+
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"]).exit_code == 0
+    builds = []
+    monkeypatch.setattr(VectorCache, "build_from_db", lambda self, conn: builds.append(1))
+
+    result = CliRunner().invoke(main, ["index", str(repo)])
+
+    assert result.exit_code == 0, result.output
+    assert builds == [], "an unchanged run rebuilt a sidecar that was already current"

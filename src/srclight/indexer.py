@@ -3740,6 +3740,10 @@ class Indexer:
         symbols = self.db.get_symbols_needing_embeddings(provider.name)
         if not symbols:
             logger.info("No symbols to embed: all are embedded with %s", provider.name)
+            # Below, the sidecar is rebuilt only after new vectors are saved.
+            # One left stale by an earlier run would otherwise outlive every
+            # run of a repo that has stopped changing.
+            self._rebuild_sidecar_if_stale(on_phase)
             return 0
 
         logger.info("Embedding %d symbols with %s...", len(symbols), provider.name)
@@ -3813,3 +3817,29 @@ class Indexer:
                 logger.warning("Failed to build embedding sidecar: %s", e)
 
         return len(results)
+
+    def _rebuild_sidecar_if_stale(self, on_phase=None) -> None:
+        """Rebuild the vector-cache sidecar when it no longer matches the index.
+
+        Every vector is in the database, so this needs no embedding provider.
+        The check reads only the sidecar's meta, not its matrix.
+        """
+        from .vector_cache import VectorCache
+
+        srclight_dir = self.config.root / ".srclight"
+        cache = VectorCache(srclight_dir)
+        db_version = VectorCache._get_db_version(self.db.conn)
+        try:
+            if json.loads(cache.meta_path.read_text())["version"] == db_version:
+                return
+        except FileNotFoundError:
+            pass  # no sidecar yet: build one if there are vectors to hold
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            logger.info("Unreadable embedding sidecar meta, rebuilding: %s", e)
+
+        try:
+            if on_phase:
+                on_phase("Rebuilding a stale vector cache")
+            cache.build_from_db(self.db.conn)
+        except Exception as e:
+            logger.warning("Failed to rebuild stale embedding sidecar: %s", e)
