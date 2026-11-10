@@ -476,3 +476,31 @@ def test_a_file_that_vanishes_mid_walk_does_not_abort_the_run(tmp_path, db, monk
     stats = Indexer(db, IndexConfig(root=root)).index()
 
     assert stats.files_indexed == 1
+
+
+def test_workspace_symbols_in_file_accepts_either_separator(tmp_path, monkeypatch):
+    """Paths are stored as the OS writes them; a Windows index holds `a\\b`."""
+    import srclight.workspace as ws_mod
+    monkeypatch.setattr(ws_mod, "WORKSPACES_DIR", tmp_path / "workspaces")
+
+    project = tmp_path / "alpha"
+    (project / "pkg").mkdir(parents=True)
+    (project / "pkg" / "shapes.py").write_text("def draw_outline():\n    return 1\n")
+    (project / ".srclight").mkdir()
+    project_db = Database(project / ".srclight" / "index.db")
+    project_db.open()
+    project_db.initialize()
+    Indexer(project_db, IndexConfig(root=project)).index()
+    project_db.conn.execute("UPDATE files SET path = replace(path, '/', '\\')")
+    project_db.conn.commit()
+    project_db.close()
+
+    config = ws_mod.WorkspaceConfig(name="seps")
+    config.add_project("alpha", str(project))
+    monkeypatch.setattr(server, "_workspace_name", "seps")
+    monkeypatch.setattr(server, "_workspace_db", None)
+    monkeypatch.setattr(server, "_workspace_config_mtime", None)
+
+    res = json.loads(server.symbols_in_file("pkg/shapes.py", project="alpha"))
+
+    assert [s["name"] for s in res["symbols"]] == ["draw_outline"]

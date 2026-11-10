@@ -113,3 +113,51 @@ def test_get_callees_surfaces_resolution(db, project):
     callees = db.get_callees(other["id"])
     assert callees
     assert all("resolution" in c for c in callees)
+
+
+def test_one_edge_keeps_its_strongest_route():
+    from srclight.indexer import _strongest_edges
+
+    edges = [(1, 2, 0.9, "name_only"), (1, 2, 0.9, "unique_file"), (1, 3, 0.5, "same_dir"),
+             (1, 3, 0.9, "name_only")]
+    assert sorted(_strongest_edges(edges)) == [(1, 2, 0.9, "unique_file"), (1, 3, 0.9, "name_only")]
+    assert sorted(_strongest_edges(list(reversed(edges)))) == sorted(_strongest_edges(edges))
+
+
+_SEED_PROBE = r"""
+import sys
+from pathlib import Path
+from srclight.db import Database
+from srclight.indexer import Indexer, IndexConfig
+root = Path(sys.argv[1])
+db = Database(root / ".srclight" / "index.db"); db.open(); db.initialize()
+Indexer(db, IndexConfig(root=root, disable_embeddings=True)).index(root)
+for r in db.conn.execute(
+    "SELECT s.name, t.name, f.path, e.resolution FROM symbol_edges e"
+    " JOIN symbols s ON s.id = e.source_id JOIN symbols t ON t.id = e.target_id"
+    " JOIN files f ON f.id = t.file_id ORDER BY 1, 2, 3"):
+    print(tuple(r))
+"""
+
+
+def test_the_stored_resolution_does_not_follow_the_hash_seed(tmp_path):
+    """Iterating a set of names made the stored route depend on PYTHONHASHSEED."""
+    import os
+    import subprocess
+    import sys
+
+    outputs = set()
+    for seed in ("1", "2", "5"):
+        root = tmp_path / f"seed{seed}"
+        (root / "src").mkdir(parents=True)
+        (root / "src/lamp.hpp").write_text("struct Lamp_c {\n  void glowLamp(int x);\n};\n")
+        (root / "src/lamp.cpp").write_text('#include "lamp.hpp"\nvoid Lamp_c::glowLamp(int x) {}\n')
+        (root / "src/user.cpp").write_text(
+            '#include "lamp.hpp"\nvoid userCall(Lamp_c* lamp) {\n'
+            "  Lamp_c::glowLamp(1);\n  lamp->glowLamp(2);\n}\n")
+        (root / ".srclight").mkdir()
+        result = subprocess.run(
+            [sys.executable, "-c", _SEED_PROBE, str(root)], capture_output=True, text=True,
+            env={**os.environ, "PYTHONHASHSEED": seed}, check=True)
+        outputs.add(result.stdout)
+    assert len(outputs) == 1, outputs

@@ -274,7 +274,10 @@ def _git_tracked_files(root: Path) -> set[str] | None:
     # A submodule is listed as its directory alone; the files it holds are
     # listed from inside it, when it is checked out. `--recurse-submodules`
     # cannot be combined with `--others`.
-    for sub in _git_submodule_paths(root):
+    # Listing the gitlinks lists the whole index again; a repository with no
+    # .gitmodules has none to find.
+    subs = _git_submodule_paths(root) if (root / ".gitmodules").exists() else []
+    for sub in subs:
         if not (root / sub / ".git").exists():
             continue
         inner = _git_tracked_files(root / sub)
@@ -2253,6 +2256,31 @@ def _dir_of(path: str) -> str:
     return path[:idx] if idx >= 0 else ""
 
 
+# Strongest first. Two references in one body can reach the same target by
+# different routes (`C::name()` and a bare `name()`); the edge is stored once,
+# so it must carry the strongest route rather than whichever came first.
+_RESOLUTION_STRENGTH = {
+    name: rank for rank, name in enumerate((
+        "same_class", "typed", "qualified", "same_file", "import",
+        "unique_file", "same_dir", "name_only",
+    ))
+}
+
+
+def _strongest_edges(edges):
+    """One edge per (source, target): the highest confidence, then the
+    strongest resolution."""
+    best: dict[tuple[int, int], tuple[int, int, float, str]] = {}
+    for edge in edges:
+        key = (edge[0], edge[1])
+        kept = best.get(key)
+        if kept is None or (
+            -edge[2], _RESOLUTION_STRENGTH.get(edge[3], len(_RESOLUTION_STRENGTH))
+        ) < (-kept[2], _RESOLUTION_STRENGTH.get(kept[3], len(_RESOLUTION_STRENGTH))):
+            best[key] = edge
+    return list(best.values())
+
+
 class _EdgeScanner:
     """The call edges of one symbol at a time, from tables built once.
 
@@ -2562,7 +2590,8 @@ class _EdgeScanner:
                     referenced_names.discard(declared)
                 else:
                     forms_of[declared] = (forms - {"bare"}, qualifiers)
-        for ref_name in referenced_names:
+        # Sorted: a set's order follows the per-process hash seed.
+        for ref_name in sorted(referenced_names):
             targets = [t for t in filtered_names.get(ref_name, [])
                        if t["id"] != source_id and (
                            # A constructor — defined in its class, or only
@@ -2607,7 +2636,25 @@ class _EdgeScanner:
                 if confidence < 0.2:
                     continue
                 edges.append((source_id, target["id"], confidence, resolution))
-        return edges
+        return _strongest_edges(edges)
+
+
+_META_VERSION_RE = re.compile(rb'\A\s*\{\s*"version"\s*:\s*(-?\d+)\s*[,}]')
+
+
+def _sidecar_meta_version(meta_path: Path) -> int:
+    """The version recorded in a sidecar's meta file.
+
+    The meta is written with `version` as its first key, so the head of the
+    file is enough; the rest lists every vector. A file that does not start
+    that way is parsed in full.
+    """
+    with open(meta_path, "rb") as fh:
+        head = fh.read(256)
+    match = _META_VERSION_RE.match(head)
+    if match:
+        return int(match.group(1))
+    return int(json.loads(meta_path.read_text())["version"])
 
 
 class Indexer:
@@ -3063,6 +3110,14 @@ class Indexer:
         # reindex that only removed files, both land here.
         if (stats.files_indexed or stats.files_removed) and not stats.symbols_embedded:
             self._invalidate_sidecar()
+
+        # A pass that embedded nothing does not rebuild the sidecar, so one
+        # left stale — by the invalidation just above, or by an earlier run —
+        # would outlive every run of a repo that has stopped changing. Every
+        # vector is in the database, so this needs no provider. It runs after
+        # the invalidation so that what it builds is not marked stale at once.
+        if embed_model and not stats.symbols_embedded:
+            self._rebuild_sidecar_if_stale(on_phase)
 
         # Update index state
         git_head = _get_git_head(root)
@@ -3740,10 +3795,6 @@ class Indexer:
         symbols = self.db.get_symbols_needing_embeddings(provider.name)
         if not symbols:
             logger.info("No symbols to embed: all are embedded with %s", provider.name)
-            # Below, the sidecar is rebuilt only after new vectors are saved.
-            # One left stale by an earlier run would otherwise outlive every
-            # run of a repo that has stopped changing.
-            self._rebuild_sidecar_if_stale(on_phase)
             return 0
 
         logger.info("Embedding %d symbols with %s...", len(symbols), provider.name)
@@ -3822,7 +3873,8 @@ class Indexer:
         """Rebuild the vector-cache sidecar when it no longer matches the index.
 
         Every vector is in the database, so this needs no embedding provider.
-        The check reads only the sidecar's meta, not its matrix.
+        The check reads the version from the head of the sidecar's meta; the
+        rest of that file lists every vector and can run to tens of MB.
         """
         from .vector_cache import VectorCache
 
@@ -3830,7 +3882,7 @@ class Indexer:
         cache = VectorCache(srclight_dir)
         db_version = VectorCache._get_db_version(self.db.conn)
         try:
-            if json.loads(cache.meta_path.read_text())["version"] == db_version:
+            if _sidecar_meta_version(cache.meta_path) == db_version:
                 return
         except FileNotFoundError:
             pass  # no sidecar yet: build one if there are vectors to hold

@@ -837,9 +837,11 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
                                   s.end_line, s.doc_comment
                            FROM [{schema}].symbols s
                            JOIN [{schema}].files f ON s.file_id = f.id
-                           WHERE f.path = ?
+                           WHERE f.path IN (?, ?, ?)
                            ORDER BY s.start_line""",
-                        (path,),
+                        # Either separator, as Database.symbols_in_file accepts:
+                        # paths are stored as the OS writes them.
+                        (path, path.replace("/", "\\"), path.replace("\\", "/")),
                     ).fetchall()
                     all_results.extend({
                         "name": r["name"],
